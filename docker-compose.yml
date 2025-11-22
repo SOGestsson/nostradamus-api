@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./all_sim_input_data.v2.json:/app/all_sim_input_data.v2.json:ro
+      - ./all_sim_input_data_with_params.v2.json:/app/all_sim_input_data_with_params.v2.json:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
