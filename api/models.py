@@ -1,7 +1,8 @@
+# api/models.py - Fixed version
 """
 Pydantic models for API requests and responses.
 """
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 
 
@@ -22,3 +23,23 @@ class SimulationRequest(BaseModel):
     number_of_days: int = 900
     number_of_simulations: int = 1000
     service_level: float = 0.95
+
+
+class ForecastRequest(BaseModel):
+    """Request model for generating forecasts."""
+    sim_input_his: List[Dict[str, Any]]  # Historical sales data with item_id, actual_sale, day
+    forecast_periods: int = 30  # Number of periods to forecast
+    mode: str = 'local'  # 'local' or 'timegpt'
+    local_model: str = 'auto_arima'  # Model type for local mode
+    season_length: int = 12  # Seasonality period
+    freq: str = 'D'  # 'D'=daily, 'MS'=monthly, 'W'=weekly
+    api_key: Optional[str] = None  # For TimeGPT mode
+    quantiles: Optional[List[float]] = None  # For TimeGPT quantile forecasts
+
+
+class ForecastResponse(BaseModel):
+    """Response model for forecast results."""
+    item_id: int | str
+    forecast: List[float]
+    forecast_dates: List[str]
+    model_used: str
