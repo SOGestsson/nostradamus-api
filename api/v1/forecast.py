@@ -1,4 +1,4 @@
-# api/v1/forecast.py - New file for forecast endpoints
+# api/v1/forecast.py - Updated with detailed parameter descriptions
 
 """
 Forecast endpoints using ClassicalForecasts.
@@ -20,18 +20,89 @@ def generate_forecast(request: ForecastRequest):
     """
     Generate forecasts for items using classical forecasting models or TimeGPT.
     
-    Supports multiple forecasting modes:
-    - 'local': StatsForecast models (AutoARIMA, ETS, Croston, etc.)
-    - 'timegpt': Nixtla TimeGPT (requires API key)
+    ## Forecasting Modes
+    - **local**: StatsForecast models (AutoARIMA, ETS, Croston, etc.) - No API key needed
+    - **timegpt**: Nixtla TimeGPT cloud API - Requires API key
     
-    Args:
-        request: ForecastRequest with historical data and forecast parameters
-        
-    Returns:
-        Dictionary containing forecasts for each item
-        
-    Raises:
-        HTTPException: If forecast generation fails
+    ## Parameters
+    
+    **sim_input_his** (required): Historical sales data for forecasting
+    - Format: List of dicts with `item_id`, `actual_sale`, `day` (YYYY-MM-DD)
+    - Minimum: 5-30 data points depending on model complexity
+    - Example: [{"item_id": 100, "actual_sale": 120, "day": "2023-01-01"}]
+    
+    **forecast_periods** (default: 30): Number of future periods to forecast
+    - Range: 1-365 for daily, 1-24 for monthly
+    - Example: 7 = forecast next 7 days/months
+    
+    **mode** (default: 'local'): Forecasting engine
+    - 'local': Local StatsForecast models
+    - 'timegpt': TimeGPT cloud API
+    
+    **local_model** (default: 'auto_arima'): Statistical model (only for mode='local')
+    - 'auto_arima': Automated ARIMA - best for trend data (20+ points)
+    - 'auto_ets': Exponential Smoothing - best for seasonal data (30+ points)
+    - 'naive': Simple forecast (last value) - works with any data
+    - 'seasonal_naive': Repeats seasonal pattern - needs 1 full season
+    - 'croston_optimized': For intermittent/sparse demand
+    - 'adida': Adaptive intermittent demand
+    - 'theta': Theta method - balanced approach
+    - 'optimized_theta': Optimized theta
+    - 'auto_ces': Complex exponential smoothing
+    
+    **season_length** (default: 12): Length of one seasonal cycle
+    - 7 = weekly seasonality (for daily data)
+    - 12 = yearly seasonality (for monthly data)
+    - 24 = daily seasonality (for hourly data)
+    - 52 = yearly seasonality (for weekly data)
+    
+    **freq** (default: 'D'): Frequency/interval of time series data
+    - 'D': Daily
+    - 'MS': Month Start (monthly data)
+    - 'W': Weekly
+    - 'H': Hourly
+    - 'Q': Quarterly
+    - 'Y': Yearly
+    - Must match your input data frequency
+    
+    **api_key** (optional): Nixtla API key for TimeGPT mode
+    - Required when mode='timegpt'
+    - Alternative: Set NIXTLA_API_KEY environment variable
+    
+    **quantiles** (optional): Quantile levels for uncertainty intervals (TimeGPT only)
+    - Format: List of floats between 0 and 1
+    - Example: [0.1, 0.5, 0.9] for 10th, 50th, 90th percentiles
+    - Use for safety stock calculations and confidence intervals
+    
+    ## Quick Guide by Use Case
+    - **Daily demand, next week**: freq='D', season_length=7, forecast_periods=7
+    - **Monthly sales, next 6 months**: freq='MS', season_length=12, forecast_periods=6
+    - **Sparse/intermittent demand**: local_model='croston_optimized'
+    - **Need uncertainty estimates**: mode='timegpt', quantiles=[0.1, 0.5, 0.9]
+    
+    ## Returns
+    Dictionary containing:
+    - forecasts: List of forecast results per item
+    - total_items: Number of items processed
+    - mode: Forecasting mode used
+    - model: Model used
+    - periods: Number of periods forecasted
+    - frequency: Data frequency
+    
+    ## Example Request
+    ```json
+    {
+      "sim_input_his": [
+        {"item_id": 100, "actual_sale": 120, "day": "2023-01-01"},
+        {"item_id": 100, "actual_sale": 115, "day": "2023-02-01"}
+      ],
+      "forecast_periods": 6,
+      "mode": "local",
+      "local_model": "auto_ets",
+      "season_length": 12,
+      "freq": "MS"
+    }
+    ```
     """
     try:
         print(f"Starting forecast generation with mode: {request.mode}")
@@ -124,16 +195,74 @@ def calculate_leadtime_quantile(request: ForecastRequest):
     Calculate lead-time demand quantiles for safety stock calculations.
     
     Uses Monte Carlo simulation to estimate demand variability over lead time,
-    accounting for forecast uncertainty.
+    accounting for forecast uncertainty. Useful for inventory optimization and
+    determining safety stock levels.
     
-    Args:
-        request: ForecastRequest with historical data and parameters
-        
-    Returns:
-        Dictionary containing lead-time quantiles for each item
-        
-    Raises:
-        HTTPException: If calculation fails
+    ## Parameters
+    
+    Same as /generate endpoint, with key parameters:
+    
+    **sim_input_his** (required): Historical sales data
+    - Minimum 20-30 data points recommended for accurate quantile estimation
+    
+    **forecast_periods**: Lead time in periods
+    - Example: 7 = 7-day lead time (for daily data)
+    - Example: 2 = 2-month lead time (for monthly data)
+    
+    **mode**: Forecasting engine ('local' or 'timegpt')
+    
+    **local_model**: Statistical model for local mode
+    - Recommended: 'auto_arima' or 'auto_ets' for quantile calculations
+    
+    ## Returns
+    Dictionary containing:
+    - leadtime_quantiles: List of quantile results per item
+    - Each item includes quantiles at 90%, 95%, and 99% service levels
+    - total_items: Number of items processed
+    - lead_time_periods: Lead time used
+    - mode: Forecasting mode used
+    
+    ## Service Level Quantiles
+    - **q_90**: 90% service level (10% stockout risk)
+    - **q_95**: 95% service level (5% stockout risk)
+    - **q_99**: 99% service level (1% stockout risk)
+    
+    ## Use Cases
+    - Safety stock calculation
+    - Reorder point determination
+    - Service level planning
+    - Risk assessment
+    
+    ## Example Request
+    ```json
+    {
+      "sim_input_his": [
+        {"item_id": 100, "actual_sale": 120, "day": "2023-01-01"},
+        ...more data points...
+      ],
+      "forecast_periods": 7,
+      "mode": "local",
+      "local_model": "auto_arima",
+      "freq": "D"
+    }
+    ```
+    
+    ## Example Response
+    ```json
+    {
+      "leadtime_quantiles": [
+        {
+          "item_id": 100,
+          "lead_time_periods": 7,
+          "quantiles": {
+            "q_90": 850.5,
+            "q_95": 920.3,
+            "q_99": 1050.2
+          }
+        }
+      ]
+    }
+    ```
     """
     try:
         print(f"Starting lead-time quantile calculation")
