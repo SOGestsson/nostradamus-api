@@ -6,10 +6,12 @@ FastAPI application for inventory optimization and forecasting simulations.
 from fastapi import FastAPI
 from api.v1 import router as v1_router
 
+VERSION = "2.1.0"  # 👉 uppfærð útgáfa
+
 app = FastAPI(
     title="Inventory Simulation API",
     description="API for inventory optimization and forecasting simulations",
-    version="2.0.0"
+    version=VERSION,
 )
 
 # Include v1 router
@@ -22,8 +24,8 @@ def read_root():
     return {
         "status": "ok",
         "message": "Inventory Simulation API",
-        "version": "2.0.0",
-        "docs": "/docs"
+        "version": VERSION,   # 👉 nota sömu breytu hér
+        "docs": "/docs",
     }
 
 
