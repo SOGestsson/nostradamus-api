@@ -43,3 +43,26 @@ class ForecastResponse(BaseModel):
     forecast: List[float]
     forecast_dates: List[str]
     model_used: str
+
+
+class LightGPTForecastRequest(BaseModel):
+    """Request model for LightGPT batch forecasting."""
+    sim_input_his: List[Dict[str, Any]]  # Historical sales with item_id, day, actual_sale, optional drivers
+    item_attributes: Optional[List[Dict[str, Any]]] = None  # Item metadata (brand, category, etc.)
+    external_drivers: Optional[List[Dict[str, Any]]] = None  # External regressors (price, promotion, etc.)
+    forecast_periods: int = 30
+    exogenous_columns: Optional[List[str]] = None  # Which driver columns to use
+    forecast_type: str = 'batch'  # 'batch', 'cross_learning', 'hierarchical', 'scenarios'
+    group_column: Optional[str] = None  # For cross_learning: 'brand', 'category', etc.
+    hierarchy: Optional[List[str]] = None  # For hierarchical: ['brand', 'category', 'item_id']
+    scenarios: Optional[Dict[str, List[Dict[str, Any]]]] = None  # For scenario analysis
+
+
+class LightGPTResponse(BaseModel):
+    """Response model for LightGPT forecasts."""
+    forecasts: List[Dict[str, Any]]
+    total_items: int
+    forecast_type: str
+    periods: int
+
+
