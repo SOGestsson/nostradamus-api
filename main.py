@@ -6,7 +6,7 @@ FastAPI application for inventory optimization and forecasting simulations.
 from fastapi import FastAPI
 from api.v1 import router as v1_router
 
-VERSION = "2.1.0"  # 👉 uppfærð útgáfa
+VERSION = "2.2.0"  # 👉 uppfærð útgáfa
 
 app = FastAPI(
     title="Inventory Simulation API",

@@ -16,8 +16,23 @@ def read_input_csv(path: Path):
     records = []
     with path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
+
         required = {"item", "value", "date"}
-        missing = required - set(reader.fieldnames or [])
+
+        # Normalise header names (strip whitespace/BOM).
+        raw_fieldnames = reader.fieldnames or []
+        normalised = []
+        for name in raw_fieldnames:
+            if name is None:
+                continue
+            cleaned = name.strip().lstrip("\ufeff")
+            normalised.append(cleaned)
+
+        missing = required - set(normalised)
+        if not missing:
+            # Synchronise DictReader with normalised headers
+            reader.fieldnames = normalised
+        
         if missing:
             raise ValueError(f"CSV is missing required columns: {missing}")
 
@@ -73,6 +88,10 @@ def call_forecast_api(
     Returns parsed JSON.
     """
     url = base_url.rstrip("/") + "/api/v1/forecast/generate"
+    record_count = len(payload.get("sim_input_his", []))
+    print(
+        f"Calling {url} with {record_count} history rows (timeout {timeout}s)"
+    )
     resp = requests.post(url, json=payload, timeout=timeout)
     try:
         resp.raise_for_status()
@@ -170,9 +189,9 @@ def main():
     )
     parser.add_argument(
         "--base-url",
-        default="http://localhost:8000",
+        default="http://api.nostradamus-api.com",
         help="Base URL of the Inventory Simulation API "
-        "(default: http://localhost:8000)",
+        "(default: http://api.nostradamus-api.com)",
     )
     parser.add_argument(
         "--forecast-periods",
@@ -188,7 +207,7 @@ def main():
     )
     parser.add_argument(
         "--local-model",
-        default="auto_arima",
+        default="auto_ets",
         help="Local model to use when mode=local "
         "(e.g. auto_arima, auto_ets, croston_optimized, ...)",
     )
@@ -209,6 +228,12 @@ def main():
         default=None,
         help="Nixtla TimeGPT API key (required if mode=timegpt, "
         "optional otherwise)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        help="HTTP timeout in seconds for the forecast API call (default: 120)",
     )
     args = parser.parse_args()
 
@@ -232,7 +257,7 @@ def main():
     )
 
     # 3) Call API
-    response_json = call_forecast_api(args.base_url, payload)
+    response_json = call_forecast_api(args.base_url, payload, timeout=args.timeout)
     print("DEBUG FULL RESPONSE:")
     print(json.dumps(response_json, indent=2))
 
