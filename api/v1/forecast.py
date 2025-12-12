@@ -4,6 +4,7 @@
 Forecast endpoints using ClassicalForecasts.
 """
 import traceback
+import asyncio
 from typing import Dict, Any, List
 import pandas as pd
 
@@ -187,6 +188,91 @@ def generate_forecast(request: ForecastRequest):
         error_details = traceback.format_exc()
         print(f"Full error traceback:\n{error_details}")
         raise HTTPException(status_code=500, detail=f"Forecast error: {str(e)}")
+
+
+@router.post("/generate_async")
+async def generate_forecast_async(request: ForecastRequest):
+    """
+    Async version of `/generate`. Runs per-item forecasting off the event loop
+    using `asyncio.to_thread` so the server remains responsive. Parameters
+    and response structure are identical to `/generate`.
+    """
+    try:
+        print(f"Starting async forecast generation with mode: {request.mode}")
+
+        df_his = pd.DataFrame(request.sim_input_his)
+
+        required_cols = ['item_id', 'actual_sale', 'day']
+        missing_cols = [col for col in required_cols if col not in df_his.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {missing_cols}")
+
+        df_his['day'] = pd.to_datetime(df_his['day'])
+
+        forecaster = ClassicalForecasts(
+            mode=request.mode,
+            api_key=request.api_key,
+            quantiles=request.quantiles,
+            local_model=request.local_model,
+            season_length=request.season_length,
+            freq=request.freq
+        )
+
+        print(f"Forecaster initialized (async): {request.local_model if request.mode == 'local' else 'TimeGPT'}")
+
+        results = []
+        unique_items = df_his['item_id'].unique()
+
+        print(f"Generating async forecasts for {len(unique_items)} items")
+
+        for item_id in unique_items:
+            try:
+                item_data = df_his[df_his['item_id'] == item_id].sort_values('day').reset_index(drop=True)
+
+                # Run potentially blocking forecasting call in a thread
+                forecast_values = await asyncio.to_thread(forecaster.daily_path, item_data, request.forecast_periods)
+
+                last_date = item_data['day'].max()
+                future_dates = pd.date_range(
+                    start=last_date + pd.Timedelta(days=1 if request.freq == 'D' else 0),
+                    periods=request.forecast_periods,
+                    freq=request.freq
+                )
+
+                results.append({
+                    'item_id': int(item_id) if isinstance(item_id, (int, float)) else str(item_id),
+                    'forecast': forecast_values.tolist(),
+                    'forecast_dates': [d.strftime('%Y-%m-%d') for d in future_dates],
+                    'model_used': request.local_model if request.mode == 'local' else 'timegpt',
+                    'periods_forecasted': len(forecast_values)
+                })
+
+                print(f"  ✓ Item {item_id}: async forecast generated")
+
+            except Exception as e:
+                print(f"  ✗ Item {item_id}: {str(e)}")
+                results.append({
+                    'item_id': int(item_id) if isinstance(item_id, (int, float)) else str(item_id),
+                    'error': str(e),
+                    'forecast': [],
+                    'forecast_dates': []
+                })
+
+        print(f"Async forecast generation completed: {len(results)} items processed")
+
+        return {
+            'forecasts': results,
+            'total_items': len(unique_items),
+            'mode': request.mode,
+            'model': request.local_model if request.mode == 'local' else 'timegpt',
+            'periods': request.forecast_periods,
+            'frequency': request.freq
+        }
+
+    except Exception as e:
+        error_details = traceback.format_exc()
+        print(f"Full async error traceback:\n{error_details}")
+        raise HTTPException(status_code=500, detail=f"Async forecast error: {str(e)}")
 
 
 @router.post("/leadtime_quantile")
