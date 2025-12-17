@@ -1,19 +1,21 @@
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 # Set working directory
 WORKDIR /app
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
-    gcc \
+    build-essential \
+    g++ \
+    cmake \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy dependency files
 COPY Pipfile Pipfile.lock ./
+COPY requirements.txt ./
 
-# Install pipenv and dependencies
-RUN pip install --no-cache-dir pipenv && \
-    pipenv install --system --deploy
+# Install dependencies from requirements.txt (fallback to avoid pipenv lock issues)
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
