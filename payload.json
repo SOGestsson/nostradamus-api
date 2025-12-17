@@ -1,0 +1,7 @@
+{
+  "sim_input_his": [
+    {"item_id": 1, "actual_sale": 10, "day": "2025-12-01"},
+    {"item_id": 1, "actual_sale": 12, "day": "2025-12-02"}
+  ],
+  "forecast_periods": 3
+}
