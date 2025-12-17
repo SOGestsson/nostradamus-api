@@ -10,4 +10,16 @@ services:
       - ./all_sim_input_data_with_params.v2.json:/app/all_sim_input_data_with_params.v2.json:ro
     environment:
       - PYTHONUNBUFFERED=1
+      - REDIS_URL=redis://redis:6379/0
     restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  redis-data:

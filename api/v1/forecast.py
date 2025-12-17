@@ -5,15 +5,117 @@ Forecast endpoints using ClassicalForecasts.
 """
 import traceback
 import asyncio
-from typing import Dict, Any, List
+import uuid
+from datetime import datetime
+from typing import Dict, Any, List, Optional
 import pandas as pd
 
-from fastapi import APIRouter, HTTPException
+import httpx
+import json
+import os
+import hmac
+import hashlib
+import time
+
+from fastapi import APIRouter, HTTPException, Request, Depends, Header
+import logging
 
 from api.models import ForecastRequest
 from inventory_algorithm.classical_forecasts import ClassicalForecasts
 
 router = APIRouter()
+
+# Logging
+logger = logging.getLogger("nostradamus")
+logging.basicConfig(level=logging.INFO)
+
+# Redis-backed job store
+REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+try:
+    import redis.asyncio as aioredis
+    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+except Exception:
+    redis_client = None
+
+# Fallback in-memory store if redis isn't available (useful for local/dev)
+JOBS: Dict[str, Dict[str, Any]] = {}
+
+
+async def send_webhook_with_retries(job_id: str, webhook: str, payload: Dict[str, Any], max_attempts: int = 5):
+    delays = [1, 5, 30, 120, 600]
+    attempt = 0
+    last_exc = None
+    webhook_secret = os.getenv('WEBHOOK_SECRET')
+    secret_bytes = webhook_secret.encode() if webhook_secret else None
+    while attempt < max_attempts:
+        attempt += 1
+        try:
+            payload_bytes = json.dumps(payload, separators=(',', ':'), sort_keys=True).encode()
+            headers = {}
+            if secret_bytes:
+                ts = str(int(time.time()))
+                signed = hmac.new(secret_bytes, ts.encode() + b'.' + payload_bytes, hashlib.sha256).hexdigest()
+                headers['X-Signature'] = f"sha256={signed}"
+                headers['X-Signature-Timestamp'] = ts
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(webhook, content=payload_bytes, headers=headers)
+
+            if 200 <= resp.status_code < 300:
+                logger.info("webhook sent", extra={'job_id': job_id, 'attempt': attempt, 'status_code': resp.status_code})
+                if redis_client:
+                    await redis_client.hset(_job_key(job_id), mapping={'webhook_attempts': attempt})
+                    await redis_client.incr('metrics:webhook:success')
+                else:
+                    JOBS[job_id]['webhook_attempts'] = attempt
+                return True
+            else:
+                last_exc = f"status={resp.status_code}, body={resp.text}"
+        except Exception as e:
+            last_exc = str(e)
+            logger.warning("webhook attempt failed", extra={'job_id': job_id, 'attempt': attempt, 'error': last_exc})
+
+        if redis_client:
+            await redis_client.hset(_job_key(job_id), mapping={'webhook_attempts': attempt, 'webhook_last_error': last_exc or ''})
+            await redis_client.incr('metrics:webhook:attempts')
+        else:
+            JOBS[job_id]['webhook_attempts'] = attempt
+            JOBS[job_id]['webhook_last_error'] = last_exc or ''
+
+        await asyncio.sleep(delays[min(attempt-1, len(delays)-1)])
+
+    dlq_entry = {
+        'job_id': job_id,
+        'webhook': webhook,
+        'payload': payload,
+        'attempts': attempt,
+        'last_error': last_exc
+    }
+    try:
+        if redis_client:
+            await redis_client.rpush('webhook:dlq', json.dumps(dlq_entry))
+            await redis_client.incr('metrics:webhook:dlq')
+        else:
+            logger.error("DLQ push (no redis)", extra={'dlq_entry': dlq_entry})
+    except Exception as e:
+        logger.exception("Failed to push to DLQ", exc_info=e)
+
+    if redis_client:
+        await redis_client.incr('metrics:webhook:failed')
+    return False
+
+
+def _job_key(job_id: str) -> str:
+    return f"job:{job_id}"
+
+
+def api_key_header(x_api_key: Optional[str] = Header(None)) -> bool:
+    """Simple API key dependency. If `API_KEY` env var is set, require matching header."""
+    expected = os.getenv('API_KEY')
+    if expected:
+        if not x_api_key or x_api_key != expected:
+            raise HTTPException(status_code=401, detail="Invalid API Key")
+    return True
 
 
 @router.post("/generate")
@@ -273,6 +375,164 @@ async def generate_forecast_async(request: ForecastRequest):
         error_details = traceback.format_exc()
         print(f"Full async error traceback:\n{error_details}")
         raise HTTPException(status_code=500, detail=f"Async forecast error: {str(e)}")
+
+
+@router.post("/generate_job")
+async def generate_forecast_job(request: ForecastRequest, req: Request, webhook_url: Optional[str] = None, auth: bool = Depends(api_key_header)):
+    """
+    Submit an asynchronous forecast job. Returns immediately with a `job_id` and
+    a status URL. The job runs in the background and the result can be polled
+    via `GET /jobs/{job_id}`. Optionally, provide `webhook_url` as a query
+    parameter to receive a POST callback on completion.
+    """
+    job_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
+    job_record = {
+        'status': 'pending',
+        'result': '',
+        'error': '',
+        'created_at': now,
+        'finished_at': ''
+    }
+
+    if redis_client:
+        # store as hash; result/error stored as JSON string when present
+        await redis_client.hset(_job_key(job_id), mapping=job_record)
+        # set a default TTL (7 days)
+        await redis_client.expire(_job_key(job_id), 60 * 60 * 24 * 7)
+    else:
+        JOBS[job_id] = job_record
+
+    async def _run_job(job_id: str, request_obj: ForecastRequest, webhook: Optional[str]):
+        # update status -> running
+        if redis_client:
+            await redis_client.hset(_job_key(job_id), mapping={'status': 'running'})
+        else:
+            JOBS[job_id]['status'] = 'running'
+
+        # use module-level send_webhook_with_retries defined above
+
+        try:
+            # Run the existing synchronous generator in a thread to avoid blocking
+            result = await asyncio.to_thread(generate_forecast, request_obj)
+
+            finished_at = datetime.utcnow().isoformat()
+            if redis_client:
+                await redis_client.hset(_job_key(job_id), mapping={
+                    'status': 'finished',
+                    'result': json.dumps(result),
+                    'finished_at': finished_at
+                })
+            else:
+                JOBS[job_id]['status'] = 'finished'
+                JOBS[job_id]['result'] = result
+                JOBS[job_id]['finished_at'] = finished_at
+
+            if webhook:
+                payload = {'job_id': job_id, 'status': 'finished', 'result': result}
+                sent = await send_webhook_with_retries(job_id, webhook, payload)
+                if not sent:
+                    print(f"Failed to deliver webhook after retries for job {job_id}")
+
+        except Exception as e:
+            finished_at = datetime.utcnow().isoformat()
+            if redis_client:
+                await redis_client.hset(_job_key(job_id), mapping={
+                    'status': 'failed',
+                    'error': str(e),
+                    'finished_at': finished_at
+                })
+            else:
+                JOBS[job_id]['status'] = 'failed'
+                JOBS[job_id]['error'] = str(e)
+                JOBS[job_id]['finished_at'] = finished_at
+
+            if webhook:
+                payload = {'job_id': job_id, 'status': 'failed', 'error': str(e)}
+                sent = await send_webhook_with_retries(job_id, webhook, payload)
+                if not sent:
+                    print(f"Failed to deliver failure webhook after retries for job {job_id}")
+
+    # Schedule background task and return job metadata
+    asyncio.create_task(_run_job(job_id, request, webhook_url))
+
+    status_path = f"/v1/forecast/jobs/{job_id}"
+    base_url = str(req.base_url).rstrip('/')
+    status = (await redis_client.hget(_job_key(job_id), 'status')) if redis_client else JOBS[job_id]['status']
+    return {
+        'job_id': job_id,
+        'status_url': f"{base_url}{status_path}",
+        'status': status
+    }
+
+
+@router.get("/jobs/{job_id}")
+async def get_job_status(job_id: str, auth: bool = Depends(api_key_header)):
+    """Return status and result (if finished) for a submitted job."""
+    if redis_client:
+        data = await redis_client.hgetall(_job_key(job_id))
+        if not data:
+            raise HTTPException(status_code=404, detail="Job not found")
+        # parse JSON fields
+        if data.get('result'):
+            try:
+                data['result'] = json.loads(data['result'])
+            except Exception:
+                pass
+        return data
+    else:
+        job = JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return job
+
+
+@router.get("/webhook/dlq")
+async def list_webhook_dlq(limit: int = 100, auth: bool = Depends(api_key_header)):
+    """List entries in the webhook dead-letter queue (requires API key if set)."""
+    if not redis_client:
+        return {'count': 0, 'dlq': []}
+    items = await redis_client.lrange('webhook:dlq', 0, limit - 1)
+    parsed = []
+    for it in items:
+        try:
+            parsed.append(json.loads(it))
+        except Exception:
+            parsed.append({'raw': it})
+    return {'count': len(parsed), 'dlq': parsed}
+
+
+@router.post("/webhook/dlq/requeue")
+async def requeue_webhook_dlq(job_id: str, auth: bool = Depends(api_key_header)):
+    """Requeue a DLQ entry by `job_id`. This will remove the DLQ entry and
+    attempt delivery again in the background."""
+    if not redis_client:
+        raise HTTPException(status_code=500, detail='Redis not configured')
+
+    items = await redis_client.lrange('webhook:dlq', 0, -1)
+    found_raw = None
+    for raw in items:
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if obj.get('job_id') == job_id:
+            found_raw = raw
+            entry = obj
+            break
+
+    if not found_raw:
+        raise HTTPException(status_code=404, detail='DLQ entry not found')
+
+    # remove single occurrence
+    await redis_client.lrem('webhook:dlq', 1, found_raw)
+
+    # re-attempt delivery asynchronously
+    webhook = entry.get('webhook')
+    payload = entry.get('payload')
+    asyncio.create_task(send_webhook_with_retries(job_id, webhook, payload))
+
+    return {'status': 'requeued', 'job_id': job_id}
 
 
 @router.post("/leadtime_quantile")

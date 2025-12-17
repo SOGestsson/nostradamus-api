@@ -76,3 +76,4 @@ utilsforecast==0.2.14; python_version >= '3.9'
 uvicorn==0.38.0; python_version >= '3.9'
 wcwidth==0.2.14; python_version >= '3.6'
 zstandard==0.25.0; python_version >= '3.9'
+redis==4.8.0
