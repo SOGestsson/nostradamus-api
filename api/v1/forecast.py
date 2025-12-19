@@ -64,10 +64,15 @@ async def send_webhook_with_retries(job_id: str, webhook: str, payload: Dict[str
             if 200 <= resp.status_code < 300:
                 logger.info("webhook sent", extra={'job_id': job_id, 'attempt': attempt, 'status_code': resp.status_code})
                 if redis_client:
-                    await redis_client.hset(_job_key(job_id), mapping={'webhook_attempts': attempt})
-                    await redis_client.incr('metrics:webhook:success')
+                    try:
+                        await redis_client.hset(_job_key(job_id), mapping={'webhook_attempts': attempt})
+                        await redis_client.incr('metrics:webhook:success')
+                    except Exception:
+                        # Redis is best-effort for metrics; don't fail webhook delivery.
+                        pass
                 else:
-                    JOBS[job_id]['webhook_attempts'] = attempt
+                    if job_id in JOBS:
+                        JOBS[job_id]['webhook_attempts'] = attempt
                 return True
             else:
                 last_exc = f"status={resp.status_code}, body={resp.text}"
@@ -76,11 +81,15 @@ async def send_webhook_with_retries(job_id: str, webhook: str, payload: Dict[str
             logger.warning("webhook attempt failed", extra={'job_id': job_id, 'attempt': attempt, 'error': last_exc})
 
         if redis_client:
-            await redis_client.hset(_job_key(job_id), mapping={'webhook_attempts': attempt, 'webhook_last_error': last_exc or ''})
-            await redis_client.incr('metrics:webhook:attempts')
+            try:
+                await redis_client.hset(_job_key(job_id), mapping={'webhook_attempts': attempt, 'webhook_last_error': last_exc or ''})
+                await redis_client.incr('metrics:webhook:attempts')
+            except Exception:
+                pass
         else:
-            JOBS[job_id]['webhook_attempts'] = attempt
-            JOBS[job_id]['webhook_last_error'] = last_exc or ''
+            if job_id in JOBS:
+                JOBS[job_id]['webhook_attempts'] = attempt
+                JOBS[job_id]['webhook_last_error'] = last_exc or ''
 
         await asyncio.sleep(delays[min(attempt-1, len(delays)-1)])
 
@@ -93,15 +102,21 @@ async def send_webhook_with_retries(job_id: str, webhook: str, payload: Dict[str
     }
     try:
         if redis_client:
-            await redis_client.rpush('webhook:dlq', json.dumps(dlq_entry))
-            await redis_client.incr('metrics:webhook:dlq')
+            try:
+                await redis_client.rpush('webhook:dlq', json.dumps(dlq_entry))
+                await redis_client.incr('metrics:webhook:dlq')
+            except Exception as e:
+                logger.exception("Failed to push to DLQ", exc_info=e)
         else:
             logger.error("DLQ push (no redis)", extra={'dlq_entry': dlq_entry})
     except Exception as e:
         logger.exception("Failed to push to DLQ", exc_info=e)
 
     if redis_client:
-        await redis_client.incr('metrics:webhook:failed')
+        try:
+            await redis_client.incr('metrics:webhook:failed')
+        except Exception:
+            pass
     return False
 
 
@@ -395,20 +410,34 @@ async def generate_forecast_job(request: ForecastRequest, req: Request, webhook_
         'finished_at': ''
     }
 
+    global redis_client
     if redis_client:
-        # store as hash; result/error stored as JSON string when present
-        await redis_client.hset(_job_key(job_id), mapping=job_record)
-        # set a default TTL (7 days)
-        await redis_client.expire(_job_key(job_id), 60 * 60 * 24 * 7)
+        try:
+            # store as hash; result/error stored as JSON string when present
+            await redis_client.hset(_job_key(job_id), mapping=job_record)
+            # set a default TTL (7 days)
+            await redis_client.expire(_job_key(job_id), 60 * 60 * 24 * 7)
+        except Exception as e:
+            # If Redis is misconfigured/unavailable, fall back to in-memory store.
+            logger.warning("Redis unavailable; falling back to in-memory JOBS", extra={'error': str(e)})
+            redis_client = None
+            JOBS[job_id] = job_record
     else:
         JOBS[job_id] = job_record
 
     async def _run_job(job_id: str, request_obj: ForecastRequest, webhook: Optional[str]):
         # update status -> running
+        global redis_client
         if redis_client:
-            await redis_client.hset(_job_key(job_id), mapping={'status': 'running'})
+            try:
+                await redis_client.hset(_job_key(job_id), mapping={'status': 'running'})
+            except Exception:
+                redis_client = None
+                if job_id in JOBS:
+                    JOBS[job_id]['status'] = 'running'
         else:
-            JOBS[job_id]['status'] = 'running'
+            if job_id in JOBS:
+                JOBS[job_id]['status'] = 'running'
 
         # use module-level send_webhook_with_retries defined above
 
@@ -418,15 +447,23 @@ async def generate_forecast_job(request: ForecastRequest, req: Request, webhook_
 
             finished_at = datetime.utcnow().isoformat()
             if redis_client:
-                await redis_client.hset(_job_key(job_id), mapping={
-                    'status': 'finished',
-                    'result': json.dumps(result),
-                    'finished_at': finished_at
-                })
+                try:
+                    await redis_client.hset(_job_key(job_id), mapping={
+                        'status': 'finished',
+                        'result': json.dumps(result),
+                        'finished_at': finished_at
+                    })
+                except Exception:
+                    redis_client = None
+                    if job_id in JOBS:
+                        JOBS[job_id]['status'] = 'finished'
+                        JOBS[job_id]['result'] = result
+                        JOBS[job_id]['finished_at'] = finished_at
             else:
-                JOBS[job_id]['status'] = 'finished'
-                JOBS[job_id]['result'] = result
-                JOBS[job_id]['finished_at'] = finished_at
+                if job_id in JOBS:
+                    JOBS[job_id]['status'] = 'finished'
+                    JOBS[job_id]['result'] = result
+                    JOBS[job_id]['finished_at'] = finished_at
 
             if webhook:
                 payload = {'job_id': job_id, 'status': 'finished', 'result': result}
@@ -437,15 +474,23 @@ async def generate_forecast_job(request: ForecastRequest, req: Request, webhook_
         except Exception as e:
             finished_at = datetime.utcnow().isoformat()
             if redis_client:
-                await redis_client.hset(_job_key(job_id), mapping={
-                    'status': 'failed',
-                    'error': str(e),
-                    'finished_at': finished_at
-                })
+                try:
+                    await redis_client.hset(_job_key(job_id), mapping={
+                        'status': 'failed',
+                        'error': str(e),
+                        'finished_at': finished_at
+                    })
+                except Exception:
+                    redis_client = None
+                    if job_id in JOBS:
+                        JOBS[job_id]['status'] = 'failed'
+                        JOBS[job_id]['error'] = str(e)
+                        JOBS[job_id]['finished_at'] = finished_at
             else:
-                JOBS[job_id]['status'] = 'failed'
-                JOBS[job_id]['error'] = str(e)
-                JOBS[job_id]['finished_at'] = finished_at
+                if job_id in JOBS:
+                    JOBS[job_id]['status'] = 'failed'
+                    JOBS[job_id]['error'] = str(e)
+                    JOBS[job_id]['finished_at'] = finished_at
 
             if webhook:
                 payload = {'job_id': job_id, 'status': 'failed', 'error': str(e)}
@@ -456,9 +501,17 @@ async def generate_forecast_job(request: ForecastRequest, req: Request, webhook_
     # Schedule background task and return job metadata
     asyncio.create_task(_run_job(job_id, request, webhook_url))
 
-    status_path = f"/v1/forecast/jobs/{job_id}"
+    # NOTE: This router is mounted at /api/v1/forecast
+    status_path = f"/api/v1/forecast/jobs/{job_id}"
     base_url = str(req.base_url).rstrip('/')
-    status = (await redis_client.hget(_job_key(job_id), 'status')) if redis_client else JOBS[job_id]['status']
+    if redis_client:
+        try:
+            status = await redis_client.hget(_job_key(job_id), 'status')
+        except Exception:
+            redis_client = None
+            status = JOBS[job_id]['status']
+    else:
+        status = JOBS[job_id]['status']
     return {
         'job_id': job_id,
         'status_url': f"{base_url}{status_path}",
@@ -469,30 +522,38 @@ async def generate_forecast_job(request: ForecastRequest, req: Request, webhook_
 @router.get("/jobs/{job_id}")
 async def get_job_status(job_id: str, auth: bool = Depends(api_key_header)):
     """Return status and result (if finished) for a submitted job."""
+    global redis_client
     if redis_client:
-        data = await redis_client.hgetall(_job_key(job_id))
-        if not data:
-            raise HTTPException(status_code=404, detail="Job not found")
-        # parse JSON fields
-        if data.get('result'):
-            try:
-                data['result'] = json.loads(data['result'])
-            except Exception:
-                pass
-        return data
-    else:
-        job = JOBS.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-        return job
+        try:
+            data = await redis_client.hgetall(_job_key(job_id))
+        except Exception:
+            redis_client = None
+            data = None
+        if data:
+            if data.get('result'):
+                try:
+                    data['result'] = json.loads(data['result'])
+                except Exception:
+                    pass
+            return data
+
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 @router.get("/webhook/dlq")
 async def list_webhook_dlq(limit: int = 100, auth: bool = Depends(api_key_header)):
     """List entries in the webhook dead-letter queue (requires API key if set)."""
+    global redis_client
     if not redis_client:
         return {'count': 0, 'dlq': []}
-    items = await redis_client.lrange('webhook:dlq', 0, limit - 1)
+    try:
+        items = await redis_client.lrange('webhook:dlq', 0, limit - 1)
+    except Exception:
+        redis_client = None
+        return {'count': 0, 'dlq': []}
     parsed = []
     for it in items:
         try:
@@ -506,10 +567,15 @@ async def list_webhook_dlq(limit: int = 100, auth: bool = Depends(api_key_header
 async def requeue_webhook_dlq(job_id: str, auth: bool = Depends(api_key_header)):
     """Requeue a DLQ entry by `job_id`. This will remove the DLQ entry and
     attempt delivery again in the background."""
+    global redis_client
     if not redis_client:
         raise HTTPException(status_code=500, detail='Redis not configured')
 
-    items = await redis_client.lrange('webhook:dlq', 0, -1)
+    try:
+        items = await redis_client.lrange('webhook:dlq', 0, -1)
+    except Exception:
+        redis_client = None
+        raise HTTPException(status_code=500, detail='Redis not configured')
     found_raw = None
     for raw in items:
         try:
