@@ -167,6 +167,7 @@ def generate_forecast(request: ForecastRequest):
     - 'theta': Theta method - balanced approach
     - 'optimized_theta': Optimized theta
     - 'auto_ces': Complex exponential smoothing
+    - 'auto_model': Automatically selects the best StatsForecast model per item via cross-validation (defaults to a robust RMSE+MAE rank aggregation; excludes TimeGPT/LightGPT)
     
     **season_length** (default: 12): Length of one seasonal cycle
     - 7 = weekly seasonality (for daily data)
@@ -249,46 +250,70 @@ def generate_forecast(request: ForecastRequest):
         
         print(f"Forecaster initialized: {request.local_model if request.mode == 'local' else 'TimeGPT'}")
         
-        # Generate forecasts for each item
         results = []
         unique_items = df_his['item_id'].unique()
-        
+
         print(f"Generating forecasts for {len(unique_items)} items")
-        
-        for item_id in unique_items:
-            try:
-                # Filter data for this item
-                item_data = df_his[df_his['item_id'] == item_id].sort_values('day').reset_index(drop=True)
-                
-                # Generate forecast
-                forecast_values = forecaster.daily_path(item_data, periods=request.forecast_periods)
-                
-                # Generate future dates
-                last_date = item_data['day'].max()
-                future_dates = pd.date_range(
-                    start=last_date + pd.Timedelta(days=1 if request.freq == 'D' else 0),
-                    periods=request.forecast_periods,
-                    freq=request.freq
-                )
-                
-                results.append({
-                    'item_id': int(item_id) if isinstance(item_id, (int, float)) else str(item_id),
-                    'forecast': forecast_values.tolist(),
-                    'forecast_dates': [d.strftime('%Y-%m-%d') for d in future_dates],
-                    'model_used': request.local_model if request.mode == 'local' else 'timegpt',
-                    'periods_forecasted': len(forecast_values)
-                })
-                
-                print(f"  ✓ Item {item_id}: forecast generated")
-                
-            except Exception as e:
-                print(f"  ✗ Item {item_id}: {str(e)}")
-                results.append({
-                    'item_id': int(item_id) if isinstance(item_id, (int, float)) else str(item_id),
-                    'error': str(e),
-                    'forecast': [],
-                    'forecast_dates': []
-                })
+
+        # Auto-select best StatsForecast model per item (explicitly not TimeGPT/LightGPT)
+        if request.mode == 'local' and request.local_model in ('auto_model', 'automodel'):
+            panel_fcst = forecaster.auto_model_forecast_panel(df_his, h=request.forecast_periods, metric='robust')
+            id_map = {str(v): v for v in unique_items}
+            for uid, grp in panel_fcst.groupby('unique_id', sort=False):
+                try:
+                    original_item_id = id_map.get(str(uid), uid)
+                    item_id_out = int(original_item_id) if isinstance(original_item_id, (int, float)) else str(original_item_id)
+
+                    grp = grp.sort_values('ds')
+                    model_used = str(grp['model_used'].iloc[0])
+                    results.append({
+                        'item_id': item_id_out,
+                        'forecast': grp['yhat'].to_numpy(dtype=float).tolist(),
+                        'forecast_dates': [pd.to_datetime(d).strftime('%Y-%m-%d') for d in grp['ds'].tolist()],
+                        'model_used': model_used,
+                        'periods_forecasted': int(len(grp))
+                    })
+                    print(f"  ✓ Item {uid}: auto_model -> {model_used}")
+                except Exception as e:
+                    print(f"  ✗ Item {uid}: {str(e)}")
+                    results.append({
+                        'item_id': str(uid),
+                        'error': str(e),
+                        'forecast': [],
+                        'forecast_dates': []
+                    })
+        else:
+            for item_id in unique_items:
+                try:
+                    item_data = df_his[df_his['item_id'] == item_id].sort_values('day').reset_index(drop=True)
+
+                    forecast_values = forecaster.daily_path(item_data, periods=request.forecast_periods)
+
+                    last_date = item_data['day'].max()
+                    future_dates = pd.date_range(
+                        start=last_date + pd.Timedelta(days=1 if request.freq == 'D' else 0),
+                        periods=request.forecast_periods,
+                        freq=request.freq
+                    )
+
+                    results.append({
+                        'item_id': int(item_id) if isinstance(item_id, (int, float)) else str(item_id),
+                        'forecast': forecast_values.tolist(),
+                        'forecast_dates': [d.strftime('%Y-%m-%d') for d in future_dates],
+                        'model_used': request.local_model if request.mode == 'local' else 'timegpt',
+                        'periods_forecasted': len(forecast_values)
+                    })
+
+                    print(f"  ✓ Item {item_id}: forecast generated")
+
+                except Exception as e:
+                    print(f"  ✗ Item {item_id}: {str(e)}")
+                    results.append({
+                        'item_id': int(item_id) if isinstance(item_id, (int, float)) else str(item_id),
+                        'error': str(e),
+                        'forecast': [],
+                        'forecast_dates': []
+                    })
         
         print(f"Forecast generation completed: {len(results)} items processed")
         
@@ -342,38 +367,69 @@ async def generate_forecast_async(request: ForecastRequest):
 
         print(f"Generating async forecasts for {len(unique_items)} items")
 
-        for item_id in unique_items:
-            try:
-                item_data = df_his[df_his['item_id'] == item_id].sort_values('day').reset_index(drop=True)
+        if request.mode == 'local' and request.local_model in ('auto_model', 'automodel'):
+            panel_fcst = await asyncio.to_thread(
+                forecaster.auto_model_forecast_panel,
+                df_his,
+                request.forecast_periods,
+                'robust'
+            )
+            id_map = {str(v): v for v in unique_items}
+            for uid, grp in panel_fcst.groupby('unique_id', sort=False):
+                try:
+                    original_item_id = id_map.get(str(uid), uid)
+                    item_id_out = int(original_item_id) if isinstance(original_item_id, (int, float)) else str(original_item_id)
 
-                # Run potentially blocking forecasting call in a thread
-                forecast_values = await asyncio.to_thread(forecaster.daily_path, item_data, request.forecast_periods)
+                    grp = grp.sort_values('ds')
+                    model_used = str(grp['model_used'].iloc[0])
+                    results.append({
+                        'item_id': item_id_out,
+                        'forecast': grp['yhat'].to_numpy(dtype=float).tolist(),
+                        'forecast_dates': [pd.to_datetime(d).strftime('%Y-%m-%d') for d in grp['ds'].tolist()],
+                        'model_used': model_used,
+                        'periods_forecasted': int(len(grp))
+                    })
+                    print(f"  ✓ Item {uid}: async auto_model -> {model_used}")
+                except Exception as e:
+                    print(f"  ✗ Item {uid}: {str(e)}")
+                    results.append({
+                        'item_id': str(uid),
+                        'error': str(e),
+                        'forecast': [],
+                        'forecast_dates': []
+                    })
+        else:
+            for item_id in unique_items:
+                try:
+                    item_data = df_his[df_his['item_id'] == item_id].sort_values('day').reset_index(drop=True)
 
-                last_date = item_data['day'].max()
-                future_dates = pd.date_range(
-                    start=last_date + pd.Timedelta(days=1 if request.freq == 'D' else 0),
-                    periods=request.forecast_periods,
-                    freq=request.freq
-                )
+                    forecast_values = await asyncio.to_thread(forecaster.daily_path, item_data, request.forecast_periods)
 
-                results.append({
-                    'item_id': int(item_id) if isinstance(item_id, (int, float)) else str(item_id),
-                    'forecast': forecast_values.tolist(),
-                    'forecast_dates': [d.strftime('%Y-%m-%d') for d in future_dates],
-                    'model_used': request.local_model if request.mode == 'local' else 'timegpt',
-                    'periods_forecasted': len(forecast_values)
-                })
+                    last_date = item_data['day'].max()
+                    future_dates = pd.date_range(
+                        start=last_date + pd.Timedelta(days=1 if request.freq == 'D' else 0),
+                        periods=request.forecast_periods,
+                        freq=request.freq
+                    )
 
-                print(f"  ✓ Item {item_id}: async forecast generated")
+                    results.append({
+                        'item_id': int(item_id) if isinstance(item_id, (int, float)) else str(item_id),
+                        'forecast': forecast_values.tolist(),
+                        'forecast_dates': [d.strftime('%Y-%m-%d') for d in future_dates],
+                        'model_used': request.local_model if request.mode == 'local' else 'timegpt',
+                        'periods_forecasted': len(forecast_values)
+                    })
 
-            except Exception as e:
-                print(f"  ✗ Item {item_id}: {str(e)}")
-                results.append({
-                    'item_id': int(item_id) if isinstance(item_id, (int, float)) else str(item_id),
-                    'error': str(e),
-                    'forecast': [],
-                    'forecast_dates': []
-                })
+                    print(f"  ✓ Item {item_id}: async forecast generated")
+
+                except Exception as e:
+                    print(f"  ✗ Item {item_id}: {str(e)}")
+                    results.append({
+                        'item_id': int(item_id) if isinstance(item_id, (int, float)) else str(item_id),
+                        'error': str(e),
+                        'forecast': [],
+                        'forecast_dates': []
+                    })
 
         print(f"Async forecast generation completed: {len(results)} items processed")
 
@@ -439,7 +495,7 @@ async def generate_forecast_job(request: ForecastRequest, req: Request, webhook_
             if job_id in JOBS:
                 JOBS[job_id]['status'] = 'running'
 
-        # use module-level send_webhook_with_retries defined above
+        # use module-level send_wits pebhook_with_retries defined above
 
         try:
             # Run the existing synchronous generator in a thread to avoid blocking
