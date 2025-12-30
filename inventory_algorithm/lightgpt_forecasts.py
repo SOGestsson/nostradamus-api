@@ -4,13 +4,26 @@ from __future__ import annotations
 import os
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Any, Optional
+from typing import List, Dict
 
 try:
     from nixtla import NixtlaClient
     _HAS_LIGHTGPT = True
 except Exception:
     _HAS_LIGHTGPT = False
+
+
+def _season_length_for_freq(freq: str) -> int:
+    f = (freq or '').strip().upper()
+    if f in ('D', 'B'):
+        return 7
+    if f.startswith('W'):
+        return 52
+    if f in ('M', 'MS'):
+        return 12
+    if f in ('Q', 'QS'):
+        return 4
+    return 1
 
 
 class LightGPTForecast:
@@ -43,11 +56,25 @@ class LightGPTForecast:
         self.model = model
         self.freq = freq
         self._client = None
-        
-        if not _HAS_LIGHTGPT:
-            raise RuntimeError("Nixtla package not available. Install with `pip install nixtla`.")
-        
-        self._client = NixtlaClient(api_key=api_key or os.environ.get("NIXTLA_API_KEY"))
+        self._backend = 'local'
+
+        # LightGPT endpoints should NOT require a Nixtla key.
+        # If a key is explicitly available we can use Nixtla; otherwise fall
+        # back to local StatsForecast models.
+        api_key_eff = (api_key or os.environ.get('NIXTLA_API_KEY') or '').strip()
+        if api_key_eff and _HAS_LIGHTGPT:
+            self._client = NixtlaClient(api_key=api_key_eff)
+            self._backend = 'nixtla'
+
+        if self._backend == 'local':
+            from inventory_algorithm.classical_forecasts import ClassicalForecasts
+
+            self._local_forecaster = ClassicalForecasts(
+                mode='local',
+                local_model='auto_model',
+                season_length=_season_length_for_freq(self.freq),
+                freq=self.freq,
+            )
 
     # ---------- Batch forecast with drivers ----------
     def batch_forecast_with_drivers(self,
@@ -122,24 +149,41 @@ class LightGPTForecast:
             
             print(f"  Using exogenous columns: {exogenous_columns}")
             print(f"  Data shape: {df_formatted.shape}")
-            
-            # Call LightGPT
-            fcst = self._client.forecast(
-                df=df_formatted,
-                h=forecast_periods,
-                freq=self.freq,
-                time_col='ds',
-                target_col='y',
-                model=self.model,
-                X_df=df_formatted[['unique_id', 'ds'] + exogenous_columns] if exogenous_columns else None
-            )
-            
-            # Format output
-            result = pd.DataFrame({
-                'item_id': fcst['unique_id'].astype(int),
-                'day': pd.to_datetime(fcst['ds']),
-                'forecast': fcst.get(self.model, fcst.get(f'{self.model}-q-50', np.nan)),
-            })
+
+            if self._backend == 'nixtla':
+                # Call LightGPT (Nixtla)
+                fcst = self._client.forecast(
+                    df=df_formatted,
+                    h=forecast_periods,
+                    freq=self.freq,
+                    time_col='ds',
+                    target_col='y',
+                    model=self.model,
+                    X_df=df_formatted[['unique_id', 'ds'] + exogenous_columns] if exogenous_columns else None,
+                )
+
+                # Format output
+                result = pd.DataFrame({
+                    'item_id': fcst['unique_id'].astype(int),
+                    'day': pd.to_datetime(fcst['ds']),
+                    'forecast': fcst.get(self.model, fcst.get(f'{self.model}-q-50', np.nan)),
+                })
+            else:
+                # Local fallback (no API key required).
+                # Note: exogenous_columns/drivers are ignored in this fallback.
+                id_map = {
+                    str(i): i
+                    for i in df_hist[['item_id']].drop_duplicates()['item_id'].tolist()
+                }
+
+                panel = self._local_forecaster.auto_model_forecast_panel(
+                    hist=df_hist[['item_id', 'day', 'actual_sale']].copy(),
+                    h=int(forecast_periods),
+                )
+                result = panel.rename(columns={'ds': 'day', 'yhat': 'forecast'})
+                result['item_id'] = result['unique_id'].map(id_map)
+                result = result.loc[:, ['item_id', 'day', 'forecast']]
+                result['day'] = pd.to_datetime(result['day'])
             
             print(f"Batch forecast completed for {result['item_id'].nunique()} items")
             return result
@@ -181,28 +225,43 @@ class LightGPTForecast:
                 
                 # Filter data for this group
                 group_data = df[df[group_column] == group].copy()
-                
-                # Prepare for batch forecast
-                group_data_formatted = group_data[['item_id', 'day', 'actual_sale']].copy()
-                group_data_formatted['day'] = pd.to_datetime(group_data_formatted['day'])
-                group_data_formatted.columns = ['unique_id', 'ds', 'y']
-                
-                # Forecast this group
-                fcst = self._client.forecast(
-                    df=group_data_formatted,
-                    h=forecast_periods,
-                    freq=self.freq,
-                    time_col='ds',
-                    target_col='y',
-                    model=self.model
-                )
-                
-                results[group] = pd.DataFrame({
-                    'item_id': fcst['unique_id'].astype(int),
-                    'day': pd.to_datetime(fcst['ds']),
-                    'forecast': fcst.get(self.model, np.nan),
-                    'group': group
-                })
+
+                if self._backend == 'nixtla':
+                    # Prepare for batch forecast
+                    group_data_formatted = group_data[['item_id', 'day', 'actual_sale']].copy()
+                    group_data_formatted['day'] = pd.to_datetime(group_data_formatted['day'])
+                    group_data_formatted.columns = ['unique_id', 'ds', 'y']
+
+                    # Forecast this group
+                    fcst = self._client.forecast(
+                        df=group_data_formatted,
+                        h=forecast_periods,
+                        freq=self.freq,
+                        time_col='ds',
+                        target_col='y',
+                        model=self.model,
+                    )
+
+                    results[group] = pd.DataFrame({
+                        'item_id': fcst['unique_id'].astype(int),
+                        'day': pd.to_datetime(fcst['ds']),
+                        'forecast': fcst.get(self.model, np.nan),
+                        'group': group,
+                    })
+                else:
+                    id_map = {
+                        str(i): i
+                        for i in group_data[['item_id']].drop_duplicates()['item_id'].tolist()
+                    }
+                    panel = self._local_forecaster.auto_model_forecast_panel(
+                        hist=group_data[['item_id', 'day', 'actual_sale']].copy(),
+                        h=int(forecast_periods),
+                    )
+                    out = panel.rename(columns={'ds': 'day', 'yhat': 'forecast'})
+                    out['item_id'] = out['unique_id'].map(id_map)
+                    out = out.loc[:, ['item_id', 'day', 'forecast']]
+                    out['group'] = group
+                    results[group] = out
             
             print(f"Cross-learning forecast completed for {len(groups)} groups")
             return results
@@ -243,23 +302,33 @@ class LightGPTForecast:
             df_formatted = df[['hierarchy_id', 'day', 'actual_sale']].copy()
             df_formatted['day'] = pd.to_datetime(df_formatted['day'])
             df_formatted.columns = ['unique_id', 'ds', 'y']
-            
-            # Forecast hierarchical structure
-            fcst = self._client.forecast(
-                df=df_formatted,
-                h=forecast_periods,
-                freq=self.freq,
-                time_col='ds',
-                target_col='y',
-                model=self.model
-            )
-            
-            # Parse hierarchy back
-            result = pd.DataFrame({
-                'hierarchy_id': fcst['unique_id'],
-                'day': pd.to_datetime(fcst['ds']),
-                'forecast': fcst.get(self.model, np.nan),
-            })
+
+            if self._backend == 'nixtla':
+                # Forecast hierarchical structure (Nixtla)
+                fcst = self._client.forecast(
+                    df=df_formatted,
+                    h=forecast_periods,
+                    freq=self.freq,
+                    time_col='ds',
+                    target_col='y',
+                    model=self.model,
+                )
+
+                # Parse hierarchy back
+                result = pd.DataFrame({
+                    'hierarchy_id': fcst['unique_id'],
+                    'day': pd.to_datetime(fcst['ds']),
+                    'forecast': fcst.get(self.model, np.nan),
+                })
+            else:
+                # Local fallback: treat each hierarchy_id as a series.
+                panel = self._local_forecaster.auto_model_forecast_panel(
+                    hist=df_formatted,
+                    h=int(forecast_periods),
+                )
+                result = panel.rename(columns={'unique_id': 'hierarchy_id', 'ds': 'day', 'yhat': 'forecast'})
+                result = result.loc[:, ['hierarchy_id', 'day', 'forecast']]
+                result['day'] = pd.to_datetime(result['day'])
             
             # Split hierarchy back into columns
             for i, level in enumerate(hierarchy):
