@@ -125,7 +125,7 @@ def forecasts_to_rows(response_json: dict):
       "mode": "local",
       "model": "auto_ets",
       "periods": 6,
-      "frequency": "MS"
+            "frequency": "M"
     }
     """
     rows = []
@@ -219,9 +219,9 @@ def main():
     )
     parser.add_argument(
         "--freq",
-        default="MS",
-        help="Pandas-style frequency string (D, MS, W, H, Q, Y). "
-        "Your example file looks like monthly start, so default is MS.",
+        default="M",
+        help="Pandas-style frequency string (D, M, W, H, Q, Y). "
+        "For monthly series, prefer M.",
     )
     parser.add_argument(
         "--api-key",

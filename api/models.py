@@ -32,9 +32,16 @@ class ForecastRequest(BaseModel):
     mode: str = 'local'  # 'local' or 'timegpt'
     local_model: str = 'auto_arima'  # Model type for local mode
     season_length: int = 12  # Seasonality period
-    freq: str = 'D'  # 'D'=daily, 'MS'=monthly, 'W'=weekly
+    freq: str = 'D'  # 'D'=daily, 'M'=monthly, 'W'=weekly
     api_key: Optional[str] = None  # For TimeGPT mode
     quantiles: Optional[List[float]] = None  # For TimeGPT quantile forecasts
+
+    # Optional tuning knobs for local_model='auto_model'
+    auto_model_metric: Optional[str] = None  # 'robust'|'rmse'|'mae' (default handled in endpoint)
+    auto_model_cv_h: Optional[int] = None  # CV horizon per window (periods)
+    auto_model_n_windows: Optional[int] = None  # Number of rolling CV windows
+    auto_model_lookback_days: Optional[int] = None  # Use only last N days per item
+    auto_model_lookback_periods: Optional[int] = None  # Use only last N observations per item
 
 
 class ForecastResponse(BaseModel):

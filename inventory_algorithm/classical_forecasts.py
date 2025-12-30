@@ -157,7 +157,7 @@ class ClassicalForecasts:
 
     Conventions:
       - Input history is a DataFrame with columns: ['day', 'actual_sale', 'item_id']
-      - Frequency 'MS' for monthly data (month start)
+            - Frequency 'M' for monthly data (month end)
     """
 
     def __init__(self,
@@ -167,12 +167,13 @@ class ClassicalForecasts:
                  quantiles: list[float] | None = None,   # e.g., [0.1,0.5,0.8,0.95]
                  local_model: str = 'auto_arima',    # 'auto_arima'|'auto_ets'|'croston_optimized'|'adida'|'theta'
                  season_length: int = 12,  # Seasonality period (12=yearly cycle in monthly data)
-                 freq: str = 'MS',  # Pandas freq: 'MS'=monthly, 'D'=daily, 'W'=weekly
+                 freq: str = 'M',  # Pandas freq: 'M'=monthly, 'D'=daily, 'W'=weekly
                  ):
         self.mode = mode
         self.quantiles = quantiles or []
         self.model_name = model
-        self.freq = freq
+        # Backwards compatibility: accept legacy month-start shorthand.
+        self.freq = 'M' if (freq or '').strip().lower() == 'ms' else freq
         self._client = None
         self.local_model = local_model
         self.season_length = season_length
@@ -301,6 +302,8 @@ class ClassicalForecasts:
         metric: str = 'robust',
         cv_h: Optional[int] = None,
         n_windows: int = 1,
+        lookback_days: Optional[int] = None,
+        lookback_periods: Optional[int] = None,
     ) -> pd.DataFrame:
         """Select best StatsForecast model per series and forecast.
 
@@ -317,6 +320,22 @@ class ClassicalForecasts:
         df, _ = self._to_statsforecast_df(hist)
         if df.empty:
             raise ValueError('Empty history')
+
+        if lookback_periods is not None and int(lookback_periods) > 0:
+            # Frequency-agnostic: keep only the last N observations per series.
+            df = (
+                df.sort_values(['unique_id', 'ds'])
+                .groupby('unique_id', as_index=False, sort=False)
+                .tail(int(lookback_periods))
+            )
+        elif lookback_days is not None and int(lookback_days) > 0:
+            # Time-based: keep only observations within last N days per series.
+            max_ds = df.groupby('unique_id', as_index=False)['ds'].transform('max')
+            cutoff = max_ds - pd.Timedelta(days=int(lookback_days))
+            df = df.loc[df['ds'] >= cutoff]
+
+        if df.empty:
+            raise ValueError('Empty history after lookback filter')
 
         metric_name, metric_fn = _metric_func_from_name(metric)
         cv_h_eff = int(cv_h) if cv_h is not None else int(min(h, max(1, self.season_length)))
@@ -470,14 +489,78 @@ class ClassicalForecasts:
         metric: str = 'robust',
         cv_h: Optional[int] = None,
         n_windows: int = 1,
+        lookback_days: Optional[int] = None,
+        lookback_periods: Optional[int] = None,
     ) -> tuple[np.ndarray, str]:
         """Auto-select a model for a single series; returns (forecast_path, model_used)."""
         df = item_hist.rename(columns={'day': 'ds', 'actual_sale': 'y'}).loc[:, ['ds', 'y']].copy()
         df['unique_id'] = 'item'
-        panel = self.auto_model_forecast_panel(df, h=h, metric=metric, cv_h=cv_h, n_windows=n_windows)
+        panel = self.auto_model_forecast_panel(
+            df,
+            h=h,
+            metric=metric,
+            cv_h=cv_h,
+            n_windows=n_windows,
+            lookback_days=lookback_days,
+            lookback_periods=lookback_periods,
+        )
         model_used = str(panel['model_used'].iloc[0])
         path = panel['yhat'].to_numpy(dtype=float)
         return path, model_used
+
+    def forecast_panel_with_selected_models(
+        self,
+        hist: pd.DataFrame,
+        h: int,
+        model_by_uid: dict[str, str],
+    ) -> pd.DataFrame:
+        """Forecast a panel using a pre-selected model per series.
+
+        This bypasses CV and is intended for cases where model selection was done
+        on a transformed representation (e.g., monthly aggregates) but forecasting
+        should be performed at the original frequency.
+
+        Returns DataFrame with columns: ['unique_id', 'ds', 'yhat', 'model_used'].
+        """
+        from statsforecast import StatsForecast
+
+        if h <= 0:
+            raise ValueError('h must be > 0')
+
+        df, _ = self._to_statsforecast_df(hist)
+        if df.empty:
+            raise ValueError('Empty history')
+
+        # Build a mapping from model class name -> factory.
+        factories = {name: factory for name, factory in _build_candidate_model_factories(int(self.season_length))}
+
+        by_model: dict[str, list[str]] = {}
+        for uid in df['unique_id'].unique().tolist():
+            model_name = model_by_uid.get(str(uid), 'Naive')
+            by_model.setdefault(model_name, []).append(str(uid))
+
+        parts: list[pd.DataFrame] = []
+        for model_name, uids in by_model.items():
+            factory = factories.get(model_name)
+            if factory is None:
+                # Unknown model name -> safe fallback
+                factory = factories.get('Naive')
+                model_name = 'Naive'
+            sf_one = StatsForecast(models=[factory()], freq=self.freq, n_jobs=1)
+            fcst = sf_one.forecast(df=df[df['unique_id'].isin(uids)], h=h)
+            if model_name not in fcst.columns:
+                raise RuntimeError(f"Expected forecast column '{model_name}' not found")
+            part = fcst.loc[:, ['unique_id', 'ds']].copy()
+            part['yhat'] = fcst[model_name].to_numpy(dtype=float)
+            part['model_used'] = model_name
+            parts.append(part)
+
+        if not parts:
+            raise RuntimeError('Failed to generate forecasts for any series')
+
+        out = pd.concat(parts, ignore_index=True)
+        out['yhat'] = out['yhat'].clip(lower=0.0)
+        return out.sort_values(['unique_id', 'ds']).reset_index(drop=True)
 
     # ---------- Public: daily path ----------
     def daily_path(self, item_hist: pd.DataFrame, periods: int) -> np.ndarray:

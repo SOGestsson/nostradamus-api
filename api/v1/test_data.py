@@ -23,7 +23,7 @@ class InputAndForecastRequest(BaseModel):
     mode: str = "local"
     local_model: str = "auto_ets"
     season_length: int = 12
-    freq: str = "MS"
+    freq: str = "M"
     quantiles: Optional[List[float]] = None
     endpoint: Optional[str] = None
     timeout: int = 30

@@ -18,7 +18,7 @@ class ForecastInputForecastBuilder:
     mode: str = "local"
     local_model: str = "auto_ets"
     season_length: int = 12
-    freq: str = "MS"
+    freq: str = "M"
     base_url: str = "https://api.nostradamus-api.com/api/v1/test-data/history/{item_id}"
     request_timeout: int = 15
     session: requests.Session = field(default_factory=requests.Session)
