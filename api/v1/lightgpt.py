@@ -37,6 +37,10 @@ def batch_forecast_with_drivers(request: LightGPTForecastRequest):
     - Columns: item_id, day, driver_name, driver_value
     - Or global: day, driver_name, driver_value
     
+    **freq**: Input/output frequency
+    - 'D' for daily
+    - 'MS'/'M'/'monthly' for monthly (handled as month-start internally)
+
     **exogenous_columns**: Which driver columns to use
     - Example: ['price', 'promotion', 'seasonality_index']
     """
@@ -54,9 +58,12 @@ def batch_forecast_with_drivers(request: LightGPTForecastRequest):
         df_drivers = None
         if request.external_drivers:
             df_drivers = pd.DataFrame(request.external_drivers)
+            if 'day' in df_drivers.columns:
+                df_drivers['day'] = pd.to_datetime(df_drivers['day'])
         
         # Initialize forecaster
-        forecaster = LightGPTForecast()
+        forecaster = LightGPTForecast(freq=request.freq)
+        freq_used = forecaster.freq_label
         
         # Generate forecasts
         result = forecaster.batch_forecast_with_drivers(
@@ -71,7 +78,8 @@ def batch_forecast_with_drivers(request: LightGPTForecastRequest):
             'forecasts': result.to_dict(orient='records'),
             'total_items': df_hist['item_id'].nunique(),
             'forecast_type': 'batch',
-            'periods': request.forecast_periods
+            'periods': request.forecast_periods,
+            'freq': freq_used,
         }
         
     except Exception as e:
@@ -91,12 +99,15 @@ def cross_learning_forecast(request: LightGPTForecastRequest):
             raise ValueError("group_column required for cross_learning")
         
         df_hist = pd.DataFrame(request.sim_input_his)
+        if 'day' in df_hist.columns:
+            df_hist['day'] = pd.to_datetime(df_hist['day'])
         df_items = pd.DataFrame(request.item_attributes) if request.item_attributes else None
         
         if df_items is None:
             raise ValueError("item_attributes required for cross_learning")
         
-        forecaster = LightGPTForecast()
+        forecaster = LightGPTForecast(freq=request.freq)
+        freq_used = forecaster.freq_label
         
         results = forecaster.forecast_with_cross_learning(
             hist=df_hist,
@@ -113,7 +124,8 @@ def cross_learning_forecast(request: LightGPTForecastRequest):
             'total_items': df_hist['item_id'].nunique(),
             'groups': list(results.keys()),
             'forecast_type': 'cross_learning',
-            'group_column': request.group_column
+            'group_column': request.group_column,
+            'freq': freq_used,
         }
         
     except Exception as e:
@@ -133,9 +145,12 @@ def hierarchical_forecast(request: LightGPTForecastRequest):
             raise ValueError("hierarchy required (e.g., ['brand', 'category', 'item_id'])")
         
         df_hist = pd.DataFrame(request.sim_input_his)
+        if 'day' in df_hist.columns:
+            df_hist['day'] = pd.to_datetime(df_hist['day'])
         df_items = pd.DataFrame(request.item_attributes) if request.item_attributes else None
         
-        forecaster = LightGPTForecast()
+        forecaster = LightGPTForecast(freq=request.freq)
+        freq_used = forecaster.freq_label
         
         result = forecaster.hierarchical_forecast(
             hist=df_hist,
@@ -148,7 +163,8 @@ def hierarchical_forecast(request: LightGPTForecastRequest):
             'forecasts': result.to_dict(orient='records'),
             'total_items': df_hist['item_id'].nunique(),
             'hierarchy': request.hierarchy,
-            'forecast_type': 'hierarchical'
+            'forecast_type': 'hierarchical',
+            'freq': freq_used,
         }
         
     except Exception as e:

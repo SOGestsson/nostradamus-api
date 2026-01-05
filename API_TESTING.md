@@ -99,6 +99,31 @@ Run simulation and return only purchase frequency histogram (lighter response).
 }
 ```
 
+### LightGPT Forecast Endpoints
+
+#### POST `/api/v1/lightgpt/batch`
+Batch forecast for multiple items.
+
+Key parameters:
+- `sim_input_his`: list of `{item_id, day, actual_sale, ...optional exogenous...}`
+- `forecast_periods`: number of future periods
+- `freq`: `'D'` for daily, `'M'`/`'monthly'` for monthly (handled as month-start internally)
+
+Example (monthly input → monthly output):
+```bash
+curl -X POST http://localhost:8000/api/v1/lightgpt/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "freq": "M",
+    "forecast_periods": 6,
+    "sim_input_his": [
+      {"item_id": 31, "actual_sale": 20, "day": "2024-01-01"},
+      {"item_id": 31, "actual_sale": 18, "day": "2024-02-01"},
+      {"item_id": 31, "actual_sale": 25, "day": "2024-03-01"}
+    ]
+  }'
+```
+
 ## Running the Server
 
 ### 1. Start the server

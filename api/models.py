@@ -57,6 +57,7 @@ class LightGPTForecastRequest(BaseModel):
     sim_input_his: List[Dict[str, Any]]  # Historical sales with item_id, day, actual_sale, optional drivers
     item_attributes: Optional[List[Dict[str, Any]]] = None  # Item metadata (brand, category, etc.)
     external_drivers: Optional[List[Dict[str, Any]]] = None  # External regressors (price, promotion, etc.)
+    freq: str = 'D'  # 'D'=daily, 'M'=monthly (treated as month-start internally)
     forecast_periods: int = 30
     exogenous_columns: Optional[List[str]] = None  # Which driver columns to use
     forecast_type: str = 'batch'  # 'batch', 'cross_learning', 'hierarchical', 'scenarios'

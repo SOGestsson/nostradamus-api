@@ -13,6 +13,86 @@ except Exception:
     _HAS_LIGHTGPT = False
 
 
+def _canonicalize_freq(freq: str | None) -> str:
+    """Return a pandas/Nixtla-compatible frequency string.
+
+    Note: For monthly data we *operate* on month-start ('MS') even if the API
+    label is 'M'. This avoids month-end alignment surprises when input dates
+    are provided as 'YYYY-MM-01'.
+    """
+    f = (freq or '').strip().upper()
+    if not f:
+        return 'D'
+    if f in {'MONTH', 'MONTHLY'}:
+        return 'MS'
+    if f in {'M', 'MS'}:
+        return 'MS'
+    if f in {'DAY', 'DAILY'}:
+        return 'D'
+    return f
+
+
+def _freq_label(freq: str | None) -> str:
+    """Return the external label for a frequency.
+
+    We expose monthly as 'M' even though we operate on 'MS' internally.
+    """
+    f = (freq or '').strip().upper()
+    if not f:
+        return 'D'
+    if f in {'MONTH', 'MONTHLY', 'M', 'MS'}:
+        return 'M'
+    if f in {'DAY', 'DAILY'}:
+        return 'D'
+    return f
+
+
+def _normalize_to_freq(df: pd.DataFrame, *, freq: str) -> pd.DataFrame:
+    """Normalize history/drivers to the requested frequency.
+
+    For monthly frequency we:
+      - map dates to the month bucket
+      - aggregate duplicates per (item_id, month)
+      - sum `actual_sale` and average other numeric columns
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    if 'day' not in out.columns:
+        return out
+
+    out['day'] = pd.to_datetime(out['day'])
+
+    f = _canonicalize_freq(freq)
+    if f == 'MS':
+        out['day'] = out['day'].dt.to_period('M').dt.to_timestamp('MS')
+
+        group_cols: list[str] = ['day']
+        if 'item_id' in out.columns:
+            group_cols = ['item_id', 'day']
+
+        value_cols = [c for c in out.columns if c not in group_cols]
+        if not value_cols:
+            return out.drop_duplicates(subset=group_cols).sort_values(group_cols).reset_index(drop=True)
+
+        agg: dict[str, str] = {}
+        if 'actual_sale' in value_cols:
+            agg['actual_sale'] = 'sum'
+
+        for col in value_cols:
+            if col in agg:
+                continue
+            if pd.api.types.is_numeric_dtype(out[col]):
+                agg[col] = 'mean'
+            else:
+                agg[col] = 'last'
+
+        out = out.groupby(group_cols, as_index=False, sort=True).agg(agg)
+
+    return out
+
+
 def _season_length_for_freq(freq: str) -> int:
     f = (freq or '').strip().upper()
     if f in ('D', 'B'):
@@ -54,7 +134,8 @@ class LightGPTForecast:
             freq: Data frequency ('D', 'MS', 'W', etc.)
         """
         self.model = model
-        self.freq = freq
+        self.freq = _canonicalize_freq(freq)
+        self.freq_label = _freq_label(freq)
         self._client = None
         self._backend = 'local'
 
@@ -116,7 +197,7 @@ class LightGPTForecast:
             
             # Prepare data
             df_hist = hist.copy()
-            df_hist['day'] = pd.to_datetime(df_hist['day'])
+            df_hist = _normalize_to_freq(df_hist, freq=self.freq)
             
             # Add item attributes if provided
             if item_attributes is not None:
@@ -126,7 +207,7 @@ class LightGPTForecast:
             # Add drivers if provided
             if drivers is not None:
                 df_drivers = drivers.copy()
-                df_drivers['day'] = pd.to_datetime(df_drivers['day'])
+                df_drivers = _normalize_to_freq(df_drivers, freq=self.freq)
                 
                 # If drivers have item_id, merge by item_id and day
                 if 'item_id' in df_drivers.columns:
@@ -214,8 +295,9 @@ class LightGPTForecast:
         try:
             print(f"Starting cross-learning forecast grouped by '{group_column}'")
             
-            # Merge attributes with history
-            df = hist.merge(item_attributes, on='item_id', how='left')
+            # Normalize and merge attributes with history
+            hist_norm = _normalize_to_freq(hist.copy(), freq=self.freq)
+            df = hist_norm.merge(item_attributes, on='item_id', how='left')
             
             results = {}
             groups = df[group_column].unique()
@@ -293,7 +375,8 @@ class LightGPTForecast:
         try:
             print(f"Starting hierarchical forecast with hierarchy: {' > '.join(hierarchy)}")
             
-            df = hist.merge(item_attributes, on='item_id', how='left')
+            hist_norm = _normalize_to_freq(hist.copy(), freq=self.freq)
+            df = hist_norm.merge(item_attributes, on='item_id', how='left')
             
             # Create hierarchical identifier
             df['hierarchy_id'] = df[hierarchy].astype(str).agg('/'.join, axis=1)
@@ -371,8 +454,9 @@ class LightGPTForecast:
                 print(f"  Forecasting scenario: {scenario_name}")
                 
                 # Combine historical data with scenario drivers
-                scenario_data = hist.copy()
-                scenario_data = scenario_data.merge(scenario_drivers, on=['item_id', 'day'], how='left')
+                scenario_data = _normalize_to_freq(hist.copy(), freq=self.freq)
+                scenario_drivers_norm = _normalize_to_freq(scenario_drivers.copy(), freq=self.freq)
+                scenario_data = scenario_data.merge(scenario_drivers_norm, on=['item_id', 'day'], how='left')
                 
                 # Generate forecast for this scenario
                 fcst = self.batch_forecast_with_drivers(
