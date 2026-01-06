@@ -152,6 +152,7 @@ class LightGPTForecast:
         self.freq = _canonicalize_freq(freq)
         self.freq_label = _freq_label(freq)
         self._client = None
+        self._backend = 'nixtla'
 
         if not _HAS_LIGHTGPT:
             raise RuntimeError("Nixtla package not available. Install with `pip install nixtla`.")
@@ -215,6 +216,21 @@ class LightGPTForecast:
             if drivers is not None:
                 df_drivers = drivers.copy()
                 df_drivers = _normalize_to_freq(df_drivers, freq=self.freq)
+
+                # Support long-format drivers: (item_id?, day, driver_name, driver_value)
+                if {'driver_name', 'driver_value'}.issubset(df_drivers.columns):
+                    idx_cols = ['day']
+                    if 'item_id' in df_drivers.columns:
+                        idx_cols = ['item_id', 'day']
+
+                    df_drivers = (
+                        df_drivers
+                        .pivot_table(index=idx_cols, columns='driver_name', values='driver_value', aggfunc='last')
+                        .reset_index()
+                    )
+
+                    # Flatten column index introduced by pivot_table
+                    df_drivers.columns = [str(c) for c in df_drivers.columns]
                 
                 # If drivers have item_id, merge by item_id and day
                 if 'item_id' in df_drivers.columns:
@@ -228,11 +244,18 @@ class LightGPTForecast:
             if exogenous_columns is None:
                 excluded = {'item_id', 'day', 'actual_sale', 'brand', 'item_group', 
                            'category', 'supplier', 'margin', 'sku', 'description'}
-                exogenous_columns = [col for col in df_hist.columns if col not in excluded]
+                candidates = [col for col in df_hist.columns if col not in excluded]
+                exogenous_columns = [
+                    col for col in candidates
+                    if pd.api.types.is_numeric_dtype(df_hist[col])
+                ]
+
+            # Keep only columns that actually exist (prevents KeyError if caller passes extras)
+            exogenous_columns = [c for c in (exogenous_columns or []) if c in df_hist.columns]
             
             # Prepare data for LightGPT
             # Rename columns to match Nixtla format
-            df_formatted = df_hist[['item_id', 'day', 'actual_sale'] + exogenous_columns].copy()
+            df_formatted = df_hist[['item_id', 'day', 'actual_sale'] + (exogenous_columns or [])].copy()
             df_formatted.columns = ['unique_id', 'ds', 'y'] + exogenous_columns
             
             print(f"  Using exogenous columns: {exogenous_columns}")
@@ -253,8 +276,15 @@ class LightGPTForecast:
             fcst_ds = pd.to_datetime(fcst['ds'])
             if (self.freq or '').upper() == 'MS':
                 fcst_ds = fcst_ds.dt.to_period('M').dt.to_timestamp(how='start')
+
+            item_ids = fcst['unique_id']
+            try:
+                item_ids = item_ids.astype(int)
+            except Exception:
+                pass
+
             result = pd.DataFrame({
-                'item_id': fcst['unique_id'].astype(int),
+                'item_id': item_ids,
                 'day': fcst_ds,
                 'forecast': fcst.get(self.model, fcst.get(f'{self.model}-q-50', np.nan)),
             })

@@ -3,7 +3,8 @@
 Pydantic models for API requests and responses.
 """
 from typing import List, Dict, Any, Optional
-from pydantic import BaseModel
+
+from pydantic import BaseModel, ConfigDict, Field, AliasChoices
 
 
 class SimInput(BaseModel):
@@ -54,13 +55,24 @@ class ForecastResponse(BaseModel):
 
 class LightGPTForecastRequest(BaseModel):
     """Request model for LightGPT batch forecasting."""
+    model_config = ConfigDict(populate_by_name=True)
+
     sim_input_his: List[Dict[str, Any]]  # Historical sales with item_id, day, actual_sale, optional drivers
     item_attributes: Optional[List[Dict[str, Any]]] = None  # Item metadata (brand, category, etc.)
     external_drivers: Optional[List[Dict[str, Any]]] = None  # External regressors (price, promotion, etc.)
     freq: str = 'D'  # 'D'=daily, 'M'=monthly (treated as month-start internally)
     forecast_periods: int = 30
-    api_key: Optional[str] = None  # Optional Nixtla API key (otherwise uses NIXTLA_API_KEY env var)
-    exogenous_columns: Optional[List[str]] = None  # Which driver columns to use
+
+    api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices('api_key', 'apiKey', 'nixtla_api_key', 'nixtlaApiKey', 'NIXTLA_API_KEY'),
+    )
+
+    exogenous_columns: Optional[List[str]] = Field(
+        default=None,
+        validation_alias=AliasChoices('exogenous_columns', 'exogenousColumns'),
+    )
+
     forecast_type: str = 'batch'  # 'batch', 'cross_learning', 'hierarchical', 'scenarios'
     group_column: Optional[str] = None  # For cross_learning: 'brand', 'category', etc.
     hierarchy: Optional[List[str]] = None  # For hierarchical: ['brand', 'category', 'item_id']

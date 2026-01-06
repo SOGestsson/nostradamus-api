@@ -7,7 +7,7 @@ import traceback
 from typing import Dict, Any, List, Optional
 import pandas as pd
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 
 from api.models import LightGPTForecastRequest
 from inventory_algorithm.lightgpt_forecasts import LightGPTForecast
@@ -16,7 +16,10 @@ router = APIRouter()
 
 
 @router.post("/batch")
-def batch_forecast_with_drivers(request: LightGPTForecastRequest):
+def batch_forecast_with_drivers(
+    request: LightGPTForecastRequest,
+    x_nixtla_api_key: str | None = Header(default=None, alias="X-Nixtla-Api-Key"),
+):
     """
     Batch forecast for multiple items with external drivers and item attributes.
     
@@ -62,7 +65,8 @@ def batch_forecast_with_drivers(request: LightGPTForecastRequest):
                 df_drivers['day'] = pd.to_datetime(df_drivers['day'])
         
         # Initialize forecaster (requires Nixtla key)
-        forecaster = LightGPTForecast(freq=request.freq, api_key=request.api_key)
+        api_key = request.api_key or x_nixtla_api_key
+        forecaster = LightGPTForecast(freq=request.freq, api_key=api_key)
         freq_used = forecaster.freq_label
         
         # Generate forecasts
@@ -92,7 +96,10 @@ def batch_forecast_with_drivers(request: LightGPTForecastRequest):
 
 
 @router.post("/cross_learning")
-def cross_learning_forecast(request: LightGPTForecastRequest):
+def cross_learning_forecast(
+    request: LightGPTForecastRequest,
+    x_nixtla_api_key: str | None = Header(default=None, alias="X-Nixtla-Api-Key"),
+):
     """
     Forecast with cross-learning by item groups (brand, category, etc.).
     Items in same group share information for better forecasts.
@@ -109,7 +116,8 @@ def cross_learning_forecast(request: LightGPTForecastRequest):
         if df_items is None:
             raise ValueError("item_attributes required for cross_learning")
         
-        forecaster = LightGPTForecast(freq=request.freq, api_key=request.api_key)
+        api_key = request.api_key or x_nixtla_api_key
+        forecaster = LightGPTForecast(freq=request.freq, api_key=api_key)
         freq_used = forecaster.freq_label
         
         results = forecaster.forecast_with_cross_learning(
@@ -140,7 +148,10 @@ def cross_learning_forecast(request: LightGPTForecastRequest):
 
 
 @router.post("/hierarchical")
-def hierarchical_forecast(request: LightGPTForecastRequest):
+def hierarchical_forecast(
+    request: LightGPTForecastRequest,
+    x_nixtla_api_key: str | None = Header(default=None, alias="X-Nixtla-Api-Key"),
+):
     """
     Hierarchical forecast respecting category structure.
     Ensures forecasts are coherent across hierarchy levels.
@@ -154,7 +165,8 @@ def hierarchical_forecast(request: LightGPTForecastRequest):
             df_hist['day'] = pd.to_datetime(df_hist['day'])
         df_items = pd.DataFrame(request.item_attributes) if request.item_attributes else None
         
-        forecaster = LightGPTForecast(freq=request.freq, api_key=request.api_key)
+        api_key = request.api_key or x_nixtla_api_key
+        forecaster = LightGPTForecast(freq=request.freq, api_key=api_key)
         freq_used = forecaster.freq_label
         
         result = forecaster.hierarchical_forecast(
