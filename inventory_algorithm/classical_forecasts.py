@@ -42,17 +42,53 @@ def _metric_func_from_name(name: str) -> tuple[str, Optional[Callable]]:
 
     Special values:
     - 'robust' / 'rank' / 'rmse+mae': rank-aggregate RMSE and MAE per series.
+    - 'wape': weighted absolute percentage error (lower is better)
+    - 'wape_bias': WAPE primary; prefer models within bias threshold when possible
     """
     from utilsforecast.losses import rmse, mae
 
     metric = (name or '').strip().lower()
     if metric in ('robust', 'rank', 'rmse+mae', 'rmse_mae'):
         return 'robust', None
+    if metric in ('wape',):
+        return 'wape', None
+    if metric in ('wape_bias', 'wape+bias', 'wape_bias_pct', 'wape_biaspct'):
+        return 'wape_bias', None
     if metric in ('rmse',):
         return 'rmse', rmse
     if metric in ('mae',):
         return 'mae', mae
-    raise ValueError("Unsupported metric. Use 'rmse', 'mae', or 'robust'.")
+    raise ValueError("Unsupported metric. Use 'rmse', 'mae', 'robust', 'wape', or 'wape_bias'.")
+
+
+def _safe_wape_and_bias(y: np.ndarray, yhat: np.ndarray) -> tuple[float, float]:
+    """Return (wape, bias_pct) using safe denominators.
+
+    WAPE = sum(|y - yhat|) / sum(|y|)
+    bias_pct = 100 * sum(yhat - y) / sum(|y|)
+
+    Uses sum(|y|) to avoid division by zero on sparse/zero series.
+    """
+    y = np.asarray(y, dtype=float)
+    yhat = np.asarray(yhat, dtype=float)
+    mask = np.isfinite(y) & np.isfinite(yhat)
+    if not np.any(mask):
+        return float('inf'), float('inf')
+    y = y[mask]
+    yhat = yhat[mask]
+
+    denom = float(np.sum(np.abs(y)))
+    if denom <= 1e-12:
+        # All-zero or near-zero: WAPE is ill-defined; fall back to absolute error scale.
+        # This still provides a consistent ordering across models.
+        wape = float(np.mean(np.abs(y - yhat)))
+        bias_pct = float(np.mean(yhat - y))
+        return wape, bias_pct
+
+    err = yhat - y
+    wape = float(np.sum(np.abs(err)) / denom)
+    bias_pct = float(100.0 * np.sum(err) / denom)
+    return wape, bias_pct
 
 
 def _build_candidate_model_factories(season_length: int) -> list[tuple[str, Callable[[], object]]]:
@@ -304,6 +340,7 @@ class ClassicalForecasts:
         n_windows: int = 1,
         lookback_days: Optional[int] = None,
         lookback_periods: Optional[int] = None,
+        bias_threshold_pct: float = 25.0,
     ) -> pd.DataFrame:
         """Select best StatsForecast model per series and forecast.
 
@@ -370,7 +407,8 @@ class ClassicalForecasts:
         def _candidate_keys_for_bucket(bucket: str, n_obs: int) -> list[str]:
             # Keep candidate sets small for speed.
             if bucket == 'intermittent':
-                return ['croston_optimized', 'adida', 'naive']
+                # Intermittent series: only test intermittent-demand models + (seasonal) naive.
+                return ['croston_optimized', 'adida', 'seasonal_naive', 'naive']
             if bucket == 'seasonal':
                 return ['seasonal_naive', 'auto_ets', 'theta', 'optimized_theta', 'naive']
             if bucket == 'trend':
@@ -403,6 +441,8 @@ class ClassicalForecasts:
             metric_scores: dict[str, dict[str, float]] = {uid: {} for uid in uids}
             rmse_scores_map: dict[str, dict[str, float]] = {uid: {} for uid in uids}
             mae_scores_map: dict[str, dict[str, float]] = {uid: {} for uid in uids}
+            wape_scores_map: dict[str, dict[str, float]] = {uid: {} for uid in uids}
+            bias_scores_map: dict[str, dict[str, float]] = {uid: {} for uid in uids}
 
             for model_name, factory in model_specs:
                 try:
@@ -425,6 +465,16 @@ class ClassicalForecasts:
                             v2 = float(mae_mean.get(uid, np.inf))
                             rmse_scores_map[uid][model_name] = v1
                             mae_scores_map[uid][model_name] = v2
+                    elif metric_name in ('wape', 'wape_bias'):
+                        # Compute per-series WAPE and bias% directly from CV paths.
+                        if model_name not in cv.columns:
+                            continue
+                        for uid, g in cv.groupby('unique_id', sort=False):
+                            y = g['y'].to_numpy(dtype=float)
+                            yhat = g[model_name].to_numpy(dtype=float)
+                            wape_v, bias_v = _safe_wape_and_bias(y, yhat)
+                            wape_scores_map[str(uid)][model_name] = wape_v
+                            bias_scores_map[str(uid)][model_name] = bias_v
                     else:
                         scores = evaluate(cv, metrics=[metric_fn])
                         m = scores[scores['metric'] == metric_name].groupby('unique_id', as_index=True)[model_name].mean()
@@ -448,6 +498,53 @@ class ClassicalForecasts:
                     picked = str(total_rank.idxmin())
                     if np.isfinite(rmse_scores_map[uid].get(picked, np.inf)):
                         best_by_uid[uid] = picked
+                elif metric_name in ('wape', 'wape_bias'):
+                    if not wape_scores_map[uid]:
+                        continue
+                    models = list(wape_scores_map[uid].keys())
+                    wape_vals = pd.Series({m: wape_scores_map[uid].get(m, np.inf) for m in models})
+                    bias_vals = pd.Series({m: abs(float(bias_scores_map[uid].get(m, np.inf))) for m in models})
+
+                    # Primary: minimize WAPE.
+                    # For 'wape_bias': only bring bias into the decision if models are
+                    # within a small WAPE band of the best model.
+                    if metric_name == 'wape_bias':
+                        best_wape = float(wape_vals.min())
+                        # Internal tolerance knobs (monthly-only selection in API).
+                        # Bias should only matter when WAPE is effectively a tie.
+                        rel_tol = 0.02   # within 2% of best WAPE
+                        abs_tol = 1e-4   # or within a tiny absolute margin
+                        band = max(abs_tol, abs(best_wape) * rel_tol)
+                        close = wape_vals <= (best_wape + band)
+                        if bool(close.any()):
+                            wape_close = wape_vals[close]
+                            bias_close = bias_vals[close]
+                        else:
+                            wape_close = wape_vals
+                            bias_close = bias_vals
+
+                        # If any of the close models are within bias threshold, prefer them.
+                        if np.isfinite(float(bias_threshold_pct)):
+                            good = bias_close <= float(bias_threshold_pct)
+                            if bool(good.any()):
+                                wape_close = wape_close[good]
+                                bias_close = bias_close[good]
+
+                        # Pick lowest |bias| among the close contenders; tie-break by WAPE.
+                        picked = (
+                            pd.DataFrame({'abs_bias_pct': bias_close, 'wape': wape_close})
+                            .sort_values(['abs_bias_pct', 'wape'], ascending=True)
+                            .index[0]
+                        )
+                    else:
+                        # Plain 'wape': pick best WAPE; deterministic tie-break by |bias|.
+                        picked = (
+                            pd.DataFrame({'wape': wape_vals, 'abs_bias_pct': bias_vals})
+                            .sort_values(['wape', 'abs_bias_pct'], ascending=True)
+                            .index[0]
+                        )
+                    if np.isfinite(float(wape_scores_map[uid].get(str(picked), np.inf))):
+                        best_by_uid[uid] = str(picked)
                 else:
                     if not metric_scores[uid]:
                         continue
