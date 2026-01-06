@@ -32,6 +32,21 @@ def _canonicalize_freq(freq: str | None) -> str:
     return f
 
 
+def _nixtla_compat_freq(freq: str | None) -> str:
+    """Return a frequency string compatible with Nixtla client internals.
+
+    Some Nixtla client paths rely on pandas Period frequencies; pandas does not
+    support offsets like 'MS' as a Period frequency.
+
+    We therefore map month-start ('MS') to monthly ('M') for the API call,
+    while we still keep month-start alignment for our own timestamps.
+    """
+    f = (freq or '').strip().upper()
+    if f == 'MS':
+        return 'M'
+    return f or 'D'
+
+
 def _freq_label(freq: str | None) -> str:
     """Return the external label for a frequency.
 
@@ -66,7 +81,7 @@ def _normalize_to_freq(df: pd.DataFrame, *, freq: str) -> pd.DataFrame:
 
     f = _canonicalize_freq(freq)
     if f == 'MS':
-        out['day'] = out['day'].dt.to_period('M').dt.to_timestamp('MS')
+        out['day'] = out['day'].dt.to_period('M').dt.to_timestamp(how='start')
 
         group_cols: list[str] = ['day']
         if 'item_id' in out.columns:
@@ -236,7 +251,7 @@ class LightGPTForecast:
                 fcst = self._client.forecast(
                     df=df_formatted,
                     h=forecast_periods,
-                    freq=self.freq,
+                    freq=_nixtla_compat_freq(self.freq),
                     time_col='ds',
                     target_col='y',
                     model=self.model,
@@ -244,9 +259,12 @@ class LightGPTForecast:
                 )
 
                 # Format output
+                fcst_ds = pd.to_datetime(fcst['ds'])
+                if (self.freq or '').upper() == 'MS':
+                    fcst_ds = fcst_ds.dt.to_period('M').dt.to_timestamp(how='start')
                 result = pd.DataFrame({
                     'item_id': fcst['unique_id'].astype(int),
-                    'day': pd.to_datetime(fcst['ds']),
+                    'day': fcst_ds,
                     'forecast': fcst.get(self.model, fcst.get(f'{self.model}-q-50', np.nan)),
                 })
             else:
@@ -318,15 +336,18 @@ class LightGPTForecast:
                     fcst = self._client.forecast(
                         df=group_data_formatted,
                         h=forecast_periods,
-                        freq=self.freq,
+                        freq=_nixtla_compat_freq(self.freq),
                         time_col='ds',
                         target_col='y',
                         model=self.model,
                     )
 
+                    fcst_ds = pd.to_datetime(fcst['ds'])
+                    if (self.freq or '').upper() == 'MS':
+                        fcst_ds = fcst_ds.dt.to_period('M').dt.to_timestamp(how='start')
                     results[group] = pd.DataFrame({
                         'item_id': fcst['unique_id'].astype(int),
-                        'day': pd.to_datetime(fcst['ds']),
+                        'day': fcst_ds,
                         'forecast': fcst.get(self.model, np.nan),
                         'group': group,
                     })
@@ -391,16 +412,19 @@ class LightGPTForecast:
                 fcst = self._client.forecast(
                     df=df_formatted,
                     h=forecast_periods,
-                    freq=self.freq,
+                    freq=_nixtla_compat_freq(self.freq),
                     time_col='ds',
                     target_col='y',
                     model=self.model,
                 )
 
                 # Parse hierarchy back
+                fcst_ds = pd.to_datetime(fcst['ds'])
+                if (self.freq or '').upper() == 'MS':
+                    fcst_ds = fcst_ds.dt.to_period('M').dt.to_timestamp(how='start')
                 result = pd.DataFrame({
                     'hierarchy_id': fcst['unique_id'],
-                    'day': pd.to_datetime(fcst['ds']),
+                    'day': fcst_ds,
                     'forecast': fcst.get(self.model, np.nan),
                 })
             else:
