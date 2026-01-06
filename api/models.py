@@ -59,6 +59,7 @@ class LightGPTForecastRequest(BaseModel):
     external_drivers: Optional[List[Dict[str, Any]]] = None  # External regressors (price, promotion, etc.)
     freq: str = 'D'  # 'D'=daily, 'M'=monthly (treated as month-start internally)
     forecast_periods: int = 30
+    api_key: Optional[str] = None  # Optional Nixtla API key (otherwise uses NIXTLA_API_KEY env var)
     exogenous_columns: Optional[List[str]] = None  # Which driver columns to use
     forecast_type: str = 'batch'  # 'batch', 'cross_learning', 'hierarchical', 'scenarios'
     group_column: Optional[str] = None  # For cross_learning: 'brand', 'category', etc.

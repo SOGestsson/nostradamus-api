@@ -152,25 +152,17 @@ class LightGPTForecast:
         self.freq = _canonicalize_freq(freq)
         self.freq_label = _freq_label(freq)
         self._client = None
-        self._backend = 'local'
 
-        # LightGPT endpoints should NOT require a Nixtla key.
-        # If a key is explicitly available we can use Nixtla; otherwise fall
-        # back to local StatsForecast models.
+        if not _HAS_LIGHTGPT:
+            raise RuntimeError("Nixtla package not available. Install with `pip install nixtla`.")
+
         api_key_eff = (api_key or os.environ.get('NIXTLA_API_KEY') or '').strip()
-        if api_key_eff and _HAS_LIGHTGPT:
-            self._client = NixtlaClient(api_key=api_key_eff)
-            self._backend = 'nixtla'
+        if not api_key_eff:
+            raise ValueError("NIXTLA_API_KEY is required for LightGPT forecasts")
 
-        if self._backend == 'local':
-            from inventory_algorithm.classical_forecasts import ClassicalForecasts
-
-            self._local_forecaster = ClassicalForecasts(
-                mode='local',
-                local_model='auto_model',
-                season_length=_season_length_for_freq(self.freq),
-                freq=self.freq,
-            )
+        # Always pass an explicit key to avoid NixtlaClient trying to read
+        # os.environ['NIXTLA_API_KEY'] (which raises KeyError if missing).
+        self._client = NixtlaClient(api_key=api_key_eff)
 
     # ---------- Batch forecast with drivers ----------
     def batch_forecast_with_drivers(self,
@@ -246,43 +238,26 @@ class LightGPTForecast:
             print(f"  Using exogenous columns: {exogenous_columns}")
             print(f"  Data shape: {df_formatted.shape}")
 
-            if self._backend == 'nixtla':
-                # Call LightGPT (Nixtla)
-                fcst = self._client.forecast(
-                    df=df_formatted,
-                    h=forecast_periods,
-                    freq=_nixtla_compat_freq(self.freq),
-                    time_col='ds',
-                    target_col='y',
-                    model=self.model,
-                    X_df=df_formatted[['unique_id', 'ds'] + exogenous_columns] if exogenous_columns else None,
-                )
+            # Call LightGPT (Nixtla)
+            fcst = self._client.forecast(
+                df=df_formatted,
+                h=forecast_periods,
+                freq=_nixtla_compat_freq(self.freq),
+                time_col='ds',
+                target_col='y',
+                model=self.model,
+                X_df=df_formatted[['unique_id', 'ds'] + exogenous_columns] if exogenous_columns else None,
+            )
 
-                # Format output
-                fcst_ds = pd.to_datetime(fcst['ds'])
-                if (self.freq or '').upper() == 'MS':
-                    fcst_ds = fcst_ds.dt.to_period('M').dt.to_timestamp(how='start')
-                result = pd.DataFrame({
-                    'item_id': fcst['unique_id'].astype(int),
-                    'day': fcst_ds,
-                    'forecast': fcst.get(self.model, fcst.get(f'{self.model}-q-50', np.nan)),
-                })
-            else:
-                # Local fallback (no API key required).
-                # Note: exogenous_columns/drivers are ignored in this fallback.
-                id_map = {
-                    str(i): i
-                    for i in df_hist[['item_id']].drop_duplicates()['item_id'].tolist()
-                }
-
-                panel = self._local_forecaster.auto_model_forecast_panel(
-                    hist=df_hist[['item_id', 'day', 'actual_sale']].copy(),
-                    h=int(forecast_periods),
-                )
-                result = panel.rename(columns={'ds': 'day', 'yhat': 'forecast'})
-                result['item_id'] = result['unique_id'].map(id_map)
-                result = result.loc[:, ['item_id', 'day', 'forecast']]
-                result['day'] = pd.to_datetime(result['day'])
+            # Format output
+            fcst_ds = pd.to_datetime(fcst['ds'])
+            if (self.freq or '').upper() == 'MS':
+                fcst_ds = fcst_ds.dt.to_period('M').dt.to_timestamp(how='start')
+            result = pd.DataFrame({
+                'item_id': fcst['unique_id'].astype(int),
+                'day': fcst_ds,
+                'forecast': fcst.get(self.model, fcst.get(f'{self.model}-q-50', np.nan)),
+            })
             
             print(f"Batch forecast completed for {result['item_id'].nunique()} items")
             return result

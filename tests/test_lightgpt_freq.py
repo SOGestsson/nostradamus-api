@@ -11,7 +11,7 @@ def test_nixtla_compat_freq_maps_ms_to_m():
 
 
 def test_monthly_internal_freq_is_ms_but_label_is_m():
-    f = LightGPTForecast(freq='M')
+    f = LightGPTForecast(freq='M', api_key='test-key')
     assert f.freq == 'MS'
     assert f.freq_label == 'M'
 

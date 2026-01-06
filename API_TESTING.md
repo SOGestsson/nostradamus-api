@@ -104,6 +104,10 @@ Run simulation and return only purchase frequency histogram (lighter response).
 #### POST `/api/v1/lightgpt/batch`
 Batch forecast for multiple items.
 
+LightGPT requires a Nixtla API key. Provide it either:
+- via request body field `api_key`, or
+- via environment variable `NIXTLA_API_KEY` on the server.
+
 Key parameters:
 - `sim_input_his`: list of `{item_id, day, actual_sale, ...optional exogenous...}`
 - `forecast_periods`: number of future periods
@@ -114,6 +118,7 @@ Example (monthly input → monthly output):
 curl -X POST http://localhost:8000/api/v1/lightgpt/batch \
   -H "Content-Type: application/json" \
   -d '{
+    "api_key": "<your_nixtla_api_key>",
     "freq": "M",
     "forecast_periods": 6,
     "sim_input_his": [

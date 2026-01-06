@@ -61,8 +61,8 @@ def batch_forecast_with_drivers(request: LightGPTForecastRequest):
             if 'day' in df_drivers.columns:
                 df_drivers['day'] = pd.to_datetime(df_drivers['day'])
         
-        # Initialize forecaster
-        forecaster = LightGPTForecast(freq=request.freq)
+        # Initialize forecaster (requires Nixtla key)
+        forecaster = LightGPTForecast(freq=request.freq, api_key=request.api_key)
         freq_used = forecaster.freq_label
         
         # Generate forecasts
@@ -82,6 +82,9 @@ def batch_forecast_with_drivers(request: LightGPTForecastRequest):
             'freq': freq_used,
         }
         
+    except ValueError as e:
+        # Common case: missing NIXTLA_API_KEY (either env var or request.api_key)
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         error_details = traceback.format_exc()
         print(f"Error: {error_details}")
@@ -106,7 +109,7 @@ def cross_learning_forecast(request: LightGPTForecastRequest):
         if df_items is None:
             raise ValueError("item_attributes required for cross_learning")
         
-        forecaster = LightGPTForecast(freq=request.freq)
+        forecaster = LightGPTForecast(freq=request.freq, api_key=request.api_key)
         freq_used = forecaster.freq_label
         
         results = forecaster.forecast_with_cross_learning(
@@ -128,6 +131,8 @@ def cross_learning_forecast(request: LightGPTForecastRequest):
             'freq': freq_used,
         }
         
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         error_details = traceback.format_exc()
         print(f"Error: {error_details}")
@@ -149,7 +154,7 @@ def hierarchical_forecast(request: LightGPTForecastRequest):
             df_hist['day'] = pd.to_datetime(df_hist['day'])
         df_items = pd.DataFrame(request.item_attributes) if request.item_attributes else None
         
-        forecaster = LightGPTForecast(freq=request.freq)
+        forecaster = LightGPTForecast(freq=request.freq, api_key=request.api_key)
         freq_used = forecaster.freq_label
         
         result = forecaster.hierarchical_forecast(
@@ -167,6 +172,8 @@ def hierarchical_forecast(request: LightGPTForecastRequest):
             'freq': freq_used,
         }
         
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         error_details = traceback.format_exc()
         print(f"Error: {error_details}")
