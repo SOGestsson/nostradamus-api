@@ -274,39 +274,20 @@ def generate_forecast(request: ForecastRequest):
 
         # Auto-select best StatsForecast model per item (explicitly not TimeGPT/LightGPT)
         if request.mode == 'local' and request.local_model in ('auto_model', 'automodel'):
-            # Speed optimization: select the best model per item using monthly aggregates,
-            # then refit/forecast that selected model on the original frequency.
-            df_monthly = df_his.copy()
-            df_monthly['day'] = pd.to_datetime(df_monthly['day'])
-            df_monthly['day'] = df_monthly['day'].dt.to_period('M').dt.to_timestamp('M')
-            df_monthly = (
-                df_monthly.groupby(['item_id', 'day'], as_index=False, sort=True)['actual_sale']
-                .sum()
-            )
-
+            # IMPORTANT: Do selection at the *requested* frequency/season_length.
+            # The previous monthly-aggregate speed optimisation (season_length=12, freq='M')
+            # was forcing many items into the 'short' bucket and defaulting them to Naive,
+            # even for strongly seasonal daily/weekly series.
             metric = request.auto_model_metric or 'robust'
-            selection_forecaster = ClassicalForecasts(
-                mode='local',
-                local_model='auto_model',
-                season_length=12,
-                freq='M',
-            )
 
-            sel_panel = selection_forecaster.auto_model_forecast_panel(
-                df_monthly,
-                h=1,
+            panel_fcst = forecaster.auto_model_forecast_panel(
+                df_his,
+                h=request.forecast_periods,
                 metric=metric,
                 cv_h=request.auto_model_cv_h,
                 n_windows=(request.auto_model_n_windows or 1),
                 lookback_days=request.auto_model_lookback_days,
                 lookback_periods=request.auto_model_lookback_periods,
-            )
-            model_by_uid = sel_panel.groupby('unique_id', as_index=True)['model_used'].first().to_dict()
-
-            panel_fcst = forecaster.forecast_panel_with_selected_models(
-                df_his,
-                h=request.forecast_periods,
-                model_by_uid=model_by_uid,
             )
             id_map = {str(v): v for v in unique_items}
             for uid, grp in panel_fcst.groupby('unique_id', sort=False):
@@ -419,39 +400,16 @@ async def generate_forecast_async(request: ForecastRequest):
 
         if request.mode == 'local' and request.local_model in ('auto_model', 'automodel'):
             metric = request.auto_model_metric or 'robust'
-            # Select models on monthly aggregates (fast), then forecast on original freq.
-            df_monthly = df_his.copy()
-            df_monthly['day'] = pd.to_datetime(df_monthly['day'])
-            df_monthly['day'] = df_monthly['day'].dt.to_period('M').dt.to_timestamp('M')
-            df_monthly = (
-                df_monthly.groupby(['item_id', 'day'], as_index=False, sort=True)['actual_sale']
-                .sum()
-            )
 
-            selection_forecaster = ClassicalForecasts(
-                mode='local',
-                local_model='auto_model',
-                season_length=12,
-                freq='M',
-            )
-
-            sel_panel = await asyncio.to_thread(
-                selection_forecaster.auto_model_forecast_panel,
-                df_monthly,
-                1,
+            panel_fcst = await asyncio.to_thread(
+                forecaster.auto_model_forecast_panel,
+                df_his,
+                request.forecast_periods,
                 metric,
                 request.auto_model_cv_h,
                 (request.auto_model_n_windows or 1),
                 request.auto_model_lookback_days,
                 request.auto_model_lookback_periods,
-            )
-            model_by_uid = sel_panel.groupby('unique_id', as_index=True)['model_used'].first().to_dict()
-
-            panel_fcst = await asyncio.to_thread(
-                forecaster.forecast_panel_with_selected_models,
-                df_his,
-                request.forecast_periods,
-                model_by_uid,
             )
             id_map = {str(v): v for v in unique_items}
             for uid, grp in panel_fcst.groupby('unique_id', sort=False):
