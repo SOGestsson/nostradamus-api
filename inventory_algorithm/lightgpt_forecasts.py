@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import os
+import re
 import numpy as np
 import pandas as pd
 from typing import List, Dict
@@ -137,7 +138,7 @@ class LightGPTForecast:
 
     def __init__(self,
                  api_key: str | None = None,
-                 model: str = 'lightgpt',  # e.g., 'lightgpt', 'lightgpt-advanced'
+                 model: str = 'timegpt-1',  # e.g., 'timegpt-1', 'timegpt-1-long-horizon'
                  freq: str = 'D',  # 'D'=daily, 'MS'=monthly, 'W'=weekly
                  ):
         """
@@ -148,7 +149,7 @@ class LightGPTForecast:
             model: LightGPT model variant
             freq: Data frequency ('D', 'MS', 'W', etc.)
         """
-        self.model = model
+        self.model = (model or '').strip() or 'timegpt-1'
         self.freq = _canonicalize_freq(freq)
         self.freq_label = _freq_label(freq)
         self._client = None
@@ -164,6 +165,20 @@ class LightGPTForecast:
         # Always pass an explicit key to avoid NixtlaClient trying to read
         # os.environ['NIXTLA_API_KEY'] (which raises KeyError if missing).
         self._client = NixtlaClient(api_key=api_key_eff)
+
+        # Nixtla's Python client currently hardcodes supported models to timegpt-* (and azureai).
+        # We extend the allow-list defensively (some deployments/accounts may allow additional
+        # model names). This does not affect normal TimeGPT usage.
+        try:
+            supported = getattr(self._client, 'supported_models', None)
+            if isinstance(supported, list):
+                # Ensure TimeGPT pattern exists (should already be present in the SDK)
+                supported.append(re.compile(r"^timegpt-.*$"))
+                supported.append(re.compile(r"^light.*$"))
+                supported.append('light')
+                supported.append('lightgpt')
+        except Exception:
+            pass
 
     # ---------- Batch forecast with drivers ----------
     def batch_forecast_with_drivers(self,
@@ -261,7 +276,7 @@ class LightGPTForecast:
             print(f"  Using exogenous columns: {exogenous_columns}")
             print(f"  Data shape: {df_formatted.shape}")
 
-            # Call LightGPT (Nixtla)
+            # Call Nixtla (cloud)
             fcst = self._client.forecast(
                 df=df_formatted,
                 h=forecast_periods,
@@ -283,10 +298,27 @@ class LightGPTForecast:
             except Exception:
                 pass
 
+            # Nixtla may name the output column differently depending on model.
+            # Try a few common options in order.
+            forecast_series = None
+            for key in (
+                self.model,
+                f'{self.model}-q-50',
+                'LightGPT',
+                'LightGPT-q-50',
+                'TimeGPT',
+                'TimeGPT-q-50',
+            ):
+                if key in fcst.columns:
+                    forecast_series = fcst[key]
+                    break
+            if forecast_series is None:
+                forecast_series = np.nan
+
             result = pd.DataFrame({
                 'item_id': item_ids,
                 'day': fcst_ds,
-                'forecast': fcst.get(self.model, fcst.get(f'{self.model}-q-50', np.nan)),
+                'forecast': forecast_series,
             })
             
             print(f"Batch forecast completed for {result['item_id'].nunique()} items")

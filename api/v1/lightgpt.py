@@ -66,7 +66,8 @@ def batch_forecast_with_drivers(
         
         # Initialize forecaster (requires Nixtla key)
         api_key = request.api_key or x_nixtla_api_key
-        forecaster = LightGPTForecast(freq=request.freq, api_key=api_key)
+        model = request.model or 'timegpt-1'
+        forecaster = LightGPTForecast(freq=request.freq, api_key=api_key, model=model)
         freq_used = forecaster.freq_label
         
         # Generate forecasts
@@ -117,7 +118,8 @@ def cross_learning_forecast(
             raise ValueError("item_attributes required for cross_learning")
         
         api_key = request.api_key or x_nixtla_api_key
-        forecaster = LightGPTForecast(freq=request.freq, api_key=api_key)
+        model = request.model or 'timegpt-1'
+        forecaster = LightGPTForecast(freq=request.freq, api_key=api_key, model=model)
         freq_used = forecaster.freq_label
         
         results = forecaster.forecast_with_cross_learning(
@@ -166,7 +168,8 @@ def hierarchical_forecast(
         df_items = pd.DataFrame(request.item_attributes) if request.item_attributes else None
         
         api_key = request.api_key or x_nixtla_api_key
-        forecaster = LightGPTForecast(freq=request.freq, api_key=api_key)
+        model = request.model or 'timegpt-1'
+        forecaster = LightGPTForecast(freq=request.freq, api_key=api_key, model=model)
         freq_used = forecaster.freq_label
         
         result = forecaster.hierarchical_forecast(

@@ -63,6 +63,11 @@ class LightGPTForecastRequest(BaseModel):
     freq: str = 'D'  # 'D'=daily, 'M'=monthly (treated as month-start internally)
     forecast_periods: int = 30
 
+    model: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices('model', 'nixtla_model', 'nixtlaModel'),
+    )
+
     api_key: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices('api_key', 'apiKey', 'nixtla_api_key', 'nixtlaApiKey', 'NIXTLA_API_KEY'),
