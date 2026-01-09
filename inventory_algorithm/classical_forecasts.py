@@ -23,6 +23,9 @@ def _lazy_import_nixtla_models():
         OptimizedTheta,
         Theta,
         AutoCES,
+        HistoricAverage,
+        WindowAverage,
+        SeasonalWindowAverage,
     )
     return {
         'auto_arima': AutoARIMA,
@@ -34,6 +37,9 @@ def _lazy_import_nixtla_models():
         'optimized_theta': OptimizedTheta,
         'theta': Theta,
         'auto_ces': AutoCES,
+        'historic_average': HistoricAverage,
+        'window_average': WindowAverage,
+        'seasonal_window_average': SeasonalWindowAverage,
     }
 
 
@@ -97,30 +103,77 @@ def _build_candidate_model_factories(season_length: int) -> list[tuple[str, Call
     # NOTE: AutoCES is intentionally excluded from the auto-model candidate set
     # because it can fail to fit for some series and would otherwise abort the
     # entire cross-validation run.
-    seasonal = {'auto_arima', 'auto_ets', 'seasonal_naive', 'theta', 'optimized_theta'}
-    keys = ['naive', 'seasonal_naive', 'auto_arima', 'auto_ets', 'theta', 'optimized_theta', 'croston_optimized', 'adida']
+    seasonal = {
+        'auto_arima',
+        'auto_ets',
+        'seasonal_naive',
+        'theta',
+        'optimized_theta',
+        'seasonal_window_average',
+    }
+    keys = [
+        'naive',
+        'historic_average',
+        'seasonal_naive',
+        'seasonal_window_average',
+        'auto_arima',
+        'auto_ets',
+        'theta',
+        'optimized_theta',
+        'croston_optimized',
+        'adida',
+    ]
     specs: list[tuple[str, Callable[[], object]]] = []
     for key in keys:
         ModelClass = models_dict[key]
         if key in seasonal:
-            specs.append((ModelClass.__name__, lambda cls=ModelClass: cls(season_length=season_length)))
+            if key == 'seasonal_window_average':
+                # window_size=1 means "use last season"; alias must match class name
+                # because downstream expects the forecast column to be that name.
+                specs.append((
+                    ModelClass.__name__,
+                    lambda cls=ModelClass: cls(season_length=season_length, window_size=1, alias=cls.__name__),
+                ))
+            else:
+                specs.append((ModelClass.__name__, lambda cls=ModelClass: cls(season_length=season_length)))
         else:
-            specs.append((ModelClass.__name__, lambda cls=ModelClass: cls()))
+            if key == 'window_average':
+                # Not used as default fallback (we use HistoricAverage for variable windows),
+                # but keep a small window available for selection.
+                specs.append((ModelClass.__name__, lambda cls=ModelClass: cls(window_size=3, alias=cls.__name__)))
+            else:
+                specs.append((ModelClass.__name__, lambda cls=ModelClass: cls()))
     return specs
 
 
 def _build_model_factories_for_keys(keys: list[str], season_length: int) -> list[tuple[str, Callable[[], object]]]:
     models_dict = _lazy_import_nixtla_models()
-    seasonal = {'auto_arima', 'auto_ets', 'seasonal_naive', 'theta', 'optimized_theta'}
+    seasonal = {
+        'auto_arima',
+        'auto_ets',
+        'seasonal_naive',
+        'theta',
+        'optimized_theta',
+        'seasonal_window_average',
+    }
     specs: list[tuple[str, Callable[[], object]]] = []
     for key in keys:
         if key not in models_dict:
             continue
         ModelClass = models_dict[key]
         if key in seasonal:
-            specs.append((ModelClass.__name__, lambda cls=ModelClass: cls(season_length=season_length)))
+            if key == 'seasonal_window_average':
+                specs.append((
+                    ModelClass.__name__,
+                    lambda cls=ModelClass: cls(season_length=season_length, window_size=1, alias=cls.__name__),
+                ))
+            else:
+                specs.append((ModelClass.__name__, lambda cls=ModelClass: cls(season_length=season_length)))
         else:
-            specs.append((ModelClass.__name__, lambda cls=ModelClass: cls()))
+            if key == 'window_average':
+                specs.append((ModelClass.__name__, lambda cls=ModelClass: cls(window_size=3, alias=cls.__name__)))
+            else:
+                specs.append((ModelClass.__name__, lambda cls=ModelClass: cls()))
     return specs
 
 
@@ -166,8 +219,10 @@ def _bucket_series(profile: dict[str, float], season_length: int, min_arima_len:
     cv2 = float(profile['cv2'])
     trend_corr = float(profile['trend_corr'])
 
-    # Very short histories: skip CV and skip AutoARIMA.
-    if n < max(20, season_length + 5):
+    # Very short histories: skip CV.
+    # IMPORTANT: history length drives this decision; season_length is a model
+    # configuration and should not decide whether a series is "too short".
+    if n < 20:
         return 'short'
 
     # Intermittent demand heuristic (Syntetos-Boylan style): ADI + CV^2.
@@ -208,8 +263,9 @@ class ClassicalForecasts:
         self.mode = mode
         self.quantiles = quantiles or []
         self.model_name = model
-        # Backwards compatibility: accept legacy month-start shorthand.
-        self.freq = 'M' if (freq or '').strip().lower() == 'ms' else freq
+        # Backwards compatibility: accept month-start shorthand.
+        # NOTE: Keep month-start as 'MS' (do not convert to month-end).
+        self.freq = 'MS' if (freq or '').strip().lower() == 'ms' else freq
         self._client = None
         self.local_model = local_model
         self.season_length = season_length
@@ -375,11 +431,20 @@ class ClassicalForecasts:
             raise ValueError('Empty history after lookback filter')
 
         metric_name, metric_fn = _metric_func_from_name(metric)
-        cv_h_eff = int(cv_h) if cv_h is not None else int(min(h, max(1, self.season_length)))
+
+        freq_upper = str(self.freq or '').strip().upper()
+        is_monthly = freq_upper in ('M', 'ME', 'MS') or freq_upper.startswith('M')
+        # For monthly series we always assume yearly seasonality (12) for model configuration.
+        season_for_models = 12 if is_monthly else int(self.season_length)
+
+        cv_h_eff = int(cv_h) if cv_h is not None else int(min(h, max(1, season_for_models)))
         cv_h_eff = max(1, cv_h_eff)
 
+        debug = bool(os.getenv('AUTO_MODEL_DEBUG'))
+        debug_reason: dict[str, dict[str, object]] = {}
+
         # Heuristic tuning knobs (kept internal to avoid API churn)
-        min_arima_len = max(50, 3 * max(1, int(self.season_length)))
+        min_arima_len = 36 if is_monthly else max(50, 3 * max(1, int(self.season_length)))
 
         counts = df.groupby('unique_id', as_index=True).size()
         min_len = (cv_h_eff * max(1, int(n_windows))) + 2
@@ -392,14 +457,87 @@ class ClassicalForecasts:
         for uid, n_obs in counts.items():
             y = df.loc[df['unique_id'] == uid, 'y'].to_numpy(dtype=float)
             prof = _series_profile(y)
-            bucket = _bucket_series(prof, season_length=int(self.season_length), min_arima_len=min_arima_len)
+            bucket = _bucket_series(prof, season_length=season_for_models, min_arima_len=min_arima_len)
 
             # Heuristic selections for very short series (skip CV entirely)
             if bucket == 'short' or int(n_obs) < min_len:
-                if int(self.season_length) >= 2 and int(n_obs) >= int(self.season_length) + 1 and bucket != 'intermittent':
+                # Intermittent series: if we skip CV due to length, avoid collapsing to Naive
+                # (Naive tends to win trivial off-season windows).
+                if bucket == 'intermittent':
+                    best_by_uid[uid] = 'ADIDA' if int(n_obs) >= 3 else 'Naive'
+                    if debug:
+                        debug_reason[uid] = {
+                            'reason': 'short_or_insufficient_len',
+                            'picked': best_by_uid[uid],
+                            'bucket': bucket,
+                            'n_obs': int(n_obs),
+                            'min_len': int(min_len),
+                            'season_for_models': int(season_for_models),
+                            'cv_h_eff': int(cv_h_eff),
+                            'n_windows': int(n_windows),
+                        }
+                    continue
+
+                # Monthly fallbacks:
+                # - Intermittent already handled above.
+                # - 12-23 months: SeasonalWindowAverage is typically a better baseline than Naive.
+                # - Otherwise: simple moving average over all available months -> HistoricAverage.
+                if is_monthly and 12 <= int(n_obs) <= 23:
+                    best_by_uid[uid] = 'SeasonalWindowAverage'
+                    if debug:
+                        debug_reason[uid] = {
+                            'reason': 'short_or_insufficient_len',
+                            'picked': 'SeasonalWindowAverage',
+                            'bucket': bucket,
+                            'n_obs': int(n_obs),
+                            'min_len': int(min_len),
+                            'season_for_models': int(season_for_models),
+                            'cv_h_eff': int(cv_h_eff),
+                            'n_windows': int(n_windows),
+                        }
+                    continue
+
+                if is_monthly and int(n_obs) < 12:
+                    best_by_uid[uid] = 'HistoricAverage'
+                    if debug:
+                        debug_reason[uid] = {
+                            'reason': 'short_or_insufficient_len',
+                            'picked': 'HistoricAverage',
+                            'bucket': bucket,
+                            'n_obs': int(n_obs),
+                            'min_len': int(min_len),
+                            'season_for_models': int(season_for_models),
+                            'cv_h_eff': int(cv_h_eff),
+                            'n_windows': int(n_windows),
+                        }
+                    continue
+
+                if int(season_for_models) >= 2 and int(n_obs) >= int(season_for_models) + 1:
                     best_by_uid[uid] = 'SeasonalNaive'
+                    if debug:
+                        debug_reason[uid] = {
+                            'reason': 'short_or_insufficient_len',
+                            'picked': 'SeasonalNaive',
+                            'bucket': bucket,
+                            'n_obs': int(n_obs),
+                            'min_len': int(min_len),
+                            'season_for_models': int(season_for_models),
+                            'cv_h_eff': int(cv_h_eff),
+                            'n_windows': int(n_windows),
+                        }
                 else:
-                    best_by_uid[uid] = 'Naive'
+                    best_by_uid[uid] = 'HistoricAverage' if is_monthly and int(n_obs) >= 2 else 'Naive'
+                    if debug:
+                        debug_reason[uid] = {
+                            'reason': 'short_or_insufficient_len',
+                            'picked': best_by_uid[uid],
+                            'bucket': bucket,
+                            'n_obs': int(n_obs),
+                            'min_len': int(min_len),
+                            'season_for_models': int(season_for_models),
+                            'cv_h_eff': int(cv_h_eff),
+                            'n_windows': int(n_windows),
+                        }
                 continue
 
             buckets.setdefault(bucket, []).append(uid)
@@ -407,17 +545,28 @@ class ClassicalForecasts:
         def _candidate_keys_for_bucket(bucket: str, n_obs: int) -> list[str]:
             # Keep candidate sets small for speed.
             if bucket == 'intermittent':
-                # Intermittent series: only test intermittent-demand models + (seasonal) naive.
-                return ['croston_optimized', 'adida', 'seasonal_naive', 'naive']
+                # Intermittent series: prefer intermittent-demand models (+ seasonal naive).
+                # NOTE: We intentionally exclude plain Naive here because it tends to win
+                # error metrics on mostly-zero holdout windows by predicting 0, which is
+                # often not the desired behaviour for replenishment planning.
+                return ['croston_optimized', 'adida', 'seasonal_naive']
             if bucket == 'seasonal':
-                return ['seasonal_naive', 'auto_ets', 'theta', 'optimized_theta', 'naive']
+                # Seasonal series: bias away from Naive so we actually test seasonal models.
+                return ['seasonal_naive', 'auto_ets', 'theta', 'optimized_theta']
             if bucket == 'trend':
                 keys = ['auto_ets', 'theta', 'optimized_theta', 'naive']
+                # If we have at least one full season, allow SeasonalNaive even if the
+                # seasonal detector didn't put the series into the seasonal bucket yet
+                # (common for monthly series with ~13-23 months of history).
+                if int(self.season_length) >= 2 and int(n_obs) >= int(self.season_length) + 1:
+                    keys.insert(0, 'seasonal_naive')
                 if n_obs >= min_arima_len:
                     keys.insert(0, 'auto_arima')
                 return keys
             # smooth
             keys = ['auto_ets', 'theta', 'optimized_theta', 'naive']
+            if int(self.season_length) >= 2 and int(n_obs) >= int(self.season_length) + 1:
+                keys.insert(0, 'seasonal_naive')
             if n_obs >= min_arima_len:
                 keys.insert(0, 'auto_arima')
             return keys
@@ -432,7 +581,7 @@ class ClassicalForecasts:
             max_n = int(counts.loc[uids].max())
             model_specs = _build_model_factories_for_keys(
                 _candidate_keys_for_bucket(bucket, max_n),
-                season_length=int(self.season_length),
+                season_length=int(season_for_models),
             )
             if not model_specs:
                 continue
@@ -488,6 +637,12 @@ class ClassicalForecasts:
             for uid in uids:
                 if metric_name == 'robust':
                     if not rmse_scores_map[uid] or not mae_scores_map[uid]:
+                        if debug and uid not in debug_reason and best_by_uid.get(uid) == 'Naive':
+                            debug_reason[uid] = {
+                                'reason': 'no_cv_scores',
+                                'picked': 'Naive',
+                                'bucket': bucket,
+                            }
                         continue
                     models = sorted(set(rmse_scores_map[uid].keys()) | set(mae_scores_map[uid].keys()))
                     if not models:
@@ -547,8 +702,29 @@ class ClassicalForecasts:
                         best_by_uid[uid] = str(picked)
                 else:
                     if not metric_scores[uid]:
+                        if debug and uid not in debug_reason and best_by_uid.get(uid) == 'Naive':
+                            debug_reason[uid] = {
+                                'reason': 'no_cv_scores',
+                                'picked': 'Naive',
+                                'bucket': bucket,
+                            }
                         continue
                     best_by_uid[uid] = str(min(metric_scores[uid].items(), key=lambda kv: kv[1])[0])
+
+        if debug:
+            # Summarise why we ended up with Naive defaults.
+            reasons = {}
+            samples: dict[str, list[str]] = {}
+            for uid, picked in best_by_uid.items():
+                if picked != 'Naive':
+                    continue
+                reason = str(debug_reason.get(uid, {}).get('reason', 'naive_won_or_unknown'))
+                reasons[reason] = reasons.get(reason, 0) + 1
+                if len(samples.get(reason, [])) < 5:
+                    samples.setdefault(reason, []).append(str(uid))
+            if reasons:
+                print('AUTO_MODEL_DEBUG naive reasons:', reasons)
+                print('AUTO_MODEL_DEBUG naive sample_uids:', samples)
 
         # Forecast per chosen model in batches.
         by_model: dict[str, list[str]] = {}
@@ -558,7 +734,7 @@ class ClassicalForecasts:
         parts: list[pd.DataFrame] = []
         # Use the full set of factories so we can forecast whatever was selected
         # in any bucket.
-        all_model_specs = _build_candidate_model_factories(self.season_length)
+        all_model_specs = _build_candidate_model_factories(int(season_for_models))
         for model_name, factory in all_model_specs:
             uids = by_model.get(model_name)
             if not uids:

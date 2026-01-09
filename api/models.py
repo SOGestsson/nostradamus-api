@@ -33,7 +33,7 @@ class ForecastRequest(BaseModel):
     mode: str = 'local'  # 'local' or 'timegpt'
     local_model: str = 'auto_arima'  # Model type for local mode
     season_length: int = 12  # Seasonality period
-    freq: str = 'D'  # 'D'=daily, 'M'=monthly, 'W'=weekly
+    freq: str = 'D'  # 'D'=daily, 'M'=monthly (month-start by convention), 'ME'=month-end, 'W'=weekly
     api_key: Optional[str] = None  # For TimeGPT mode
     quantiles: Optional[List[float]] = None  # For TimeGPT quantile forecasts
 

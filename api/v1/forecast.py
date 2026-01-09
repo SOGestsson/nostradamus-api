@@ -4,11 +4,13 @@
 Forecast endpoints using ClassicalForecasts.
 """
 import traceback
+import math
 import asyncio
 import uuid
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 import pandas as pd
+from pandas.tseries.frequencies import to_offset
 
 import httpx
 import json
@@ -133,6 +135,40 @@ def api_key_header(x_api_key: Optional[str] = Header(None)) -> bool:
     return True
 
 
+def _normalize_and_aggregate_history(df_his: pd.DataFrame, freq: str) -> tuple[pd.DataFrame, str]:
+    """Normalize requested frequency and aggregate daily rows when requesting coarser freq.
+
+    This prevents frequency mismatches (e.g., daily timestamps + freq='M') that can
+    cause many StatsForecast models to fail and auto_model to collapse to the
+    default Naive.
+    """
+    freq_req = (freq or 'D').strip().upper()
+
+    # Monthly:
+    # - Our API treats 'M' as "monthly" and (by convention) expects month-start timestamps.
+    # - Use 'MS' (month begin) for 'M'/'MS', and 'ME' (month end) when explicitly requested.
+    if freq_req in ('M', 'MS', 'ME'):
+        month_start = freq_req in ('M', 'MS')
+        out = df_his.copy()
+        p = out['day'].dt.to_period('M')
+        if month_start:
+            out['day'] = p.dt.to_timestamp(how='start')
+        else:
+            # Month-end at midnight (not end-of-day nanoseconds).
+            out['day'] = p.dt.to_timestamp('M')
+        out = out.groupby(['item_id', 'day'], as_index=False, sort=True)['actual_sale'].sum()
+        return out, ('MS' if month_start else 'ME')
+
+    # Weekly: aggregate to weekly sums. Default 'W' is week ending Sunday.
+    if freq_req in ('W', 'W-SUN', 'W-MON', 'W-TUE', 'W-WED', 'W-THU', 'W-FRI', 'W-SAT'):
+        out = df_his.copy()
+        out['day'] = out['day'].dt.to_period('W').dt.to_timestamp('W')
+        out = out.groupby(['item_id', 'day'], as_index=False, sort=True)['actual_sale'].sum()
+        return out, 'W'
+
+    return df_his, freq_req
+
+
 @router.post("/generate")
 def generate_forecast(request: ForecastRequest):
     """
@@ -194,7 +230,9 @@ def generate_forecast(request: ForecastRequest):
     
     **freq** (default: 'D'): Frequency/interval of time series data
     - 'D': Daily
-    - 'M': Monthly (month end)
+    - 'M': Monthly (month start; use YYYY-MM-01)
+    - 'ME': Monthly (month end)
+    - 'MS': Monthly (month start)
     - 'W': Weekly
     - 'H': Hourly
     - 'Q': Quarterly
@@ -254,6 +292,8 @@ def generate_forecast(request: ForecastRequest):
         
         # Convert date column to datetime
         df_his['day'] = pd.to_datetime(df_his['day'])
+
+        df_his, freq_req = _normalize_and_aggregate_history(df_his, request.freq)
         
         # Initialize forecaster
         forecaster = ClassicalForecasts(
@@ -262,7 +302,7 @@ def generate_forecast(request: ForecastRequest):
             quantiles=request.quantiles,
             local_model=request.local_model,
             season_length=request.season_length,
-            freq=request.freq
+            freq=freq_req
         )
         
         print(f"Forecaster initialized: {request.local_model if request.mode == 'local' else 'TimeGPT'}")
@@ -280,12 +320,24 @@ def generate_forecast(request: ForecastRequest):
             # even for strongly seasonal daily/weekly series.
             metric = request.auto_model_metric or 'robust'
 
+            # If the user didn't specify the number of CV windows, default to enough
+            # rolling windows to cover roughly one full season. This avoids a common
+            # failure mode where the last CV window is entirely "off-season" (all zeros)
+            # and Naive wins by predicting 0, even when the series has strong seasonality.
+            cv_h_eff = int(request.auto_model_cv_h) if request.auto_model_cv_h is not None else int(min(request.forecast_periods, max(1, int(request.season_length))))
+            cv_h_eff = max(1, cv_h_eff)
+            if request.auto_model_n_windows is None:
+                n_windows = int(max(1, math.ceil(max(1, int(request.season_length)) / float(cv_h_eff))))
+                n_windows = min(n_windows, 24)
+            else:
+                n_windows = int(max(1, request.auto_model_n_windows))
+
             panel_fcst = forecaster.auto_model_forecast_panel(
                 df_his,
                 h=request.forecast_periods,
                 metric=metric,
                 cv_h=request.auto_model_cv_h,
-                n_windows=(request.auto_model_n_windows or 1),
+                n_windows=n_windows,
                 lookback_days=request.auto_model_lookback_days,
                 lookback_periods=request.auto_model_lookback_periods,
             )
@@ -321,10 +373,11 @@ def generate_forecast(request: ForecastRequest):
                     forecast_values = forecaster.daily_path(item_data, periods=request.forecast_periods)
 
                     last_date = item_data['day'].max()
+                    offset = to_offset(freq_req)
                     future_dates = pd.date_range(
-                        start=last_date + pd.Timedelta(days=1 if request.freq == 'D' else 0),
+                        start=last_date + offset,
                         periods=request.forecast_periods,
-                        freq=request.freq
+                        freq=freq_req
                     )
 
                     results.append({
@@ -354,7 +407,7 @@ def generate_forecast(request: ForecastRequest):
             'mode': request.mode,
             'model': request.local_model if request.mode == 'local' else 'timegpt',
             'periods': request.forecast_periods,
-            'frequency': request.freq
+            'frequency': freq_req
         }
             
     except Exception as e:
@@ -382,13 +435,15 @@ async def generate_forecast_async(request: ForecastRequest):
 
         df_his['day'] = pd.to_datetime(df_his['day'])
 
+        df_his, freq_req = _normalize_and_aggregate_history(df_his, request.freq)
+
         forecaster = ClassicalForecasts(
             mode=request.mode,
             api_key=request.api_key,
             quantiles=request.quantiles,
             local_model=request.local_model,
             season_length=request.season_length,
-            freq=request.freq
+            freq=freq_req
         )
 
         print(f"Forecaster initialized (async): {request.local_model if request.mode == 'local' else 'TimeGPT'}")
@@ -401,13 +456,21 @@ async def generate_forecast_async(request: ForecastRequest):
         if request.mode == 'local' and request.local_model in ('auto_model', 'automodel'):
             metric = request.auto_model_metric or 'robust'
 
+            cv_h_eff = int(request.auto_model_cv_h) if request.auto_model_cv_h is not None else int(min(request.forecast_periods, max(1, int(request.season_length))))
+            cv_h_eff = max(1, cv_h_eff)
+            if request.auto_model_n_windows is None:
+                n_windows = int(max(1, math.ceil(max(1, int(request.season_length)) / float(cv_h_eff))))
+                n_windows = min(n_windows, 24)
+            else:
+                n_windows = int(max(1, request.auto_model_n_windows))
+
             panel_fcst = await asyncio.to_thread(
                 forecaster.auto_model_forecast_panel,
                 df_his,
                 request.forecast_periods,
                 metric,
                 request.auto_model_cv_h,
-                (request.auto_model_n_windows or 1),
+                n_windows,
                 request.auto_model_lookback_days,
                 request.auto_model_lookback_periods,
             )
@@ -443,10 +506,11 @@ async def generate_forecast_async(request: ForecastRequest):
                     forecast_values = await asyncio.to_thread(forecaster.daily_path, item_data, request.forecast_periods)
 
                     last_date = item_data['day'].max()
+                    offset = to_offset(freq_req)
                     future_dates = pd.date_range(
-                        start=last_date + pd.Timedelta(days=1 if request.freq == 'D' else 0),
+                        start=last_date + offset,
                         periods=request.forecast_periods,
-                        freq=request.freq
+                        freq=freq_req
                     )
 
                     results.append({
@@ -476,7 +540,7 @@ async def generate_forecast_async(request: ForecastRequest):
             'mode': request.mode,
             'model': request.local_model if request.mode == 'local' else 'timegpt',
             'periods': request.forecast_periods,
-            'frequency': request.freq
+            'frequency': freq_req
         }
 
     except Exception as e:
@@ -775,6 +839,8 @@ def calculate_leadtime_quantile(request: ForecastRequest):
         # Convert input data to DataFrame
         df_his = pd.DataFrame(request.sim_input_his)
         df_his['day'] = pd.to_datetime(df_his['day'])
+
+        df_his, freq_req = _normalize_and_aggregate_history(df_his, request.freq)
         
         # Initialize forecaster
         forecaster = ClassicalForecasts(
@@ -783,7 +849,7 @@ def calculate_leadtime_quantile(request: ForecastRequest):
             quantiles=request.quantiles or [0.5, 0.9, 0.95, 0.99],
             local_model=request.local_model,
             season_length=request.season_length,
-            freq=request.freq
+            freq=freq_req
         )
         
         print(f"Calculating quantiles for lead-time: {request.forecast_periods} periods")
