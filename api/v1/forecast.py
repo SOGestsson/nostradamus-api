@@ -206,7 +206,9 @@ def generate_forecast(request: ForecastRequest):
     - 'auto_model': Automatically selects the best StatsForecast model per item via cross-validation (defaults to a robust RMSE+MAE rank aggregation; excludes TimeGPT/LightGPT)
 
     **auto_model_metric** (optional): Scoring metric for local_model='auto_model'
-    - 'robust' (default): rank-aggregate RMSE and MAE
+    - 'wape_bias' (default): WAPE primary with symmetric |bias| penalty (best for inventory)
+    - 'wape': choose lowest WAPE
+    - 'robust': rank-aggregate RMSE and MAE
     - 'rmse': choose lowest RMSE
     - 'mae': choose lowest MAE
 
@@ -280,6 +282,10 @@ def generate_forecast(request: ForecastRequest):
     """
     try:
         print(f"Starting forecast generation with mode: {request.mode}")
+
+        # Safety: auto_model is StatsForecast-only; disallow accidental TimeGPT mode.
+        if request.local_model in ('auto_model', 'automodel') and request.mode != 'local':
+            raise HTTPException(status_code=400, detail="local_model='auto_model' requires mode='local' (StatsForecast only)")
         
         # Convert input data to DataFrame
         df_his = pd.DataFrame(request.sim_input_his)
@@ -318,7 +324,7 @@ def generate_forecast(request: ForecastRequest):
             # The previous monthly-aggregate speed optimisation (season_length=12, freq='M')
             # was forcing many items into the 'short' bucket and defaulting them to Naive,
             # even for strongly seasonal daily/weekly series.
-            metric = request.auto_model_metric or 'robust'
+            metric = request.auto_model_metric or 'wape_bias'
 
             # If the user didn't specify the number of CV windows, default to enough
             # rolling windows to cover roughly one full season. This avoids a common
@@ -426,6 +432,10 @@ async def generate_forecast_async(request: ForecastRequest):
     try:
         print(f"Starting async forecast generation with mode: {request.mode}")
 
+        # Safety: auto_model is StatsForecast-only; disallow accidental TimeGPT mode.
+        if request.local_model in ('auto_model', 'automodel') and request.mode != 'local':
+            raise HTTPException(status_code=400, detail="local_model='auto_model' requires mode='local' (StatsForecast only)")
+
         df_his = pd.DataFrame(request.sim_input_his)
 
         required_cols = ['item_id', 'actual_sale', 'day']
@@ -454,7 +464,7 @@ async def generate_forecast_async(request: ForecastRequest):
         print(f"Generating async forecasts for {len(unique_items)} items")
 
         if request.mode == 'local' and request.local_model in ('auto_model', 'automodel'):
-            metric = request.auto_model_metric or 'robust'
+            metric = request.auto_model_metric or 'wape_bias'
 
             cv_h_eff = int(request.auto_model_cv_h) if request.auto_model_cv_h is not None else int(min(request.forecast_periods, max(1, int(request.season_length))))
             cv_h_eff = max(1, cv_h_eff)

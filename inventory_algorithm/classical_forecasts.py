@@ -6,10 +6,24 @@ import pandas as pd
 from typing import Callable, Optional
 
 try:
-    from nixtla import NixtlaClient
-    _HAS_TIMEGPT = True
+    # NOTE: Do not import nixtla at module import time.
+    # Auto-model (StatsForecast) must not require or touch Nixtla.
+    pass
 except Exception:
-    _HAS_TIMEGPT = False
+    pass
+
+
+def _lazy_import_timegpt_client():
+    """Lazy import of Nixtla client.
+
+    This guarantees StatsForecast-only paths (including auto_model selection)
+    never import or instantiate the Nixtla SDK.
+    """
+    try:
+        from nixtla import NixtlaClient  # type: ignore
+    except Exception as e:
+        raise RuntimeError("Nixtla 'nixtla' package not available. Install with `pip install nixtla`.") from e
+    return NixtlaClient
 
 # Optional local fallback models via StatsForecast
 def _lazy_import_nixtla_models():
@@ -95,6 +109,75 @@ def _safe_wape_and_bias(y: np.ndarray, yhat: np.ndarray) -> tuple[float, float]:
     wape = float(np.sum(np.abs(err)) / denom)
     bias_pct = float(100.0 * np.sum(err) / denom)
     return wape, bias_pct
+
+
+def _pick_model_wape_bias_penalty(
+    wape_vals: pd.Series,
+    bias_pct_vals: pd.Series,
+    *,
+    rel_eps: float = 0.02,
+    abs_eps: float = 0.005,
+    bias_ok_pct: float = 10.0,
+    bias_scale_pct: float = 20.0,
+    weight: float = 0.25,
+) -> str:
+    """Pick a model using WAPE primary with a symmetric |bias| penalty.
+
+    - WAPE is the primary objective.
+    - Bias is symmetric: over/under forecasts are equally bad.
+    - Bias only affects choice among models whose WAPE is within a small band
+      of the best WAPE (to keep WAPE as the main focus).
+
+    Score definition (in percent points):
+      W = 100 * wape
+      B = |bias_pct|
+      penalty = weight * max(0, B - bias_ok)^2 / bias_scale
+      score = W + penalty
+
+    Edge case: if wape values are on an absolute-error scale (all-zero denom
+    fallback), then bias_pct is not a percentage; disable the bias penalty.
+    """
+    if wape_vals.empty:
+        return 'Naive'
+
+    wape_vals = wape_vals.astype(float)
+    bias_abs = bias_pct_vals.astype(float).abs()
+
+    best_wape = float(wape_vals.min())
+    # Use both relative and absolute epsilon to be stable across scales.
+    band = max(float(abs_eps), abs(best_wape) * float(rel_eps))
+    close = wape_vals <= (best_wape + band)
+    if bool(close.any()):
+        w_close = wape_vals[close]
+        b_close = bias_abs[close]
+    else:
+        w_close = wape_vals
+        b_close = bias_abs
+
+    # If WAPE is on absolute-error scale (near-zero denom fallback), bias_pct is
+    # not actually a percent. In that case, disable the penalty and just pick
+    # the lowest WAPE (tie-break by |bias| for determinism).
+    if best_wape > 5.0:
+        picked = (
+            pd.DataFrame({'wape': w_close, 'abs_bias': b_close})
+            .sort_values(['wape', 'abs_bias'], ascending=True)
+            .index[0]
+        )
+        return str(picked)
+
+    # Penalize excessive |bias| above an "ok" zone.
+    excess = (b_close - float(bias_ok_pct)).clip(lower=0.0)
+    denom = float(bias_scale_pct) if float(bias_scale_pct) > 0 else 1.0
+    penalty = float(weight) * (excess * excess) / denom
+    w_pct = 100.0 * w_close
+    score = w_pct + penalty
+
+    picked = (
+        pd.DataFrame({'score': score, 'wape': w_close, 'abs_bias': b_close})
+        .sort_values(['score', 'wape', 'abs_bias'], ascending=True)
+        .index[0]
+    )
+    return str(picked)
 
 
 def _build_candidate_model_factories(season_length: int) -> list[tuple[str, Callable[[], object]]]:
@@ -212,6 +295,38 @@ def _series_profile(y: np.ndarray) -> dict[str, float]:
     return {'n': float(n), 'zero_frac': zero_frac, 'adi': adi, 'cv2': cv2, 'trend_corr': trend_corr}
 
 
+def _regularize_panel_time_index(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """Return a panel with a complete time index per unique_id.
+
+    Many StatsForecast models expect a regular time grid. Real inventory history
+    often has missing timestamps (no transactions recorded). For demand series,
+    missing periods should typically be treated as 0.
+
+    Input df must have columns: ['unique_id','ds','y'].
+    """
+    if df.empty:
+        return df
+    out_parts: list[pd.DataFrame] = []
+    for uid, g in df.groupby('unique_id', sort=False):
+        g = g.sort_values('ds')
+        start = pd.to_datetime(g['ds'].iloc[0])
+        end = pd.to_datetime(g['ds'].iloc[-1])
+        full = pd.date_range(start=start, end=end, freq=freq)
+        # If already regular, skip reindex work.
+        if len(full) == len(g) and pd.Index(g['ds']).is_monotonic_increasing:
+            out_parts.append(g)
+            continue
+        gg = g.set_index('ds')
+        gg = gg.reindex(full)
+        gg.index.name = 'ds'
+        gg = gg.reset_index()
+        gg['unique_id'] = str(uid)
+        gg['y'] = gg['y'].fillna(0.0)
+        out_parts.append(gg.loc[:, ['unique_id', 'ds', 'y']])
+    out = pd.concat(out_parts, ignore_index=True)
+    return out.sort_values(['unique_id', 'ds']).reset_index(drop=True)
+
+
 def _bucket_series(profile: dict[str, float], season_length: int, min_arima_len: int) -> str:
     n = int(profile['n'])
     zero_frac = float(profile['zero_frac'])
@@ -271,8 +386,7 @@ class ClassicalForecasts:
         self.season_length = season_length
 
         if self.mode == 'timegpt':
-            if not _HAS_TIMEGPT:
-                raise RuntimeError("Nixtla 'nixtla' package not available. Install with `pip install nixtla`.")
+            NixtlaClient = _lazy_import_timegpt_client()
             self._client = NixtlaClient(api_key=api_key or os.environ.get("NIXTLA_API_KEY"))
 
     # ---------- TimeGPT path ----------
@@ -396,7 +510,7 @@ class ClassicalForecasts:
         n_windows: int = 1,
         lookback_days: Optional[int] = None,
         lookback_periods: Optional[int] = None,
-        bias_threshold_pct: float = 25.0,
+        bias_threshold_pct: float = float('inf'),
     ) -> pd.DataFrame:
         """Select best StatsForecast model per series and forecast.
 
@@ -429,6 +543,13 @@ class ClassicalForecasts:
 
         if df.empty:
             raise ValueError('Empty history after lookback filter')
+
+        # Ensure each series has a complete time index for the requested frequency.
+        # This dramatically reduces model failures in StatsForecast CV and prevents
+        # the "no_cv_scores -> default Naive" outcome.
+        df = _regularize_panel_time_index(df, freq=str(self.freq))
+        if df.empty:
+            raise ValueError('Empty history after regularization')
 
         metric_name, metric_fn = _metric_func_from_name(metric)
 
@@ -658,43 +779,23 @@ class ClassicalForecasts:
                         continue
                     models = list(wape_scores_map[uid].keys())
                     wape_vals = pd.Series({m: wape_scores_map[uid].get(m, np.inf) for m in models})
-                    bias_vals = pd.Series({m: abs(float(bias_scores_map[uid].get(m, np.inf))) for m in models})
+                    bias_vals = pd.Series({m: float(bias_scores_map[uid].get(m, np.inf)) for m in models})
 
-                    # Primary: minimize WAPE.
-                    # For 'wape_bias': only bring bias into the decision if models are
-                    # within a small WAPE band of the best model.
                     if metric_name == 'wape_bias':
-                        best_wape = float(wape_vals.min())
-                        # Internal tolerance knobs (monthly-only selection in API).
-                        # Bias should only matter when WAPE is effectively a tie.
-                        rel_tol = 0.02   # within 2% of best WAPE
-                        abs_tol = 1e-4   # or within a tiny absolute margin
-                        band = max(abs_tol, abs(best_wape) * rel_tol)
-                        close = wape_vals <= (best_wape + band)
-                        if bool(close.any()):
-                            wape_close = wape_vals[close]
-                            bias_close = bias_vals[close]
-                        else:
-                            wape_close = wape_vals
-                            bias_close = bias_vals
-
-                        # If any of the close models are within bias threshold, prefer them.
-                        if np.isfinite(float(bias_threshold_pct)):
-                            good = bias_close <= float(bias_threshold_pct)
-                            if bool(good.any()):
-                                wape_close = wape_close[good]
-                                bias_close = bias_close[good]
-
-                        # Pick lowest |bias| among the close contenders; tie-break by WAPE.
-                        picked = (
-                            pd.DataFrame({'abs_bias_pct': bias_close, 'wape': wape_close})
-                            .sort_values(['abs_bias_pct', 'wape'], ascending=True)
-                            .index[0]
+                        # WAPE is the main focus. If WAPE is close, penalize excessive |bias|.
+                        picked = _pick_model_wape_bias_penalty(
+                            wape_vals,
+                            bias_vals,
+                            rel_eps=0.02,
+                            abs_eps=0.005,
+                            bias_ok_pct=10.0,
+                            bias_scale_pct=20.0,
+                            weight=0.25,
                         )
                     else:
                         # Plain 'wape': pick best WAPE; deterministic tie-break by |bias|.
                         picked = (
-                            pd.DataFrame({'wape': wape_vals, 'abs_bias_pct': bias_vals})
+                            pd.DataFrame({'wape': wape_vals, 'abs_bias_pct': bias_vals.abs()})
                             .sort_values(['wape', 'abs_bias_pct'], ascending=True)
                             .index[0]
                         )
