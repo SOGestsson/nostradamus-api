@@ -33,3 +33,25 @@ def test_wape_bias_penalty_disables_bias_when_wape_is_absolute_error_scale():
 
     picked = _pick_model_wape_bias_penalty(wape, bias_pct)
     assert picked == "m2"
+
+
+def test_wape_bias_penalty_prefers_adaptive_over_seasonal_naive_when_close():
+    from inventory_algorithm.classical_forecasts import _pick_model_wape_bias_penalty
+
+    # SeasonalNaive is slightly better on WAPE, but not materially better.
+    wape = pd.Series({"SeasonalNaive": 0.100, "Theta": 0.101})
+    bias_pct = pd.Series({"SeasonalNaive": 0.0, "Theta": 0.0})
+
+    picked = _pick_model_wape_bias_penalty(wape, bias_pct)
+    assert picked == "Theta"
+
+
+def test_wape_bias_penalty_keeps_seasonal_naive_when_materially_better():
+    from inventory_algorithm.classical_forecasts import _pick_model_wape_bias_penalty
+
+    # SeasonalNaive is materially better by > 1.5 WAPE points.
+    wape = pd.Series({"SeasonalNaive": 0.080, "Theta": 0.101})
+    bias_pct = pd.Series({"SeasonalNaive": 0.0, "Theta": 0.0})
+
+    picked = _pick_model_wape_bias_penalty(wape, bias_pct)
+    assert picked == "SeasonalNaive"

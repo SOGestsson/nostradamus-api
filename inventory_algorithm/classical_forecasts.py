@@ -117,6 +117,7 @@ def _pick_model_wape_bias_penalty(
     *,
     rel_eps: float = 0.02,
     abs_eps: float = 0.005,
+    seasonal_naive_min_wape_advantage: float = 0.015,
     bias_ok_pct: float = 10.0,
     bias_scale_pct: float = 20.0,
     weight: float = 0.25,
@@ -171,6 +172,27 @@ def _pick_model_wape_bias_penalty(
     penalty = float(weight) * (excess * excess) / denom
     w_pct = 100.0 * w_close
     score = w_pct + penalty
+
+    # Policy: avoid picking SeasonalNaive when an adaptive model is essentially tied.
+    # Rationale: SeasonalNaive is a strong baseline but can be brittle under level shifts.
+    # Keep it only when it is materially better on WAPE.
+    seasonal_name = 'SeasonalNaive'
+    if seasonal_name in w_close.index:
+        adaptive = [m for m in ['AutoETS', 'Theta', 'OptimizedTheta', 'AutoARIMA'] if m in w_close.index]
+        if adaptive:
+            best_adaptive = float(w_close.loc[adaptive].min())
+            seasonal_wape = float(w_close.loc[seasonal_name])
+            # SeasonalNaive advantage is how much lower its WAPE is.
+            advantage = best_adaptive - seasonal_wape
+            if advantage < float(seasonal_naive_min_wape_advantage):
+                # Choose the best adaptive model by the same penalized score.
+                score_adaptive = score.loc[adaptive]
+                picked_adaptive = (
+                    pd.DataFrame({'score': score_adaptive, 'wape': w_close.loc[adaptive], 'abs_bias': b_close.loc[adaptive]})
+                    .sort_values(['score', 'wape', 'abs_bias'], ascending=True)
+                    .index[0]
+                )
+                return str(picked_adaptive)
 
     picked = (
         pd.DataFrame({'score': score, 'wape': w_close, 'abs_bias': b_close})
