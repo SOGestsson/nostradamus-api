@@ -118,6 +118,10 @@ class LightGBMTrainRequest(BaseModel):
         # If provided, restrict which wide columns are treated as exogenous
         exogenous_columns: Optional[List[str]] = None
 
+        # Optional detrending (helps avoid flat forecasts on trending series)
+        # Supported: 'none' (default), 'linear', 'log1p_linear'
+        detrend_method: str = 'none'
+
         # Registry
         model_version: Optional[str] = None
         status: str = 'staging'  # staging|prod|archived
@@ -142,6 +146,9 @@ class LightGBMBatchForecastRequest(BaseModel):
         freq: str = 'M'
         forecast_periods: int = 12
         exogenous_columns: Optional[List[str]] = None
+
+        # If omitted, the model's saved detrend settings apply.
+        detrend_method: Optional[str] = None
 
         # Which registered model to use
         model_version: Optional[str] = None

@@ -116,11 +116,74 @@ def _nonzero_run_length(values: np.ndarray) -> int:
     return int(len(values))
 
 
+def _month_index(ds: pd.Timestamp, start_ds: pd.Timestamp) -> int:
+    """Integer number of months between two month-start timestamps."""
+    ds = pd.Timestamp(ds)
+    start_ds = pd.Timestamp(start_ds)
+    return int((ds.year * 12 + ds.month) - (start_ds.year * 12 + start_ds.month))
+
+
+def _fit_trend_params(ds: np.ndarray, y: np.ndarray, method: str) -> dict[str, Any]:
+    """Fit a simple per-item trend model.
+
+    Supported methods:
+    - 'none': no detrending
+    - 'linear': y ~= a*t + b
+    - 'log1p_linear': log1p(y) ~= a*t + b  (i.e., exponential trend on y)
+    """
+
+    method = (method or "none").strip().lower()
+    if method not in {"none", "linear", "log1p_linear"}:
+        raise ValueError("detrend_method must be one of: none, linear, log1p_linear")
+
+    ds0 = pd.Timestamp(ds[0])
+    x = np.array([_month_index(pd.Timestamp(d), ds0) for d in ds], dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    if method == "none":
+        return {"method": "none", "start_ds": ds0.strftime("%Y-%m-%d"), "slope": 0.0, "intercept": 0.0}
+
+    if method == "log1p_linear":
+        yt = np.log1p(np.maximum(0.0, y))
+    else:
+        yt = y
+
+    if len(yt) < 2 or float(np.nanstd(yt)) <= 1e-12:
+        slope = 0.0
+        intercept = float(np.nanmean(yt)) if len(yt) else 0.0
+    else:
+        slope, intercept = np.polyfit(x, yt, deg=1)
+
+    return {
+        "method": method,
+        "start_ds": ds0.strftime("%Y-%m-%d"),
+        "slope": float(slope),
+        "intercept": float(intercept),
+    }
+
+
+def _trend_model_value(ds: pd.Timestamp, params: dict[str, Any]) -> float:
+    """Trend value in *model space* for a given timestamp.
+
+    - linear: returns trend in y-units
+    - log1p_linear: returns trend in log1p(y)-units
+    """
+
+    method = str(params.get("method") or "none").strip().lower()
+    if method == "none":
+        return 0.0
+    start_ds = pd.Timestamp(str(params.get("start_ds")))
+    t = float(_month_index(pd.Timestamp(ds), start_ds))
+    return float(params.get("intercept", 0.0) + params.get("slope", 0.0) * t)
+
+
 def _build_direct_rows_for_item(
     *,
     unique_id: str,
     ds: np.ndarray,
     y: np.ndarray,
+    y_orig: np.ndarray | None,
+    trend_params: dict[str, Any] | None,
     exo: dict[str, np.ndarray],
     static: dict[str, Any],
     horizon: int,
@@ -138,12 +201,22 @@ def _build_direct_rows_for_item(
 
         forecast_ds = pd.Timestamp(ds[t]) + pd.offsets.MonthBegin(horizon)
         target = float(y[t + horizon])
+        if y_orig is not None:
+            target_orig = float(y_orig[t + horizon])
+        else:
+            target_orig = target
+
+        trend_model_at_forecast = 0.0
+        if trend_params is not None:
+            trend_model_at_forecast = _trend_model_value(forecast_ds, trend_params)
 
         row: dict[str, Any] = {
             "unique_id": unique_id,
             "decision_ds": pd.Timestamp(ds[t]),
             "forecast_ds": forecast_ds,
             "y": target,
+            "y_orig": target_orig,
+            "trend_model": float(trend_model_at_forecast),
         }
 
         m = int(forecast_ds.month)
@@ -158,6 +231,9 @@ def _build_direct_rows_for_item(
         for lag in lags:
             idx = t - (lag - 1)
             row[f"lag_{lag}"] = float(y[idx])
+
+        if y_orig is not None:
+            row["lag_1_orig"] = float(y_orig[t])
 
         for w in roll_windows:
             start = t - (w - 1)
@@ -258,6 +334,7 @@ class LightGBMForecast:
         freq: str = "M",
         horizon: int = 12,
         exogenous_columns: list[str] | None = None,
+        detrend_method: str = "none",
         model_version: str | None = None,
         status: str = "staging",
         notes: str | None = None,
@@ -321,11 +398,30 @@ class LightGBMForecast:
         # Build supervised rows across all items for each horizon
         all_rows_by_h: dict[int, list[dict[str, Any]]] = {h: [] for h in range(1, int(horizon) + 1)}
 
+        detrend_method = (detrend_method or "none").strip().lower()
+        if detrend_method not in {"none", "linear", "log1p_linear"}:
+            raise ValueError("detrend_method must be one of: none, linear, log1p_linear")
+
+        trend_params_by_uid: dict[str, dict[str, Any]] = {}
+
         base = base.sort_values(["unique_id", "ds"], kind="mergesort").reset_index(drop=True)
         for uid, grp in base.groupby("unique_id", sort=False):
             grp = grp.sort_values("ds", kind="mergesort")
             ds = grp["ds"].to_numpy()
-            y = grp["y"].to_numpy(dtype=float)
+            y_orig = grp["y"].to_numpy(dtype=float)
+
+            trend_params = _fit_trend_params(ds, y_orig, detrend_method)
+            trend_params_by_uid[str(uid)] = trend_params
+
+            if detrend_method == "none":
+                y_model = y_orig
+            elif detrend_method == "linear":
+                trend = np.array([_trend_model_value(pd.Timestamp(d), trend_params) for d in ds], dtype=float)
+                y_model = y_orig - trend
+            else:  # log1p_linear
+                yt = np.log1p(np.maximum(0.0, y_orig))
+                trend = np.array([_trend_model_value(pd.Timestamp(d), trend_params) for d in ds], dtype=float)
+                y_model = yt - trend
 
             exo = {c: pd.to_numeric(grp[c], errors="coerce").fillna(0.0).to_numpy(dtype=float) for c in exogenous_columns}
 
@@ -339,7 +435,9 @@ class LightGBMForecast:
                 rows = _build_direct_rows_for_item(
                     unique_id=str(uid),
                     ds=ds,
-                    y=y,
+                    y=y_model,
+                    y_orig=y_orig,
+                    trend_params=trend_params,
                     exo=exo,
                     static=static,
                     horizon=h,
@@ -356,6 +454,7 @@ class LightGBMForecast:
             "strategy": "direct",
             "horizon": int(horizon),
             "val_months": int(val_months),
+            "detrend_method": detrend_method,
         }
 
         models: dict[int, Any] = {}
@@ -411,7 +510,7 @@ class LightGBMForecast:
 
             # Define feature columns once
             if feature_cols is None:
-                excluded = {"y", "decision_ds", "forecast_ds"}
+                excluded = {"y", "decision_ds", "forecast_ds", "y_orig", "trend_model", "lag_1_orig"}
                 feature_cols = [c for c in df.columns if c not in excluded]
 
             # Time split by forecast_ds
@@ -433,8 +532,12 @@ class LightGBMForecast:
             if len(X_train) < 50:
                 raise ValueError("Not enough training rows to fit LightGBM. Provide more history or more items.")
 
-            all_nonneg = bool(np.all(y_train >= 0) and np.all(y_val >= 0))
-            objective = "poisson" if all_nonneg else "regression"
+            if detrend_method == "none":
+                all_nonneg = bool(np.all(y_train >= 0) and np.all(y_val >= 0))
+                objective = "poisson" if all_nonneg else "regression"
+            else:
+                # Detrended targets can be negative; use regression.
+                objective = "regression"
 
             params = {
                 "objective": objective,
@@ -470,17 +573,51 @@ class LightGBMForecast:
 
             # Metrics
             if len(X_val) > 0:
-                yhat = np.maximum(0.0, booster.predict(X_val))
-                metrics_summary[f"wape_val_h{h}"] = _wape(y_val, yhat)
+                yhat_model = booster.predict(X_val)
+
+                # Reconstruct to original scale for metrics.
+                if "y_orig" in df.columns:
+                    y_true_orig = df.loc[is_val, "y_orig"].to_numpy(dtype=float)
+                else:
+                    y_true_orig = y_val
+
+                if detrend_method == "none":
+                    yhat_orig = np.maximum(0.0, yhat_model)
+                elif detrend_method == "linear":
+                    trend_val = df.loc[is_val, "trend_model"].to_numpy(dtype=float)
+                    yhat_orig = np.maximum(0.0, yhat_model + trend_val)
+                else:  # log1p_linear
+                    trend_val = df.loc[is_val, "trend_model"].to_numpy(dtype=float)
+                    yhat_orig = np.maximum(0.0, np.expm1(yhat_model + trend_val))
+
+                metrics_summary[f"wape_val_h{h}"] = _wape(y_true_orig, yhat_orig)
 
                 if h == 1:
                     # per-item eval for eligibility (h=1)
-                    df_val = df.loc[is_val, ["unique_id", "y", "lag_1"]].copy()
-                    df_val["yhat_ml"] = yhat
-                    df_val["yhat_naive"] = pd.to_numeric(df_val["lag_1"], errors="coerce").fillna(0.0)
+                    cols = ["unique_id", "y", "lag_1", "y_orig", "lag_1_orig", "trend_model"]
+                    keep = [c for c in cols if c in df.columns]
+                    df_val = df.loc[is_val, keep].copy()
+
+                    if detrend_method == "none":
+                        df_val["yhat_ml"] = np.maximum(0.0, yhat_model)
+                        y_eval = pd.to_numeric(df_val.get("y_orig", df_val["y"]), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                    elif detrend_method == "linear":
+                        trend_val = pd.to_numeric(df_val.get("trend_model"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                        df_val["yhat_ml"] = np.maximum(0.0, yhat_model + trend_val)
+                        y_eval = pd.to_numeric(df_val.get("y_orig", df_val["y"]), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                    else:
+                        trend_val = pd.to_numeric(df_val.get("trend_model"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                        df_val["yhat_ml"] = np.maximum(0.0, np.expm1(yhat_model + trend_val))
+                        y_eval = pd.to_numeric(df_val.get("y_orig", df_val["y"]), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+
+                    df_val["y_eval"] = y_eval
+                    if "lag_1_orig" in df_val.columns:
+                        df_val["yhat_naive"] = pd.to_numeric(df_val["lag_1_orig"], errors="coerce").fillna(0.0)
+                    else:
+                        df_val["yhat_naive"] = pd.to_numeric(df_val.get("lag_1"), errors="coerce").fillna(0.0)
 
                     for uid, g in df_val.groupby("unique_id", sort=False):
-                        yt = g["y"].to_numpy(dtype=float)
+                        yt = g.get("y_eval", g.get("y_orig", g["y"])).to_numpy(dtype=float)
                         y_ml = g["yhat_ml"].to_numpy(dtype=float)
                         y_nv = g["yhat_naive"].to_numpy(dtype=float)
                         per_item_eval[str(uid)] = {
@@ -505,6 +642,7 @@ class LightGBMForecast:
             "horizon": int(horizon),
             "horizons": list(range(1, int(horizon) + 1)),
             "target": "y",
+            "detrend_method": detrend_method,
             "lags": lags,
             "rolling_windows": roll_windows,
             "static_columns": static_cols,
@@ -518,6 +656,19 @@ class LightGBMForecast:
             json.dump(feature_spec, f, ensure_ascii=False, indent=2)
 
         spec_hash = self.store.set_feature_spec(model_version, feature_spec)
+
+        if detrend_method != "none":
+            trend_path = os.path.join(artifact_root, "trend_params.json")
+            with open(trend_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "detrend_method": detrend_method,
+                        "per_unique_id": trend_params_by_uid,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
 
         if progress_hook:
             progress_hook({"phase": "writing_duckdb"})
@@ -727,6 +878,18 @@ class LightGBMForecast:
         lags: list[int] = list(spec.get("lags") or [1, 2, 3, 6, 12, 24])
         roll_windows: list[int] = list(spec.get("rolling_windows") or [3, 6, 12])
 
+        detrend_method = str(spec.get("detrend_method") or "none").strip().lower()
+        trend_params_by_uid: dict[str, dict[str, Any]] = {}
+        trend_path = os.path.join(artifact_root, "trend_params.json")
+        if os.path.exists(trend_path):
+            try:
+                with open(trend_path, "r", encoding="utf-8") as f:
+                    trend_blob = json.load(f)
+                detrend_method = str(trend_blob.get("detrend_method") or detrend_method).strip().lower()
+                trend_params_by_uid = dict(trend_blob.get("per_unique_id") or {})
+            except Exception:
+                trend_params_by_uid = {}
+
         H = int(forecast_periods)
         horizons = list(range(1, H + 1))
 
@@ -768,12 +931,24 @@ class LightGBMForecast:
 
         for uid, grp in base.groupby("unique_id", sort=False):
             grp = grp.sort_values("ds", kind="mergesort")
-            y = grp["y"].to_numpy(dtype=float)
+            y_orig = grp["y"].to_numpy(dtype=float)
             ds_arr = grp["ds"].to_numpy()
-            if len(y) < 25:
+            if len(y_orig) < 25:
                 continue
 
             last_ds = pd.Timestamp(ds_arr[-1])
+
+            params = trend_params_by_uid.get(str(uid))
+            if detrend_method != "none" and params:
+                if detrend_method == "linear":
+                    trend_hist = np.array([_trend_model_value(pd.Timestamp(d), params) for d in ds_arr], dtype=float)
+                    y = y_orig - trend_hist
+                else:  # log1p_linear
+                    yt = np.log1p(np.maximum(0.0, y_orig))
+                    trend_hist = np.array([_trend_model_value(pd.Timestamp(d), params) for d in ds_arr], dtype=float)
+                    y = yt - trend_hist
+            else:
+                y = y_orig
 
             exo = {c: pd.to_numeric(grp[c], errors="coerce").fillna(0.0).to_numpy(dtype=float) for c in exogenous_columns}
             static: dict[str, Any] = {}
@@ -838,7 +1013,15 @@ class LightGBMForecast:
                         X[c] = 0
                 X = X[feature_cols].fillna(0)
 
-                yhat = float(np.maximum(0.0, boosters[h].predict(X)[0]))
+                yhat_model = float(boosters[h].predict(X)[0])
+                if detrend_method == "none" or not params:
+                    yhat = float(np.maximum(0.0, yhat_model))
+                elif detrend_method == "linear":
+                    trend_future = _trend_model_value(forecast_ds, params)
+                    yhat = float(np.maximum(0.0, yhat_model + trend_future))
+                else:  # log1p_linear
+                    trend_future = _trend_model_value(forecast_ds, params)
+                    yhat = float(np.maximum(0.0, np.expm1(yhat_model + trend_future)))
                 forecasts.append({"unique_id": str(uid), "ds": forecast_ds, "yhat": yhat})
 
         fcst = pd.DataFrame(forecasts)
@@ -847,5 +1030,5 @@ class LightGBMForecast:
             fcst["day"] = pd.to_datetime(fcst["ds"]).dt.strftime("%Y-%m-%d")
             fcst = fcst[["item_id", "day", "yhat"]]
 
-        meta = {"model_version": model_version, "freq": "MS", "strategy": "direct"}
+        meta = {"model_version": model_version, "freq": "MS", "strategy": "direct", "detrend_method": detrend_method}
         return fcst, meta

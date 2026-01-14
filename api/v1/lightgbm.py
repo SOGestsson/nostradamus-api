@@ -144,6 +144,7 @@ def train_lightgbm(request: LightGBMTrainRequest):
             freq=request.freq,
             horizon=request.forecast_periods,
             exogenous_columns=request.exogenous_columns,
+            detrend_method=getattr(request, "detrend_method", "none"),
             model_version=request.model_version,
             status=request.status,
             notes=request.notes,
@@ -198,6 +199,8 @@ def train_lightgbm_async(
             _update_job(job_id, status='running', phase='starting')
 
             df_hist = pd.DataFrame(request.sim_input_his)
+            if "item_id" in df_hist.columns:
+                df_hist["item_id"] = df_hist["item_id"].astype(str)
             df_items = pd.DataFrame(request.item_attributes) if request.item_attributes else None
             df_drivers = pd.DataFrame(request.external_drivers) if request.external_drivers else None
 
@@ -218,6 +221,7 @@ def train_lightgbm_async(
                 freq=request.freq,
                 horizon=request.forecast_periods,
                 exogenous_columns=request.exogenous_columns,
+                detrend_method=getattr(request, "detrend_method", "none"),
                 model_version=request.model_version,
                 status=request.status,
                 notes=request.notes,
@@ -351,25 +355,32 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
         for item_id in unique_ids:
             elig = eligibility.get(str(item_id)) or {}
             ml_allowed = bool(elig.get("ml_allowed")) if elig.get("ml_allowed") is not None else False
-            winner = elig.get("winner_model") or ("lgbm_global" if ml_allowed else "naive")
+            winner = elig.get("winner_model") or ("lgbm_direct" if ml_allowed else "naive")
             reason = elig.get("reason_code") or ("OK" if ml_allowed else "NO_ELIGIBILITY")
             confidence = elig.get("confidence")
 
-            if ml_allowed and winner == "lgbm_global":
+            use_ml = ml_allowed and str(winner).startswith("lgbm")
+            if use_ml:
                 item_fcst = fcst_df[fcst_df["item_id"].astype(str) == str(item_id)].sort_values("day")
-                yhat = item_fcst["yhat"].to_numpy(dtype=float).tolist()
-                days = [pd.to_datetime(d).strftime("%Y-%m-%d") for d in item_fcst["day"].tolist()]
-                out.append(
-                    {
-                        "item_id": item_id,
-                        "forecast": yhat,
-                        "forecast_dates": days,
-                        "model_used": "lgbm_global",
-                        "reason_code": reason,
-                        "confidence": confidence,
-                    }
-                )
-            else:
+                if len(item_fcst) == int(request.forecast_periods):
+                    yhat = item_fcst["yhat"].to_numpy(dtype=float).tolist()
+                    days = [pd.to_datetime(d).strftime("%Y-%m-%d") for d in item_fcst["day"].tolist()]
+                    out.append(
+                        {
+                            "item_id": item_id,
+                            "forecast": yhat,
+                            "forecast_dates": days,
+                            "model_used": str(winner),
+                            "reason_code": reason,
+                            "confidence": confidence,
+                        }
+                    )
+                    continue
+
+                # If ML is allowed but we don't have predictions (e.g. not enough history
+                # for that item), fall back to naive but keep an explicit reason.
+                reason = "ML_NO_PREDICTION"
+
                 last = float(last_vals.get(str(item_id), 0.0)) if len(last_vals) else 0.0
                 # naive dates: just increment by freq offset from max day
                 last_day = df_hist[df_hist["item_id"].astype(str) == str(item_id)]["day"].max()
