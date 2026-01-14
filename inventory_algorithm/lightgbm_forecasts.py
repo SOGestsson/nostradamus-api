@@ -64,6 +64,8 @@ def _normalize_monthly_history(df_his: pd.DataFrame) -> pd.DataFrame:
 
     df["day"] = pd.to_datetime(df["day"], errors="coerce")
     df = df.dropna(subset=["day", "item_id"])
+    # Treat item_id as an opaque identifier (often non-numeric in real systems).
+    df["item_id"] = df["item_id"].astype(str)
 
     df["ds"] = _to_month_start(df["day"])
     df["y"] = pd.to_numeric(df["actual_sale"], errors="coerce").fillna(0.0).astype(float)

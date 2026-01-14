@@ -130,6 +130,9 @@ def _default_store_root() -> str:
 def train_lightgbm(request: LightGBMTrainRequest):
     try:
         df_hist = pd.DataFrame(request.sim_input_his)
+        # item_id is an opaque identifier (often non-numeric)
+        if "item_id" in df_hist.columns:
+            df_hist["item_id"] = df_hist["item_id"].astype(str)
         df_items = pd.DataFrame(request.item_attributes) if request.item_attributes else None
         df_drivers = pd.DataFrame(request.external_drivers) if request.external_drivers else None
 
@@ -332,6 +335,7 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
         # Build naive fallback
         df_hist["day"] = pd.to_datetime(df_hist["day"], errors="coerce")
         df_hist = df_hist.dropna(subset=["item_id", "day", "actual_sale"])
+        df_hist["item_id"] = df_hist["item_id"].astype(str)
         last_vals = (
             df_hist.sort_values(["item_id", "day"], kind="mergesort")
             .groupby("item_id", sort=False)
@@ -366,7 +370,7 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
                     }
                 )
             else:
-                last = float(last_vals.get(int(item_id), last_vals.get(str(item_id), 0.0))) if len(last_vals) else 0.0
+                last = float(last_vals.get(str(item_id), 0.0)) if len(last_vals) else 0.0
                 # naive dates: just increment by freq offset from max day
                 last_day = df_hist[df_hist["item_id"].astype(str) == str(item_id)]["day"].max()
                 if pd.isna(last_day):
