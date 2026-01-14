@@ -66,6 +66,8 @@ llvmlite = "*"
 statsmodels = "*"
 requests = "*"
 mysql-connector-python = "*"
+duckdb = "*"
+lightgbm = "*"
 
 [dev-packages]
 

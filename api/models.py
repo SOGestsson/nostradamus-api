@@ -92,3 +92,59 @@ class LightGPTResponse(BaseModel):
     periods: int
 
 
+class LightGBMTrainRequest(BaseModel):
+        """Request model for training a monthly LightGBM model.
+
+        Canonical format:
+        - Wide history in `sim_input_his` with columns:
+            item_id, day, actual_sale, plus optional wide regressors (support series).
+
+        Optional:
+        - `item_attributes` for static item metadata (category, brand, etc.).
+        - `external_drivers` for long-format drivers; converted to wide on ingest.
+        """
+
+        customer_id: str
+        store_root: Optional[str] = None
+
+        sim_input_his: List[Dict[str, Any]]
+        item_attributes: Optional[List[Dict[str, Any]]] = None
+        external_drivers: Optional[List[Dict[str, Any]]] = None
+
+        # Monthly-only for now; 'M' treated as month-start ('MS') internally
+        freq: str = 'M'
+        forecast_periods: int = 12
+
+        # If provided, restrict which wide columns are treated as exogenous
+        exogenous_columns: Optional[List[str]] = None
+
+        # Registry
+        model_version: Optional[str] = None
+        status: str = 'staging'  # staging|prod|archived
+        notes: Optional[str] = None
+
+        # Guardrails
+        min_history_points: int = 24
+        min_improvement: float = 0.02
+
+
+class LightGBMBatchForecastRequest(BaseModel):
+        """Request model for batch forecasting with a trained LightGBM model."""
+
+        customer_id: str
+        store_root: Optional[str] = None
+
+        sim_input_his: List[Dict[str, Any]]
+        item_attributes: Optional[List[Dict[str, Any]]] = None
+        external_drivers: Optional[List[Dict[str, Any]]] = None
+
+        # Monthly-only for now; 'M' treated as month-start ('MS') internally
+        freq: str = 'M'
+        forecast_periods: int = 12
+        exogenous_columns: Optional[List[str]] = None
+
+        # Which registered model to use
+        model_version: Optional[str] = None
+        status: str = 'prod'
+
+
