@@ -104,7 +104,8 @@ def _pivot_long_drivers(drivers: pd.DataFrame) -> pd.DataFrame:
 # -------------------------
 
 def _month_sin_cos(month: int) -> tuple[float, float]:
-    ang = 2.0 * np.pi * (float(month) / 12.0)
+    # Use 0-based month index for cyclic encoding (Jan=0,...,Dec=11)
+    ang = 2.0 * np.pi * ((float(month) - 1.0) / 12.0)
     return float(np.sin(ang)), float(np.cos(ang))
 
 
@@ -340,6 +341,8 @@ class LightGBMForecast:
         notes: str | None = None,
         min_history_points: int = 24,
         min_improvement: float = 0.02,
+        lgbm_min_data_in_leaf: int = 50,
+        lgbm_min_data_in_bin: int = 1,
         val_months: int = 6,
         progress_hook: Callable[[dict[str, Any]], None] | None = None,
     ) -> TrainResult:
@@ -547,7 +550,8 @@ class LightGBMForecast:
                 "feature_fraction": 0.8,
                 "bagging_fraction": 0.8,
                 "bagging_freq": 1,
-                "min_data_in_leaf": 50,
+                "min_data_in_leaf": int(max(1, lgbm_min_data_in_leaf)),
+                "min_data_in_bin": int(max(1, lgbm_min_data_in_bin)),
                 "seed": 42,
                 "verbosity": -1,
             }
@@ -810,6 +814,180 @@ class LightGBMForecast:
                 }
             )
 
+        # Per-item diagnostics (stored as JSON under explain_item_summary.group_contrib_json)
+        # - SHAP-like attributions: LightGBM's pred_contrib output (TreeSHAP)
+        # - Per-item importance: abs(contribution) ranking
+        # - Used/dropped static/exogenous columns (based on last available row)
+        # - Basic training diagnostics
+        booster_h1 = models.get(1)
+        if booster_h1 is not None and feature_cols is not None:
+            per_uid_diag: dict[str, dict[str, Any]] = {}
+            base_by_uid = base.sort_values(["unique_id", "ds"], kind="mergesort").groupby("unique_id", sort=False)
+
+            for uid, grp in base_by_uid:
+                uid = str(uid)
+                grp = grp.sort_values("ds", kind="mergesort")
+                ds_arr = grp["ds"].to_numpy()
+                y_orig = grp["y"].to_numpy(dtype=float)
+
+                diag: dict[str, Any] = {
+                    "series_len": int(len(y_orig)),
+                    "train_end_ds": pd.Timestamp(ds_arr[-1]).strftime("%Y-%m-%d") if len(ds_arr) else None,
+                    "detrend_method": detrend_method,
+                }
+
+                # Attach evaluation info (eligibility backtest)
+                evalr = per_item_eval.get(uid) or {}
+                if evalr:
+                    diag.update(
+                        {
+                            "wape_ml": float(evalr.get("wape_ml")) if evalr.get("wape_ml") is not None else None,
+                            "wape_naive": float(evalr.get("wape_naive")) if evalr.get("wape_naive") is not None else None,
+                            "eval_n": float(evalr.get("n")) if evalr.get("n") is not None else None,
+                        }
+                    )
+
+                params = trend_params_by_uid.get(uid)
+                if detrend_method == "none" or not params:
+                    y_model = y_orig
+                elif detrend_method == "linear":
+                    trend_hist = np.array([_trend_model_value(pd.Timestamp(d), params) for d in ds_arr], dtype=float)
+                    y_model = y_orig - trend_hist
+                    diag["trend_slope"] = float(params.get("slope", 0.0))
+                    diag["trend_intercept"] = float(params.get("intercept", 0.0))
+                else:  # log1p_linear
+                    yt = np.log1p(np.maximum(0.0, y_orig))
+                    trend_hist = np.array([_trend_model_value(pd.Timestamp(d), params) for d in ds_arr], dtype=float)
+                    y_model = yt - trend_hist
+                    diag["trend_slope"] = float(params.get("slope", 0.0))
+                    diag["trend_intercept"] = float(params.get("intercept", 0.0))
+
+                # Used/dropped columns (static + exogenous)
+                used_static: list[str] = []
+                dropped_static: list[str] = []
+                for c in static_cols:
+                    if c in grp.columns and pd.notna(grp[c].iloc[-1]):
+                        used_static.append(c)
+                    else:
+                        dropped_static.append(c)
+
+                used_exo: list[str] = []
+                dropped_exo: list[str] = []
+                for c in exogenous_columns or []:
+                    if c in grp.columns and pd.notna(grp[c].iloc[-1]):
+                        used_exo.append(c)
+                    else:
+                        dropped_exo.append(c)
+
+                # Build a single feature row for horizon=1 at the last decision point
+                lags_local = lags
+                roll_local = roll_windows
+                t = len(y_model) - 1
+                max_needed = max(max(lags_local) - 1, max(roll_local) - 1, 12)
+                if t < max_needed:
+                    diag["shap"] = {"available": False, "reason": "INSUFFICIENT_LAGS"}
+                    per_uid_diag[uid] = {
+                        "training_diagnostics": diag,
+                        "used_columns": {"static": used_static, "exogenous": used_exo},
+                        "dropped_columns": {"static": dropped_static, "exogenous": dropped_exo},
+                    }
+                    continue
+
+                last_ds = pd.Timestamp(ds_arr[-1])
+                forecast_ds = last_ds + pd.offsets.MonthBegin(1)
+
+                r: dict[str, Any] = {
+                    "unique_id": uid,
+                    "decision_ds": last_ds,
+                    "forecast_ds": forecast_ds,
+                }
+                m = int(forecast_ds.month)
+                r["month"] = m
+                r["quarter"] = int(((m - 1) // 3) + 1)
+                r["year"] = int(forecast_ds.year)
+                s, c = _month_sin_cos(m)
+                r["month_sin"] = s
+                r["month_cos"] = c
+
+                for lag in lags_local:
+                    idx = t - (lag - 1)
+                    r[f"lag_{lag}"] = float(y_model[idx])
+
+                for w in roll_local:
+                    start = t - (w - 1)
+                    window = y_model[start : t + 1]
+                    r[f"roll_mean_{w}"] = float(np.mean(window))
+                    if w >= 2:
+                        r[f"roll_std_{w}"] = float(np.std(window, ddof=0))
+
+                r["diff1"] = float(y_model[t] - y_model[t - 1])
+                r["diff12"] = float(y_model[t] - y_model[t - 12])
+
+                last12 = y_model[t - 11 : t + 1]
+                r["zero_ratio_12"] = float(np.mean(last12 == 0.0))
+                r["nonzero_run_length"] = float(_nonzero_run_length(y_model[: t + 1]))
+
+                # Exogenous values at time t
+                for k in exogenous_columns or []:
+                    if k in grp.columns:
+                        v = pd.to_numeric(grp[k].iloc[-1], errors="coerce") if pd.notna(grp[k].iloc[-1]) else 0.0
+                        r[k] = float(0.0 if pd.isna(v) else v)
+
+                # Static values
+                for k in static_cols:
+                    if k in grp.columns:
+                        r[k] = grp[k].iloc[-1]
+
+                X = pd.DataFrame([r])
+                X["unique_id"] = X["unique_id"].astype(str)
+                X, _ = _encode_categories(X, cat_cols, mappings=mappings)
+                for col in feature_cols:
+                    if col not in X.columns:
+                        X[col] = 0
+                X = X[feature_cols].fillna(0)
+
+                try:
+                    contrib = booster_h1.predict(X, pred_contrib=True)
+                    contrib_row = np.asarray(contrib[0], dtype=float)
+                    # LightGBM returns n_features + 1 (bias)
+                    bias = float(contrib_row[-1])
+                    feat_names = list(booster_h1.feature_name())
+                    feat_contrib = contrib_row[:-1]
+                    pairs = list(zip(feat_names, feat_contrib))
+                    pairs_sorted = sorted(pairs, key=lambda kv: abs(float(kv[1])), reverse=True)
+
+                    top_k = 20
+                    shap_top = [{"feature": n, "contribution": float(v)} for n, v in pairs_sorted[:top_k]]
+                    imp_top = [{"feature": n, "importance": float(abs(v))} for n, v in pairs_sorted[:top_k]]
+
+                    shap_info = {
+                        "available": True,
+                        "method": "pred_contrib",
+                        "horizon": 1,
+                        "bias": bias,
+                        "top": shap_top,
+                    }
+                except Exception as e:
+                    shap_info = {"available": False, "reason": f"PRED_CONTRIB_FAILED: {e}"}
+                    imp_top = []
+
+                per_uid_diag[uid] = {
+                    "shap": shap_info,
+                    "per_item_importance_top": imp_top,
+                    "used_columns": {"static": used_static, "exogenous": used_exo},
+                    "dropped_columns": {"static": dropped_static, "exogenous": dropped_exo},
+                    "training_diagnostics": diag,
+                }
+
+            # Merge diagnostics into explain_rows
+            for r in explain_rows:
+                uid = str(r.get("unique_id"))
+                extra = per_uid_diag.get(uid)
+                if not extra:
+                    continue
+                # Keep existing structure but attach rich per-item payload
+                r["group_contrib"] = extra
+
         self.store.upsert_backtest_metrics(backtest_rows)
         self.store.upsert_eligibility(eligibility_rows)
         self.store.upsert_explain_summary(explain_rows)
@@ -1027,8 +1205,16 @@ class LightGBMForecast:
         fcst = pd.DataFrame(forecasts)
         if not fcst.empty:
             fcst["item_id"] = fcst["unique_id"]
+            # Month-start semantics: 2026-01-01 represents the total for January 2026.
+            fcst["ds"] = pd.to_datetime(fcst["ds"], errors="coerce").dt.to_period("M").dt.to_timestamp(how="start")
             fcst["day"] = pd.to_datetime(fcst["ds"]).dt.strftime("%Y-%m-%d")
             fcst = fcst[["item_id", "day", "yhat"]]
 
-        meta = {"model_version": model_version, "freq": "MS", "strategy": "direct", "detrend_method": detrend_method}
+        meta = {
+            "model_version": model_version,
+            "freq": "MS",
+            "strategy": "direct",
+            "detrend_method": detrend_method,
+            "date_semantics": "month_start_represents_month",
+        }
         return fcst, meta

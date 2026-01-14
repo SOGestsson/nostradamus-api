@@ -379,3 +379,55 @@ class DuckDBModelStore:
                 "confidence": float(confidence) if confidence is not None else None,
             }
         return out
+
+    def get_explain_summary(
+        self,
+        model_version: str,
+        unique_ids: list[str] | None = None,
+        limit: int = 500,
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch per-item explanation/diagnostics JSON stored in explain_item_summary.
+
+        Returns mapping: unique_id -> {top_features, group_contrib, support_share, updated_at}
+        """
+
+        with self.connect() as con:
+            if unique_ids:
+                placeholders = ",".join(["?"] * len(unique_ids))
+                rows = con.execute(
+                    f"""
+                    SELECT unique_id, top_features_json, group_contrib_json, support_share, updated_at
+                    FROM explain_item_summary
+                    WHERE customer_id=? AND model_version=? AND unique_id IN ({placeholders});
+                    """,
+                    [self.customer_id, model_version, *unique_ids],
+                ).fetchall()
+            else:
+                rows = con.execute(
+                    """
+                    SELECT unique_id, top_features_json, group_contrib_json, support_share, updated_at
+                    FROM explain_item_summary
+                    WHERE customer_id=? AND model_version=?
+                    ORDER BY updated_at DESC
+                    LIMIT ?;
+                    """,
+                    [self.customer_id, model_version, int(limit)],
+                ).fetchall()
+
+        out: dict[str, dict[str, Any]] = {}
+        for uid, topj, groupj, support_share, updated_at in rows:
+            try:
+                top = json.loads(topj) if isinstance(topj, str) and topj else topj
+            except Exception:
+                top = topj
+            try:
+                group = json.loads(groupj) if isinstance(groupj, str) and groupj else groupj
+            except Exception:
+                group = groupj
+            out[str(uid)] = {
+                "top_features": top or [],
+                "group_contrib": group or {},
+                "support_share": float(support_share) if support_share is not None else None,
+                "updated_at": str(updated_at) if updated_at is not None else None,
+            }
+        return out

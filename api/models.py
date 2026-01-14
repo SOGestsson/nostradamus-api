@@ -131,6 +131,10 @@ class LightGBMTrainRequest(BaseModel):
         min_history_points: int = 24
         min_improvement: float = 0.02
 
+        # LightGBM knobs (useful for short/low-data series)
+        lgbm_min_data_in_leaf: int = 50
+        lgbm_min_data_in_bin: int = 1
+
 
 class LightGBMBatchForecastRequest(BaseModel):
         """Request model for batch forecasting with a trained LightGBM model."""

@@ -150,6 +150,8 @@ def train_lightgbm(request: LightGBMTrainRequest):
             notes=request.notes,
             min_history_points=request.min_history_points,
             min_improvement=request.min_improvement,
+            lgbm_min_data_in_leaf=getattr(request, "lgbm_min_data_in_leaf", 50),
+            lgbm_min_data_in_bin=getattr(request, "lgbm_min_data_in_bin", 1),
         )
 
         return {
@@ -227,6 +229,8 @@ def train_lightgbm_async(
                 notes=request.notes,
                 min_history_points=request.min_history_points,
                 min_improvement=request.min_improvement,
+                lgbm_min_data_in_leaf=getattr(request, "lgbm_min_data_in_leaf", 50),
+                lgbm_min_data_in_bin=getattr(request, "lgbm_min_data_in_bin", 1),
                 progress_hook=progress_hook,
             )
 
@@ -364,7 +368,11 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
                 item_fcst = fcst_df[fcst_df["item_id"].astype(str) == str(item_id)].sort_values("day")
                 if len(item_fcst) == int(request.forecast_periods):
                     yhat = item_fcst["yhat"].to_numpy(dtype=float).tolist()
-                    days = [pd.to_datetime(d).strftime("%Y-%m-%d") for d in item_fcst["day"].tolist()]
+                    # Month-start semantics: YYYY-MM-01 represents that month.
+                    days = [
+                        pd.to_datetime(d).to_period("M").to_timestamp(how="start").strftime("%Y-%m-%d")
+                        for d in item_fcst["day"].tolist()
+                    ]
                     out.append(
                         {
                             "item_id": item_id,
@@ -417,3 +425,59 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
         error_details = traceback.format_exc()
         print(error_details)
         raise HTTPException(status_code=500, detail=f"LightGBM forecast error: {str(e)}")
+
+
+@router.get("/diagnostics")
+def get_lightgbm_diagnostics(
+    customer_id: str,
+    model_version: str | None = None,
+    status: str = "prod",
+    item_ids: str | None = None,
+    limit: int = 200,
+    store_root: str | None = None,
+):
+    """Fetch per-item diagnostics produced at training time.
+
+    This is designed to be called after training/forecasting without re-uploading history.
+
+    Query params:
+    - customer_id: required
+    - model_version: optional (defaults to active version for status)
+    - status: used if model_version is omitted
+    - item_ids: optional comma-separated list
+    - limit: max rows if item_ids not specified
+    - store_root: optional override
+    """
+
+    try:
+        forecaster = LightGBMForecast(store_root=store_root or _default_store_root(), customer_id=customer_id)
+
+        mv = model_version
+        if mv is None:
+            mv = forecaster.store.get_active_model_version(status=status)
+        if not mv:
+            raise ValueError(f"No active model version found for status='{status}'")
+
+        unique_ids: list[str] | None
+        if item_ids:
+            unique_ids = [s.strip() for s in item_ids.split(",") if s.strip()]
+        else:
+            unique_ids = None
+
+        explain = forecaster.store.get_explain_summary(model_version=mv, unique_ids=unique_ids, limit=int(limit))
+        return {
+            "customer_id": customer_id,
+            "model_version": mv,
+            "items": [
+                {
+                    "item_id": uid,
+                    **payload,
+                }
+                for uid, payload in explain.items()
+            ],
+            "total_items": len(explain),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LightGBM diagnostics error: {str(e)}")
