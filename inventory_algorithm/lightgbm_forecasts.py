@@ -101,6 +101,52 @@ def _pivot_long_drivers(drivers: pd.DataFrame) -> pd.DataFrame:
     return wide
 
 
+def _build_item_month_caps(
+    base: pd.DataFrame,
+    *,
+    lookback_years: int = 4,
+) -> dict[tuple[str, int], dict[str, float]]:
+    """Compute per-item month-of-year caps from history.
+
+    Returns {(unique_id, month): {"max_y": ..., "mean_y": ..., "nonzero_rate": ...}}.
+    """
+    if base is None or base.empty or "unique_id" not in base.columns or "ds" not in base.columns or "y" not in base.columns:
+        return {}
+
+    df = base[["unique_id", "ds", "y"]].copy()
+    df["unique_id"] = df["unique_id"].astype(str)
+    df["ds"] = pd.to_datetime(df["ds"], errors="coerce")
+    df = df[df["ds"].notna()].copy()
+    if df.empty:
+        return {}
+
+    max_ds = df["ds"].max()
+    if pd.isna(max_ds):
+        return {}
+    start_ds = max_ds - pd.DateOffset(years=int(max(1, lookback_years)))
+    df = df[df["ds"] >= start_ds].copy()
+    if df.empty:
+        return {}
+
+    df["month"] = df["ds"].dt.month
+    df["nonzero"] = (pd.to_numeric(df["y"], errors="coerce").fillna(0.0) > 0.0).astype(float)
+
+    agg = (
+        df.groupby(["unique_id", "month"], as_index=False)
+        .agg(max_y=("y", "max"), mean_y=("y", "mean"), nonzero_rate=("nonzero", "mean"))
+    )
+
+    out: dict[tuple[str, int], dict[str, float]] = {}
+    for _, r in agg.iterrows():
+        key = (str(r["unique_id"]), int(r["month"]))
+        out[key] = {
+            "max_y": float(r.get("max_y", 0.0)),
+            "mean_y": float(r.get("mean_y", 0.0)),
+            "nonzero_rate": float(r.get("nonzero_rate", 0.0)),
+        }
+    return out
+
+
 # -------------------------
 # Feature engineering (direct strategy)
 # -------------------------
@@ -117,6 +163,19 @@ def _nonzero_run_length(values: np.ndarray) -> int:
         if float(values[i]) != 0.0:
             return int(len(values) - 1 - i)
     return int(len(values))
+
+
+def _rolling_slope(y: np.ndarray) -> float:
+    """Slope of the last 12 points (or fewer) using a simple linear fit."""
+    y = np.asarray(y, dtype=float)
+    if len(y) < 2:
+        return 0.0
+    window = y[-12:] if len(y) >= 12 else y
+    x = np.arange(len(window), dtype=float)
+    if float(np.nanstd(window)) <= 1e-12:
+        return 0.0
+    slope, _ = np.polyfit(x, window, deg=1)
+    return float(slope)
 
 
 def _month_index(ds: pd.Timestamp, start_ds: pd.Timestamp) -> int:
@@ -247,6 +306,22 @@ def _build_direct_rows_for_item(
     n = len(y)
     max_needed = max(max(roll_windows) - 1, 1) if roll_windows else 1
 
+    # Precompute per-month historical stats for same-month features (last 36 months).
+    same_month_stats: dict[int, dict[str, float]] = {}
+    months = np.array([pd.Timestamp(d).month for d in ds], dtype=int)
+    vals_3y = y[-36:] if len(y) > 36 else y
+    months_3y = months[-36:] if len(months) > 36 else months
+    for m in range(1, 13):
+        hist_vals = vals_3y[months_3y == m]
+        if len(hist_vals) == 0:
+            same_month_stats[m] = {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0}
+        else:
+            same_month_stats[m] = {
+                "mean": float(np.mean(hist_vals)),
+                "max": float(np.max(hist_vals)),
+                "nonzero_rate": float(np.mean(hist_vals > 0.0)),
+            }
+
     for t in range(0, n - horizon):
         if t < max_needed:
             continue
@@ -302,6 +377,15 @@ def _build_direct_rows_for_item(
         last12 = y[t - 11 : t + 1]
         row["zero_ratio_12"] = float(np.mean(last12 == 0.0))
         row["nonzero_run_length"] = float(_nonzero_run_length(y[: t + 1]))
+
+        # Same-month historical features (per item)
+        m_stats = same_month_stats.get(m, {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0})
+        row["same_month_mean_3y"] = float(m_stats["mean"])
+        row["same_month_max_3y"] = float(m_stats["max"])
+        row["same_month_nonzero_rate_3y"] = float(m_stats["nonzero_rate"])
+
+        # Simple decay signal: slope of last 12 months
+        row["rolling_12_slope"] = float(_rolling_slope(y[: t + 1]))
 
         # Exogenous (wide) at time t (known at forecast time)
         for k, arr in exo.items():
@@ -1247,6 +1331,11 @@ class LightGBMForecast:
 
         base = base.sort_values(["unique_id", "ds"], kind="mergesort")
 
+        month_caps = _build_item_month_caps(base, lookback_years=4)
+        cap_nonzero_threshold = 0.25
+        cap_multiplier = 2.0
+        cap_small_floor = 0.0
+
         # Load models
         boosters: dict[int, Any] = {}
         for h in horizons:
@@ -1290,6 +1379,22 @@ class LightGBMForecast:
             for c in static_cols:
                 static[c] = grp[c].iloc[-1] if c in grp.columns else None
 
+            # Precompute same-month stats for inference (last 36 months).
+            months = np.array([pd.Timestamp(d).month for d in ds_arr], dtype=int)
+            vals_3y = y[-36:] if len(y) > 36 else y
+            months_3y = months[-36:] if len(months) > 36 else months
+            same_month_stats: dict[int, dict[str, float]] = {}
+            for m in range(1, 13):
+                hist_vals = vals_3y[months_3y == m]
+                if len(hist_vals) == 0:
+                    same_month_stats[m] = {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0}
+                else:
+                    same_month_stats[m] = {
+                        "mean": float(np.mean(hist_vals)),
+                        "max": float(np.max(hist_vals)),
+                        "nonzero_rate": float(np.mean(hist_vals > 0.0)),
+                    }
+
             # Build one row per horizon and predict with the corresponding model
             for h in horizons:
                 if h not in boosters:
@@ -1332,6 +1437,15 @@ class LightGBMForecast:
                 r["zero_ratio_12"] = float(np.mean(last12 == 0.0))
                 r["nonzero_run_length"] = float(_nonzero_run_length(y[: t + 1]))
 
+                # Same-month historical features (per item)
+                m_stats = same_month_stats.get(m, {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0})
+                r["same_month_mean_3y"] = float(m_stats["mean"])
+                r["same_month_max_3y"] = float(m_stats["max"])
+                r["same_month_nonzero_rate_3y"] = float(m_stats["nonzero_rate"])
+
+                # Simple decay signal: slope of last 12 months
+                r["rolling_12_slope"] = float(_rolling_slope(y[: t + 1]))
+
                 for k, arr in exo.items():
                     if len(arr) == len(y):
                         r[k] = float(arr[t])
@@ -1364,9 +1478,28 @@ class LightGBMForecast:
                 else:
                     p_nonzero = 1.0
 
-                yhat = float(yhat_amount * p_nonzero)
-                if p_nonzero < occurrence_threshold:
+                # Couple occurrence to month history + recent run-length.
+                cap_stats = month_caps.get((str(uid), int(forecast_ds.month)))
+                month_rate = float(cap_stats.get("nonzero_rate", 1.0)) if cap_stats else 1.0
+                run_length = float(_nonzero_run_length(y_orig))
+                run_penalty = float(np.exp(-run_length / 6.0))
+
+                p_effective = float(np.clip(p_nonzero * max(0.05, month_rate) * run_penalty, 0.0, 1.0))
+                p_min = max(0.05, 0.5 * month_rate)
+
+                yhat = float(yhat_amount * p_effective)
+                if p_effective < max(occurrence_threshold, p_min):
                     yhat = 0.0
+
+                cap_stats = month_caps.get((str(uid), int(forecast_ds.month)))
+                if cap_stats is not None:
+                    max_y = float(cap_stats.get("max_y", 0.0))
+                    nonzero_rate = float(cap_stats.get("nonzero_rate", 0.0))
+                    cap_low = max(max_y, cap_small_floor)
+                    if nonzero_rate < cap_nonzero_threshold:
+                        yhat = min(yhat, cap_low)
+                    cap = max(cap_multiplier * max_y, cap_small_floor)
+                    yhat = min(yhat, cap)
                 forecasts.append({"unique_id": str(uid), "ds": forecast_ds, "yhat": yhat})
 
         fcst = pd.DataFrame(forecasts)
@@ -1385,5 +1518,11 @@ class LightGBMForecast:
             "date_semantics": "month_start_represents_month",
             "occurrence_model": "shared" if occ_model is not None else None,
             "occurrence_threshold": occurrence_threshold if occ_model is not None else None,
+            "month_cap": {
+                "lookback_years": 4,
+                "cap_multiplier": cap_multiplier,
+                "nonzero_threshold": cap_nonzero_threshold,
+                "small_floor": cap_small_floor,
+            },
         }
         return fcst, meta
