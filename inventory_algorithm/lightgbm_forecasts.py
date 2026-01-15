@@ -69,6 +69,8 @@ def _normalize_monthly_history(df_his: pd.DataFrame) -> pd.DataFrame:
 
     df["ds"] = _to_month_start(df["day"])
     df["y"] = pd.to_numeric(df["actual_sale"], errors="coerce").fillna(0.0).astype(float)
+    # Clamp negatives (e.g., returns) to zero for demand modeling.
+    df.loc[df["y"] < 0, "y"] = 0.0
 
     extra_cols = [c for c in df.columns if c not in ("item_id", "day", "actual_sale", "ds", "y")]
 
