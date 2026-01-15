@@ -163,6 +163,55 @@ def _fit_trend_params(ds: np.ndarray, y: np.ndarray, method: str) -> dict[str, A
     }
 
 
+def _resolve_detrend_method(
+    base: pd.DataFrame,
+    requested: str | None,
+    *,
+    zero_ratio_threshold: float = 0.5,
+    min_nonzero: int = 6,
+) -> tuple[str, dict[str, float]]:
+    """Resolve detrend method with a simple intermittency heuristic.
+
+    If requested != 'auto', return it verbatim. For 'auto', choose:
+    - 'none' for intermittent/low-volume series
+    - 'linear' otherwise
+    """
+
+    requested = (requested or "auto").strip().lower()
+    if requested not in {"auto", "none", "linear", "log1p_linear"}:
+        requested = "auto"
+
+    if requested != "auto":
+        return requested, {}
+
+    if base is None or base.empty or "unique_id" not in base.columns or "y" not in base.columns:
+        return "linear", {}
+
+    stats: list[tuple[float, float]] = []
+    for uid, grp in base.groupby("unique_id", sort=False):
+        y = pd.to_numeric(grp["y"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        if len(y) == 0:
+            continue
+        last12 = y[-12:] if len(y) >= 12 else y
+        zero_ratio = float(np.mean(last12 == 0.0)) if len(last12) else 1.0
+        nonzero_count = float(np.sum(y > 0.0))
+        stats.append((zero_ratio, nonzero_count))
+
+    if not stats:
+        return "linear", {}
+
+    zero_ratios = np.array([s[0] for s in stats], dtype=float)
+    nonzero_counts = np.array([s[1] for s in stats], dtype=float)
+    median_zero_ratio = float(np.median(zero_ratios))
+    median_nonzero = float(np.median(nonzero_counts))
+
+    resolved = "none" if (median_zero_ratio >= zero_ratio_threshold or median_nonzero < min_nonzero) else "linear"
+    return resolved, {
+        "auto_median_zero_ratio_12": median_zero_ratio,
+        "auto_median_nonzero_count": median_nonzero,
+    }
+
+
 def _trend_model_value(ds: pd.Timestamp, params: dict[str, Any]) -> float:
     """Trend value in *model space* for a given timestamp.
 
@@ -194,7 +243,7 @@ def _build_direct_rows_for_item(
     rows: list[dict[str, Any]] = []
 
     n = len(y)
-    max_needed = max(max(lags) - 1, max(roll_windows) - 1, 12) if (lags or roll_windows) else 12
+    max_needed = max(max(roll_windows) - 1, 1) if roll_windows else 1
 
     for t in range(0, n - horizon):
         if t < max_needed:
@@ -231,7 +280,7 @@ def _build_direct_rows_for_item(
         # Lags are defined as: lag_1 = y[t], lag_2=y[t-1], ...
         for lag in lags:
             idx = t - (lag - 1)
-            row[f"lag_{lag}"] = float(y[idx])
+            row[f"lag_{lag}"] = float(y[idx]) if idx >= 0 else 0.0
 
         if y_orig is not None:
             row["lag_1_orig"] = float(y_orig[t])
@@ -245,7 +294,7 @@ def _build_direct_rows_for_item(
 
         # Trend-ish
         row["diff1"] = float(y[t] - y[t - 1])
-        row["diff12"] = float(y[t] - y[t - 12])
+        row["diff12"] = float(y[t] - y[t - 12]) if t >= 12 else 0.0
 
         # Intermittency
         last12 = y[t - 11 : t + 1]
@@ -339,8 +388,8 @@ class LightGBMForecast:
         model_version: str | None = None,
         status: str = "staging",
         notes: str | None = None,
-        min_history_points: int = 24,
-        min_improvement: float = 0.02,
+        min_history_points: int = 6,
+        min_improvement: float = 0.0,
         lgbm_min_data_in_leaf: int = 50,
         lgbm_min_data_in_bin: int = 1,
         val_months: int = 6,
@@ -390,6 +439,9 @@ class LightGBMForecast:
             exogenous_columns = [c for c in base.columns if c not in base_cols and c not in set(static_cols)]
         else:
             exogenous_columns = [c for c in exogenous_columns if c in base.columns]
+
+        resolved_detrend_method, auto_stats = _resolve_detrend_method(base, detrend_method)
+        detrend_method = resolved_detrend_method
 
         # Feature recipe (monthly)
         lags = [1, 2, 3, 6, 12, 24]
@@ -459,6 +511,8 @@ class LightGBMForecast:
             "val_months": int(val_months),
             "detrend_method": detrend_method,
         }
+        if auto_stats:
+            metrics_summary.update(auto_stats)
 
         models: dict[int, Any] = {}
         feature_cols: list[str] | None = None
@@ -493,6 +547,89 @@ class LightGBMForecast:
         # For eligibility: evaluate horizon 1 per-item
         per_item_eval: dict[str, dict[str, float]] = {}
 
+        # Resolve feature columns once from the first non-empty horizon
+        if feature_cols is None:
+            for rows in all_rows_by_h.values():
+                if rows:
+                    df_spec = pd.DataFrame(rows)
+                    excluded = {"y", "decision_ds", "forecast_ds", "y_orig", "trend_model", "lag_1_orig"}
+                    feature_cols = [c for c in df_spec.columns if c not in excluded]
+                    break
+        if not feature_cols:
+            raise ValueError("Could not determine feature columns (no training rows).")
+
+        # Train shared occurrence model (y > 0) across all horizons
+        occ_rows: list[dict[str, Any]] = []
+        for rows in all_rows_by_h.values():
+            if rows:
+                occ_rows.extend(rows)
+        occ_model: Any | None = None
+        if occ_rows:
+            occ_df = pd.DataFrame(occ_rows)
+            y_occ_src = occ_df["y_orig"] if "y_orig" in occ_df.columns else occ_df["y"]
+            y_occ = (pd.to_numeric(y_occ_src, errors="coerce").fillna(0.0).to_numpy(dtype=float) > 0.0).astype(int)
+            is_val_occ = pd.to_datetime(occ_df["forecast_ds"]) >= cutoff
+
+            X_occ = occ_df[feature_cols].copy()
+            X_occ["unique_id"] = X_occ["unique_id"].astype(str)
+            X_occ, _ = _encode_categories(X_occ, cat_cols, mappings=mappings)
+            X_occ = X_occ.fillna(0)
+
+            X_occ_train = X_occ[~is_val_occ]
+            y_occ_train = y_occ[~is_val_occ]
+            X_occ_val = X_occ[is_val_occ]
+            y_occ_val = y_occ[is_val_occ]
+
+            if len(X_occ_train) >= 50 and y_occ_train.sum() > 0:
+                pos = float(y_occ_train.sum())
+                neg = float(len(y_occ_train) - pos)
+                occ_params = {
+                    "objective": "binary",
+                    "metric": "binary_logloss",
+                    "learning_rate": 0.05,
+                    "num_leaves": 63,
+                    "feature_fraction": 0.8,
+                    "bagging_fraction": 0.8,
+                    "bagging_freq": 1,
+                    "min_data_in_leaf": int(max(1, lgbm_min_data_in_leaf)),
+                    "min_data_in_bin": int(max(1, lgbm_min_data_in_bin)),
+                    "seed": 42,
+                    "verbosity": -1,
+                }
+                if pos > 0 and neg > 0:
+                    occ_params["scale_pos_weight"] = float(neg / pos)
+
+                dtrain_occ = lgb.Dataset(
+                    X_occ_train,
+                    label=y_occ_train,
+                    categorical_feature=[c for c in cat_cols if c in X_occ_train.columns],
+                    free_raw_data=False,
+                )
+                valid_sets = [dtrain_occ]
+                valid_names = ["train"]
+                if len(X_occ_val) > 0:
+                    dval_occ = lgb.Dataset(
+                        X_occ_val,
+                        label=y_occ_val,
+                        categorical_feature=[c for c in cat_cols if c in X_occ_val.columns],
+                        free_raw_data=False,
+                    )
+                    valid_sets.append(dval_occ)
+                    valid_names.append("val")
+
+                occ_model = lgb.train(
+                    occ_params,
+                    dtrain_occ,
+                    num_boost_round=1000,
+                    valid_sets=valid_sets,
+                    valid_names=valid_names,
+                    callbacks=[lgb.early_stopping(50, verbose=False)] if len(X_occ_val) > 0 else None,
+                )
+                occ_model.save_model(os.path.join(artifact_root, "lgbm_occurrence.txt"))
+                metrics_summary["occurrence_model"] = "shared"
+                metrics_summary["occurrence_threshold"] = 0.2
+                metrics_summary["occurrence_pos_rate_train"] = float(pos / max(1.0, pos + neg))
+
         for h in range(1, int(horizon) + 1):
             rows = all_rows_by_h[h]
             if not rows:
@@ -510,11 +647,6 @@ class LightGBMForecast:
             df = pd.DataFrame(rows)
             # Keep the label name as y
             y_target = df["y"].to_numpy(dtype=float)
-
-            # Define feature columns once
-            if feature_cols is None:
-                excluded = {"y", "decision_ds", "forecast_ds", "y_orig", "trend_model", "lag_1_orig"}
-                feature_cols = [c for c in df.columns if c not in excluded]
 
             # Time split by forecast_ds
             is_val = pd.to_datetime(df["forecast_ds"]) >= cutoff
@@ -578,6 +710,11 @@ class LightGBMForecast:
             # Metrics
             if len(X_val) > 0:
                 yhat_model = booster.predict(X_val)
+                if occ_model is not None:
+                    p_nonzero = occ_model.predict(X_val)
+                else:
+                    p_nonzero = np.ones_like(yhat_model)
+                p_nonzero = np.clip(p_nonzero, 0.0, 1.0)
 
                 # Reconstruct to original scale for metrics.
                 if "y_orig" in df.columns:
@@ -594,6 +731,8 @@ class LightGBMForecast:
                     trend_val = df.loc[is_val, "trend_model"].to_numpy(dtype=float)
                     yhat_orig = np.maximum(0.0, np.expm1(yhat_model + trend_val))
 
+                yhat_orig = yhat_orig * p_nonzero
+
                 metrics_summary[f"wape_val_h{h}"] = _wape(y_true_orig, yhat_orig)
 
                 if h == 1:
@@ -603,16 +742,24 @@ class LightGBMForecast:
                     df_val = df.loc[is_val, keep].copy()
 
                     if detrend_method == "none":
-                        df_val["yhat_ml"] = np.maximum(0.0, yhat_model)
+                        yhat_tmp = np.maximum(0.0, yhat_model)
                         y_eval = pd.to_numeric(df_val.get("y_orig", df_val["y"]), errors="coerce").fillna(0.0).to_numpy(dtype=float)
                     elif detrend_method == "linear":
                         trend_val = pd.to_numeric(df_val.get("trend_model"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
-                        df_val["yhat_ml"] = np.maximum(0.0, yhat_model + trend_val)
+                        yhat_tmp = np.maximum(0.0, yhat_model + trend_val)
                         y_eval = pd.to_numeric(df_val.get("y_orig", df_val["y"]), errors="coerce").fillna(0.0).to_numpy(dtype=float)
                     else:
                         trend_val = pd.to_numeric(df_val.get("trend_model"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
-                        df_val["yhat_ml"] = np.maximum(0.0, np.expm1(yhat_model + trend_val))
+                        yhat_tmp = np.maximum(0.0, np.expm1(yhat_model + trend_val))
                         y_eval = pd.to_numeric(df_val.get("y_orig", df_val["y"]), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+
+                    if occ_model is not None:
+                        p_nonzero_h1 = occ_model.predict(X_val)
+                        p_nonzero_h1 = np.clip(p_nonzero_h1, 0.0, 1.0)
+                    else:
+                        p_nonzero_h1 = np.ones_like(yhat_tmp)
+
+                    df_val["yhat_ml"] = yhat_tmp * p_nonzero_h1
 
                     df_val["y_eval"] = y_eval
                     if "lag_1_orig" in df_val.columns:
@@ -647,6 +794,8 @@ class LightGBMForecast:
             "horizons": list(range(1, int(horizon) + 1)),
             "target": "y",
             "detrend_method": detrend_method,
+            "occurrence_model": "shared" if occ_model is not None else None,
+            "occurrence_threshold": 0.2 if occ_model is not None else None,
             "lags": lags,
             "rolling_windows": roll_windows,
             "static_columns": static_cols,
@@ -1055,6 +1204,7 @@ class LightGBMForecast:
         mappings: dict[str, dict[str, int]] = dict(spec.get("category_mappings") or {})
         lags: list[int] = list(spec.get("lags") or [1, 2, 3, 6, 12, 24])
         roll_windows: list[int] = list(spec.get("rolling_windows") or [3, 6, 12])
+        occurrence_threshold = float(spec.get("occurrence_threshold") or 0.2)
 
         detrend_method = str(spec.get("detrend_method") or "none").strip().lower()
         trend_params_by_uid: dict[str, dict[str, Any]] = {}
@@ -1102,6 +1252,11 @@ class LightGBMForecast:
             if os.path.exists(path):
                 boosters[h] = lgb.Booster(model_file=path)
 
+        occ_model: Any | None = None
+        occ_path = os.path.join(artifact_root, "lgbm_occurrence.txt")
+        if os.path.exists(occ_path):
+            occ_model = lgb.Booster(model_file=occ_path)
+
         if not boosters:
             raise ValueError(f"No horizon models found under {artifact_root}")
 
@@ -1111,7 +1266,7 @@ class LightGBMForecast:
             grp = grp.sort_values("ds", kind="mergesort")
             y_orig = grp["y"].to_numpy(dtype=float)
             ds_arr = grp["ds"].to_numpy()
-            if len(y_orig) < 25:
+            if len(y_orig) < 6:
                 continue
 
             last_ds = pd.Timestamp(ds_arr[-1])
@@ -1159,7 +1314,7 @@ class LightGBMForecast:
 
                 for lag in lags:
                     idx = t - (lag - 1)
-                    r[f"lag_{lag}"] = float(y[idx])
+                    r[f"lag_{lag}"] = float(y[idx]) if idx >= 0 else 0.0
 
                 for w in roll_windows:
                     start = t - (w - 1)
@@ -1169,7 +1324,7 @@ class LightGBMForecast:
                         r[f"roll_std_{w}"] = float(np.std(window, ddof=0))
 
                 r["diff1"] = float(y[t] - y[t - 1])
-                r["diff12"] = float(y[t] - y[t - 12])
+                r["diff12"] = float(y[t] - y[t - 12]) if t >= 12 else 0.0
 
                 last12 = y[t - 11 : t + 1]
                 r["zero_ratio_12"] = float(np.mean(last12 == 0.0))
@@ -1193,13 +1348,23 @@ class LightGBMForecast:
 
                 yhat_model = float(boosters[h].predict(X)[0])
                 if detrend_method == "none" or not params:
-                    yhat = float(np.maximum(0.0, yhat_model))
+                    yhat_amount = float(np.maximum(0.0, yhat_model))
                 elif detrend_method == "linear":
                     trend_future = _trend_model_value(forecast_ds, params)
-                    yhat = float(np.maximum(0.0, yhat_model + trend_future))
+                    yhat_amount = float(np.maximum(0.0, yhat_model + trend_future))
                 else:  # log1p_linear
                     trend_future = _trend_model_value(forecast_ds, params)
-                    yhat = float(np.maximum(0.0, np.expm1(yhat_model + trend_future)))
+                    yhat_amount = float(np.maximum(0.0, np.expm1(yhat_model + trend_future)))
+
+                if occ_model is not None:
+                    p_nonzero = float(occ_model.predict(X)[0])
+                    p_nonzero = float(np.clip(p_nonzero, 0.0, 1.0))
+                else:
+                    p_nonzero = 1.0
+
+                yhat = float(yhat_amount * p_nonzero)
+                if p_nonzero < occurrence_threshold:
+                    yhat = 0.0
                 forecasts.append({"unique_id": str(uid), "ds": forecast_ds, "yhat": yhat})
 
         fcst = pd.DataFrame(forecasts)
@@ -1216,5 +1381,7 @@ class LightGBMForecast:
             "strategy": "direct",
             "detrend_method": detrend_method,
             "date_semantics": "month_start_represents_month",
+            "occurrence_model": "shared" if occ_model is not None else None,
+            "occurrence_threshold": occurrence_threshold if occ_model is not None else None,
         }
         return fcst, meta

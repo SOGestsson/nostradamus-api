@@ -119,8 +119,8 @@ class LightGBMTrainRequest(BaseModel):
         exogenous_columns: Optional[List[str]] = None
 
         # Optional detrending (helps avoid flat forecasts on trending series)
-        # Supported: 'none' (default), 'linear', 'log1p_linear'
-        detrend_method: str = 'none'
+        # Supported: 'auto' (default), 'none', 'linear', 'log1p_linear'
+        detrend_method: str = 'auto'
 
         # Registry
         model_version: Optional[str] = None
