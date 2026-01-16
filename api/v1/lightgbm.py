@@ -53,9 +53,13 @@ def _set_job(job_id: str, payload: dict[str, Any]) -> None:
     payload = dict(payload)
     payload.setdefault('updated_at', _now_ts())
     if _redis_sync is not None:
-        _redis_sync.hset(_job_key(job_id), mapping={k: json.dumps(v) for k, v in payload.items()})
-        _redis_sync.expire(_job_key(job_id), 60 * 60 * 24)
-        return
+        try:
+            _redis_sync.hset(_job_key(job_id), mapping={k: json.dumps(v) for k, v in payload.items()})
+            _redis_sync.expire(_job_key(job_id), 60 * 60 * 24)
+            return
+        except Exception:
+            # Fall back to in-memory storage if Redis is unavailable.
+            pass
     with _JOBS_LOCK:
         _JOBS[job_id] = payload
 
@@ -64,9 +68,13 @@ def _update_job(job_id: str, **fields: Any) -> None:
     fields = dict(fields)
     fields['updated_at'] = _now_ts()
     if _redis_sync is not None:
-        _redis_sync.hset(_job_key(job_id), mapping={k: json.dumps(v) for k, v in fields.items()})
-        _redis_sync.expire(_job_key(job_id), 60 * 60 * 24)
-        return
+        try:
+            _redis_sync.hset(_job_key(job_id), mapping={k: json.dumps(v) for k, v in fields.items()})
+            _redis_sync.expire(_job_key(job_id), 60 * 60 * 24)
+            return
+        except Exception:
+            # Fall back to in-memory storage if Redis is unavailable.
+            pass
     with _JOBS_LOCK:
         cur = _JOBS.get(job_id, {})
         cur.update(fields)

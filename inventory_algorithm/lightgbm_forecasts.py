@@ -383,6 +383,8 @@ def _build_direct_rows_for_item(
         row["same_month_mean_3y"] = float(m_stats["mean"])
         row["same_month_max_3y"] = float(m_stats["max"])
         row["same_month_nonzero_rate_3y"] = float(m_stats["nonzero_rate"])
+        # Alias: per-item month nonzero rate computed server-side.
+        row["item_month_nonzero_rate"] = float(m_stats["nonzero_rate"])
 
         # Simple decay signal: slope of last 12 months
         row["rolling_12_slope"] = float(_rolling_slope(y[: t + 1]))
@@ -1442,6 +1444,8 @@ class LightGBMForecast:
                 r["same_month_mean_3y"] = float(m_stats["mean"])
                 r["same_month_max_3y"] = float(m_stats["max"])
                 r["same_month_nonzero_rate_3y"] = float(m_stats["nonzero_rate"])
+                # Alias: per-item month nonzero rate computed server-side.
+                r["item_month_nonzero_rate"] = float(m_stats["nonzero_rate"])
 
                 # Simple decay signal: slope of last 12 months
                 r["rolling_12_slope"] = float(_rolling_slope(y[: t + 1]))
