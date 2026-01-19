@@ -57,6 +57,35 @@ def _lazy_import_nixtla_models():
     }
 
 
+def simple_croston_mean(y: np.ndarray) -> float:
+    """Return a simple Croston-style mean for intermittent demand."""
+    y = np.asarray(y, dtype=float)
+    idx = np.where(y > 0.0)[0]
+    if len(idx) == 0:
+        return 0.0
+    sizes = y[idx]
+    if len(idx) == 1:
+        return float(sizes[0])
+    intervals = np.diff(idx)
+    mean_size = float(np.mean(sizes))
+    mean_interval = float(np.mean(intervals)) if float(np.mean(intervals)) > 0 else 1.0
+    return float(mean_size / mean_interval)
+
+
+def simple_adida_mean(y: np.ndarray, agg: int = 3) -> float:
+    """Return a simple ADIDA-style mean (aggregate then average back to monthly scale)."""
+    y = np.asarray(y, dtype=float)
+    if len(y) == 0:
+        return 0.0
+    if agg <= 1:
+        return float(np.mean(y))
+    n = len(y) - (len(y) % agg)
+    if n <= 0:
+        return float(np.mean(y))
+    y2 = y[:n].reshape(-1, agg).sum(axis=1)
+    return float(np.mean(y2) / agg)
+
+
 def _metric_func_from_name(name: str) -> tuple[str, Optional[Callable]]:
     """Map a user-friendly metric string to utilsforecast loss function.
 

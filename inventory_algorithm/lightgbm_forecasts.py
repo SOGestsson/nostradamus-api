@@ -5,11 +5,13 @@ import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Callable, Iterable
+import math
 
 import numpy as np
 import pandas as pd
 
 from services.duckdb_model_store import DuckDBModelStore, ModelVersionRow
+from inventory_algorithm.classical_forecasts import simple_croston_mean, simple_adida_mean
 
 
 try:
@@ -176,6 +178,35 @@ def _rolling_slope(y: np.ndarray) -> float:
         return 0.0
     slope, _ = np.polyfit(x, window, deg=1)
     return float(slope)
+
+
+def _recent_level(y: np.ndarray) -> float:
+    y = np.asarray(y, dtype=float)
+    if len(y) >= 6:
+        return float(np.mean(y[-6:]))
+    if len(y) >= 3:
+        return float(np.mean(y[-3:]))
+    return float(np.mean(y)) if len(y) else 0.0
+
+
+def _cv(y: np.ndarray) -> float:
+    y = np.asarray(y, dtype=float)
+    if len(y) == 0:
+        return float("inf")
+    mean = float(np.mean(y))
+    if mean <= 1e-9:
+        return float("inf")
+    return float(np.std(y) / mean)
+
+
+def _archetype(nonzero_rate: float, cv: float, seasonal_strength: float) -> str:
+    if seasonal_strength >= 0.8 and nonzero_rate <= 0.5:
+        return "seasonal"
+    if 0.1 <= nonzero_rate <= 0.5:
+        return "intermittent"
+    if cv >= 1.0:
+        return "noisy"
+    return "stable"
 
 
 def _month_index(ds: pd.Timestamp, start_ds: pd.Timestamp) -> int:
@@ -1397,6 +1428,14 @@ class LightGBMForecast:
                         "nonzero_rate": float(np.mean(hist_vals > 0.0)),
                     }
 
+            overall_nonzero_rate = float(np.mean((vals_3y > 0.0))) if len(vals_3y) else 0.0
+            seasonal_strength = float(max([v["nonzero_rate"] for v in same_month_stats.values()] or [0.0]))
+            cv_val = _cv(vals_3y if len(vals_3y) else y)
+            archetype = _archetype(overall_nonzero_rate, cv_val, seasonal_strength)
+            recent_level = _recent_level(y_orig)
+            croston_mean = simple_croston_mean(y_orig)
+            adida_mean = simple_adida_mean(y_orig, agg=3)
+
             # Build one row per horizon and predict with the corresponding model
             for h in horizons:
                 if h not in boosters:
@@ -1495,6 +1534,54 @@ class LightGBMForecast:
                 if p_effective < max(occurrence_threshold, p_min):
                     yhat = 0.0
 
+                adjustments: dict[str, Any] = {"archetype": archetype}
+
+                # Improvement #1: recent-level anchor (skip in seasonal-off months)
+                month_rate = float(m_stats.get("nonzero_rate", 0.0))
+                if month_rate >= 0.25 and yhat > 0.0:
+                    if archetype == "seasonal":
+                        alpha = 0.9
+                    elif archetype == "noisy":
+                        alpha = 0.5
+                    else:
+                        alpha = 0.7
+                    yhat = float(alpha * yhat + (1.0 - alpha) * recent_level)
+                    adjustments["recent_level"] = recent_level
+                    adjustments["alpha"] = alpha
+
+                # Improvement #2: Croston-style floor for intermittent alive items
+                last_nonzero_age = float(_nonzero_run_length(y_orig))
+                if (
+                    0.1 < overall_nonzero_rate < 0.5
+                    and last_nonzero_age <= 6
+                    and month_rate >= 0.25
+                ):
+                    floor = 0.3 * float(croston_mean)
+                    if yhat < floor:
+                        yhat = float(floor)
+                        adjustments["croston_floor"] = floor
+
+                # Improvement #3: horizon shrinkage
+                if archetype == "noisy":
+                    beta = 0.05
+                else:
+                    beta = 0.02
+                shrink = max(0.0, 1.0 - beta * math.log1p(float(h)))
+                yhat = float(yhat * shrink)
+                adjustments["shrink"] = shrink
+
+                # Improvement #4: classical override in narrow cases
+                classical_pred = float(np.mean([croston_mean, adida_mean]))
+                near_zero = yhat <= max(1.0, 0.1 * max(recent_level, 1.0))
+                if (
+                    near_zero
+                    and cv_val <= 0.5
+                    and 0.0 < classical_pred <= max(5.0, 0.5 * max(recent_level, 1.0))
+                    and month_rate >= 0.25
+                ):
+                    yhat = float(classical_pred)
+                    adjustments["classical_override"] = classical_pred
+
                 cap_stats = month_caps.get((str(uid), int(forecast_ds.month)))
                 if cap_stats is not None:
                     max_y = float(cap_stats.get("max_y", 0.0))
@@ -1504,7 +1591,9 @@ class LightGBMForecast:
                         yhat = min(yhat, cap_low)
                     cap = max(cap_multiplier * max_y, cap_small_floor)
                     yhat = min(yhat, cap)
-                forecasts.append({"unique_id": str(uid), "ds": forecast_ds, "yhat": yhat})
+                    adjustments["cap"] = cap
+
+                forecasts.append({"unique_id": str(uid), "ds": forecast_ds, "yhat": yhat, "adjustments": adjustments})
 
         fcst = pd.DataFrame(forecasts)
         if not fcst.empty:
