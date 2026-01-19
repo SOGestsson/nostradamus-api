@@ -1562,7 +1562,7 @@ class LightGBMForecast:
 
                 # Seasonal peak anchor: lift in-season peaks toward historical max
                 if archetype == "seasonal" and month_rate >= 0.25:
-                    peak_alpha = 0.3
+                    peak_alpha = 0.5
                     yhat = float((1.0 - peak_alpha) * yhat + peak_alpha * float(m_stats.get("max", 0.0)))
                     adjustments["peak_alpha"] = peak_alpha
 
@@ -1578,14 +1578,15 @@ class LightGBMForecast:
                         adjustments["croston_floor"] = floor
 
                 # Improvement #3: horizon shrinkage (apply only when above recent level)
-                if archetype == "noisy":
-                    beta = 0.05
-                else:
-                    beta = 0.02
-                shrink = max(0.0, 1.0 - beta * math.log1p(float(h)))
-                if yhat > recent_level:
-                    yhat = float(yhat * shrink)
-                    adjustments["shrink"] = shrink
+                if not (archetype == "seasonal" and month_rate >= 0.25):
+                    if archetype == "noisy":
+                        beta = 0.05
+                    else:
+                        beta = 0.02
+                    shrink = max(0.0, 1.0 - beta * math.log1p(float(h)))
+                    if yhat > recent_level:
+                        yhat = float(yhat * shrink)
+                        adjustments["shrink"] = shrink
 
                 # Improvement #4: classical override in narrow cases
                 classical_pred = float(np.mean([croston_mean, adida_mean]))
@@ -1612,7 +1613,7 @@ class LightGBMForecast:
                         yhat = min(yhat, cap_low)
                     cap_mult = cap_multiplier
                     if archetype == "seasonal" and month_rate >= 0.25:
-                        cap_mult = 3.0
+                        cap_mult = 4.0
                     cap = max(cap_mult * max_y, cap_small_floor)
                     yhat = min(yhat, cap)
                     adjustments["cap"] = cap
