@@ -424,6 +424,20 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
                         "model_used": "naive",
                         "reason_code": reason,
                         "confidence": confidence,
+                        "skipped": True,
+                    }
+                )
+                continue
+            if not ml_allowed:
+                out.append(
+                    {
+                        "item_id": item_id,
+                        "forecast": [],
+                        "forecast_dates": [],
+                        "model_used": "naive",
+                        "reason_code": reason,
+                        "confidence": confidence,
+                        "skipped": True,
                     }
                 )
 
