@@ -381,6 +381,14 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
                         pd.to_datetime(d).to_period("M").to_timestamp(how="start").strftime("%Y-%m-%d")
                         for d in item_fcst["day"].tolist()
                     ]
+                    adjustments_list = []
+                    if "adjustments" in item_fcst.columns:
+                        try:
+                            adjustments_list = [
+                                (a if isinstance(a, dict) else {}) for a in item_fcst["adjustments"].tolist()
+                            ]
+                        except Exception:
+                            adjustments_list = []
                     out.append(
                         {
                             "item_id": item_id,
@@ -389,6 +397,7 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
                             "model_used": str(winner),
                             "reason_code": reason,
                             "confidence": confidence,
+                            "adjustments": adjustments_list,
                         }
                     )
                     continue
