@@ -1560,6 +1560,12 @@ class LightGBMForecast:
                     adjustments["recent_level"] = recent_level
                     adjustments["alpha"] = alpha
 
+                # Seasonal peak anchor: lift in-season peaks toward historical max
+                if archetype == "seasonal" and month_rate >= 0.25:
+                    peak_alpha = 0.3
+                    yhat = float((1.0 - peak_alpha) * yhat + peak_alpha * float(m_stats.get("max", 0.0)))
+                    adjustments["peak_alpha"] = peak_alpha
+
                 # Improvement #2: Croston-style floor for intermittent alive items
                 if (
                     0.1 < overall_nonzero_rate < 0.5
@@ -1604,9 +1610,13 @@ class LightGBMForecast:
                     cap_low = max(max_y, cap_small_floor)
                     if nonzero_rate < cap_nonzero_threshold:
                         yhat = min(yhat, cap_low)
-                    cap = max(cap_multiplier * max_y, cap_small_floor)
+                    cap_mult = cap_multiplier
+                    if archetype == "seasonal" and month_rate >= 0.25:
+                        cap_mult = 3.0
+                    cap = max(cap_mult * max_y, cap_small_floor)
                     yhat = min(yhat, cap)
                     adjustments["cap"] = cap
+                    adjustments["cap_mult"] = cap_mult
 
                 forecasts.append({"unique_id": str(uid), "ds": forecast_ds, "yhat": yhat, "adjustments": adjustments})
 
