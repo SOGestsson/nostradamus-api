@@ -182,11 +182,13 @@ def _rolling_slope(y: np.ndarray) -> float:
 
 def _recent_level(y: np.ndarray) -> float:
     y = np.asarray(y, dtype=float)
-    if len(y) >= 6:
-        return float(np.mean(y[-6:]))
-    if len(y) >= 3:
-        return float(np.mean(y[-3:]))
-    return float(np.mean(y)) if len(y) else 0.0
+    if len(y) == 0:
+        return 0.0
+    window = y[-12:] if len(y) >= 12 else y
+    nz = window[window > 0.0]
+    if len(nz) >= 3:
+        return float(np.median(nz))
+    return float(np.mean(window))
 
 
 def _cv(y: np.ndarray) -> float:
@@ -1432,9 +1434,14 @@ class LightGBMForecast:
             seasonal_strength = float(max([v["nonzero_rate"] for v in same_month_stats.values()] or [0.0]))
             cv_val = _cv(vals_3y if len(vals_3y) else y)
             archetype = _archetype(overall_nonzero_rate, cv_val, seasonal_strength)
-            recent_level = _recent_level(y_orig)
             croston_mean = simple_croston_mean(y_orig)
             adida_mean = simple_adida_mean(y_orig, agg=3)
+            recent_level = _recent_level(y_orig)
+            if recent_level <= 0.0 and croston_mean > 0.0:
+                recent_level = 0.4 * float(croston_mean)
+            nonzero_count_last_12 = int(np.sum((y_orig[-12:] if len(y_orig) >= 12 else y_orig) > 0.0))
+            last_nonzero_age = float(_nonzero_run_length(y_orig))
+            recently_active = (last_nonzero_age <= 6) or (nonzero_count_last_12 >= 2)
 
             # Build one row per horizon and predict with the corresponding model
             for h in horizons:
@@ -1538,7 +1545,11 @@ class LightGBMForecast:
 
                 # Improvement #1: recent-level anchor (skip in seasonal-off months)
                 month_rate = float(m_stats.get("nonzero_rate", 0.0))
-                if month_rate >= 0.25 and yhat > 0.0:
+                if (
+                    recent_level > 0.0
+                    and (archetype != "seasonal" or month_rate >= 0.25)
+                    and (last_nonzero_age <= 9)
+                ):
                     if archetype == "seasonal":
                         alpha = 0.9
                     elif archetype == "noisy":
@@ -1550,34 +1561,38 @@ class LightGBMForecast:
                     adjustments["alpha"] = alpha
 
                 # Improvement #2: Croston-style floor for intermittent alive items
-                last_nonzero_age = float(_nonzero_run_length(y_orig))
                 if (
                     0.1 < overall_nonzero_rate < 0.5
-                    and last_nonzero_age <= 6
-                    and month_rate >= 0.25
+                    and last_nonzero_age <= 9
+                    and nonzero_count_last_12 >= 2
                 ):
-                    floor = 0.3 * float(croston_mean)
+                    floor = 0.4 * float(croston_mean)
                     if yhat < floor:
                         yhat = float(floor)
                         adjustments["croston_floor"] = floor
 
-                # Improvement #3: horizon shrinkage
+                # Improvement #3: horizon shrinkage (apply only when above recent level)
                 if archetype == "noisy":
                     beta = 0.05
                 else:
                     beta = 0.02
                 shrink = max(0.0, 1.0 - beta * math.log1p(float(h)))
-                yhat = float(yhat * shrink)
-                adjustments["shrink"] = shrink
+                if yhat > recent_level:
+                    yhat = float(yhat * shrink)
+                    adjustments["shrink"] = shrink
 
                 # Improvement #4: classical override in narrow cases
                 classical_pred = float(np.mean([croston_mean, adida_mean]))
                 near_zero = yhat <= max(1.0, 0.1 * max(recent_level, 1.0))
+                classical_floor = 0.4 * float(croston_mean)
+                classical_cap = max(5.0, 2.0 * max(recent_level, 1.0))
+                cv_threshold = 0.8 if archetype == "intermittent" else 0.5
                 if (
                     near_zero
-                    and cv_val <= 0.5
-                    and 0.0 < classical_pred <= max(5.0, 0.5 * max(recent_level, 1.0))
-                    and month_rate >= 0.25
+                    and cv_val <= cv_threshold
+                    and classical_floor <= classical_pred <= classical_cap
+                    and last_nonzero_age <= 9
+                    and archetype != "seasonal"
                 ):
                     yhat = float(classical_pred)
                     adjustments["classical_override"] = classical_pred
