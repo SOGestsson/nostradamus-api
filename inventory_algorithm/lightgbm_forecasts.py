@@ -1439,9 +1439,14 @@ class LightGBMForecast:
             recent_level = _recent_level(y_orig)
             if recent_level <= 0.0 and croston_mean > 0.0:
                 recent_level = 0.4 * float(croston_mean)
+            if archetype == "stable":
+                stable_window = y_orig[-12:] if len(y_orig) >= 12 else y_orig
+                if len(stable_window):
+                    recent_level = float(np.mean(stable_window))
             nonzero_count_last_12 = int(np.sum((y_orig[-12:] if len(y_orig) >= 12 else y_orig) > 0.0))
             last_nonzero_age = float(_nonzero_run_length(y_orig))
             recently_active = (last_nonzero_age <= 6) or (nonzero_count_last_12 >= 2)
+            recent_slope = _rolling_slope(y_orig)
 
             # Build one row per horizon and predict with the corresponding model
             for h in horizons:
@@ -1563,8 +1568,13 @@ class LightGBMForecast:
                 # Seasonal peak anchor: lift in-season peaks toward historical max
                 if archetype == "seasonal" and month_rate >= 0.25:
                     peak_alpha = 0.5
-                    yhat = float((1.0 - peak_alpha) * yhat + peak_alpha * float(m_stats.get("max", 0.0)))
+                    peak_target = float(m_stats.get("max", 0.0))
+                    peak_mean = float(m_stats.get("mean", 0.0))
+                    if peak_mean > 0.0 and peak_target > 3.0 * peak_mean:
+                        peak_target = 3.0 * peak_mean
+                    yhat = float((1.0 - peak_alpha) * yhat + peak_alpha * peak_target)
                     adjustments["peak_alpha"] = peak_alpha
+                    adjustments["peak_target"] = peak_target
 
                 # Improvement #2: Croston-style floor for intermittent alive items
                 if (
@@ -1587,6 +1597,23 @@ class LightGBMForecast:
                     if yhat > recent_level:
                         yhat = float(yhat * shrink)
                         adjustments["shrink"] = shrink
+
+                # Trend memory for stable/nonseasonal items (small nudge)
+                if archetype == "stable":
+                    trend_weight = 0.2
+                    trend_adjust = float(trend_weight * recent_slope * min(float(h), 6.0))
+                    if trend_adjust != 0.0:
+                        yhat = float(yhat + trend_adjust)
+                        adjustments["trend_adjust"] = trend_adjust
+
+                # Level floor for stable items with low CV and flat trend
+                if archetype == "stable" and cv_val <= 0.6:
+                    flat_thresh = 0.05 * max(recent_level, 1.0)
+                    if abs(recent_slope) <= flat_thresh:
+                        level_floor = 0.7 * float(recent_level)
+                        if yhat < level_floor:
+                            yhat = float(level_floor)
+                            adjustments["level_floor"] = level_floor
 
                 # Improvement #4: classical override in narrow cases
                 classical_pred = float(np.mean([croston_mean, adida_mean]))
