@@ -429,11 +429,24 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
                 )
                 continue
             if not ml_allowed:
+                last = float(last_vals.get(str(item_id), 0.0)) if len(last_vals) else 0.0
+                last_day = df_hist[df_hist["item_id"].astype(str) == str(item_id)]["day"].max()
+                if pd.isna(last_day):
+                    days = []
+                else:
+                    start = pd.to_datetime(last_day).to_period('M').to_timestamp(how='start')
+                    future = pd.date_range(
+                        start=start + pd.offsets.MonthBegin(1),
+                        periods=request.forecast_periods,
+                        freq='MS',
+                    )
+                    days = [d.strftime("%Y-%m-%d") for d in future]
+
                 out.append(
                     {
                         "item_id": item_id,
-                        "forecast": [],
-                        "forecast_dates": [],
+                        "forecast": [last] * int(request.forecast_periods),
+                        "forecast_dates": days,
                         "model_used": "naive",
                         "reason_code": reason,
                         "confidence": confidence,
