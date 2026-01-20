@@ -1225,10 +1225,21 @@ class LightGBMForecast:
                     feat_contrib = contrib_row[:-1]
                     pairs = list(zip(feat_names, feat_contrib))
                     pairs_sorted = sorted(pairs, key=lambda kv: abs(float(kv[1])), reverse=True)
+                    contrib_map = {str(n): float(v) for n, v in pairs}
 
                     top_k = 20
                     shap_top = [{"feature": n, "contribution": float(v)} for n, v in pairs_sorted[:top_k]]
                     imp_top = [{"feature": n, "importance": float(abs(v))} for n, v in pairs_sorted[:top_k]]
+
+                    static_contrib = [
+                        {"feature": f, "contribution": float(contrib_map.get(f, 0.0))}
+                        for f in used_static
+                        if f in contrib_map
+                    ]
+                    static_contrib = sorted(static_contrib, key=lambda kv: abs(float(kv["contribution"])), reverse=True)
+                    static_values = {
+                        f: float(X[f].iloc[0]) for f in used_static if f in X.columns
+                    }
 
                     shap_info = {
                         "available": True,
@@ -1240,12 +1251,16 @@ class LightGBMForecast:
                 except Exception as e:
                     shap_info = {"available": False, "reason": f"PRED_CONTRIB_FAILED: {e}"}
                     imp_top = []
+                    static_contrib = []
+                    static_values = {}
 
                 per_uid_diag[uid] = {
                     "shap": shap_info,
                     "per_item_importance_top": imp_top,
                     "used_columns": {"static": used_static, "exogenous": used_exo},
                     "dropped_columns": {"static": dropped_static, "exogenous": dropped_exo},
+                    "static_contrib": static_contrib,
+                    "static_values": static_values,
                     "training_diagnostics": diag,
                 }
 
