@@ -1570,7 +1570,9 @@ class LightGBMForecast:
                     and (archetype != "seasonal" or month_rate >= 0.25)
                     and (last_nonzero_age <= 9)
                 ):
-                    if archetype == "seasonal":
+                    if archetype == "seasonal" and month_rate >= 0.25:
+                        alpha = 0.95
+                    elif archetype == "seasonal":
                         alpha = 0.9
                     elif archetype == "noisy":
                         alpha = 0.5
@@ -1588,6 +1590,9 @@ class LightGBMForecast:
                     if peak_mean > 0.0 and peak_target > 3.0 * peak_mean:
                         peak_target = 3.0 * peak_mean
                     yhat = float((1.0 - peak_alpha) * yhat + peak_alpha * peak_target)
+                    if peak_mean > 0.0 and yhat < 0.8 * peak_mean:
+                        yhat = float(0.8 * peak_mean)
+                        adjustments["seasonal_mean_floor"] = float(0.8 * peak_mean)
                     adjustments["peak_alpha"] = peak_alpha
                     adjustments["peak_target"] = peak_target
 
