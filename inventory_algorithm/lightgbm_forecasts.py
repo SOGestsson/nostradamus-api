@@ -348,7 +348,8 @@ def _build_direct_rows_for_item(
     # Precompute per-month historical stats for same-month features (last 36 months).
     same_month_stats: dict[int, dict[str, float]] = {}
     months = np.array([pd.Timestamp(d).month for d in ds], dtype=int)
-    vals_3y = y[-36:] if len(y) > 36 else y
+    base_y = y_orig if y_orig is not None else y
+    vals_3y = base_y[-36:] if len(base_y) > 36 else base_y
     months_3y = months[-36:] if len(months) > 36 else months
     for m in range(1, 13):
         hist_vals = vals_3y[months_3y == m]
@@ -445,7 +446,7 @@ def _build_direct_rows_for_item(
         # Alias: per-item month nonzero rate computed server-side.
         row["item_month_nonzero_rate"] = float(m_stats["nonzero_rate"])
 
-        mean_last12 = float(np.mean(y[t - 11 : t + 1]))
+        mean_last12 = float(np.mean(base_y[t - 11 : t + 1]))
         row["seasonal_amplitude_ratio"] = float(m_stats["max"]) / max(mean_last12, 1.0)
 
         # Simple decay signal: slope of last 12 months
@@ -521,6 +522,51 @@ def _add_sample_weights(
     return df
 
 
+def _compute_target_encodings(
+    base: pd.DataFrame,
+    cols: list[str],
+    *,
+    prior: float = 10.0,
+) -> tuple[dict[str, dict[str, Any]], pd.DataFrame]:
+    if base is None or base.empty or not cols:
+        return {}, base
+    df = base.copy()
+    global_mean = float(pd.to_numeric(df["y"], errors="coerce").fillna(0.0).mean())
+    enc_maps: dict[str, dict[str, Any]] = {}
+    for col in cols:
+        if col not in df.columns:
+            continue
+        series = df[col].astype(str).fillna("")
+        stats = (
+            pd.DataFrame({"key": series, "y": pd.to_numeric(df["y"], errors="coerce").fillna(0.0)})
+            .groupby("key", as_index=True)
+            .agg(count=("y", "size"), mean=("y", "mean"))
+        )
+        smooth = (stats["mean"] * stats["count"] + global_mean * float(prior)) / (stats["count"] + float(prior))
+        mapping = {str(k): float(v) for k, v in smooth.to_dict().items()}
+        enc_maps[col] = {"__global__": global_mean, "mapping": mapping}
+        df[f"{col}_te"] = series.map(mapping).fillna(global_mean).astype(float)
+    return enc_maps, df
+
+
+def _apply_target_encodings(
+    df: pd.DataFrame,
+    te_cols: list[str],
+    te_maps: dict[str, Any],
+) -> pd.DataFrame:
+    if df is None or df.empty or not te_cols or not te_maps:
+        return df
+    out = df.copy()
+    for col in te_cols:
+        if col not in out.columns:
+            continue
+        series = out[col].astype(str).fillna("")
+        mapping = dict((te_maps.get(col) or {}).get("mapping") or {})
+        global_mean = float((te_maps.get(col) or {}).get("__global__", 0.0))
+        out[f"{col}_te"] = series.map(mapping).fillna(global_mean).astype(float)
+    return out
+
+
 def _build_statsforecast_features(
     base: pd.DataFrame,
     *,
@@ -575,6 +621,7 @@ def _build_statsforecast_features(
     }
     keep = ["unique_id", "ds"] + [c for c in rename.keys() if c in cv.columns]
     out = cv.loc[:, keep].copy()
+    out["sf_available"] = 1.0
     out = out.rename(columns=rename)
     out = out.dropna(subset=["unique_id", "ds"]).reset_index(drop=True)
     return out
@@ -620,6 +667,7 @@ def _build_statsforecast_future_features(
     }
     keep = ["unique_id", "ds"] + [c for c in rename.keys() if c in fcst.columns]
     out = fcst.loc[:, keep].copy()
+    out["sf_available"] = 1.0
     out = out.rename(columns=rename)
     out = out.dropna(subset=["unique_id", "ds"]).reset_index(drop=True)
     return out
@@ -709,6 +757,7 @@ class LightGBMForecast:
             base = base.merge(attrs, on="item_id", how="left", suffixes=("", "_attr"))
             static_cols = [c for c in attrs.columns if c != "item_id"]
 
+
         # Merge long drivers (optional) → wide monthly
         if drivers is not None and not drivers.empty:
             wide = _pivot_long_drivers(drivers)
@@ -718,6 +767,16 @@ class LightGBMForecast:
                     base = base.merge(wide, on=["item_id", "ds"], how="left")
                 else:
                     base = base.merge(wide, on=["ds"], how="left")
+
+        # Apply target encodings for static fields
+        if te_cols and te_maps:
+            for col in te_cols:
+                if col not in base.columns:
+                    continue
+                series = base[col].astype(str).fillna("")
+                mapping = dict((te_maps.get(col) or {}).get("mapping") or {})
+                global_mean = float((te_maps.get(col) or {}).get("__global__", 0.0))
+                base[f"{col}_te"] = series.map(mapping).fillna(global_mean).astype(float)
 
         # Determine exogenous columns from wide data
         base_cols = {"item_id", "unique_id", "ds", "y"}
@@ -741,7 +800,7 @@ class LightGBMForecast:
         ]
         static_interaction_cols: list[str] = []
         for c in static_cols:
-            if c not in base.columns or c in {"name", "flavour"}:
+            if c not in base.columns or c in {"name", "flavour"} or c.endswith("_te"):
                 continue
             unique_count = int(base[c].nunique(dropna=True))
             if unique_count <= 50:
@@ -765,6 +824,13 @@ class LightGBMForecast:
             if not base.empty else {}
         )
         weight_map = {str(uid): 1.0 / (float(total) + 1.0) for uid, total in demand_by_uid.items()}
+        if weight_map:
+            weights = np.array(list(weight_map.values()), dtype=float)
+            w_med = float(np.median(weights)) if len(weights) else 1.0
+            if w_med <= 0:
+                w_med = 1.0
+            for uid in list(weight_map.keys()):
+                weight_map[uid] = float(np.clip(weight_map[uid] / w_med, 0.5, 3.0))
         for uid, grp in base.groupby("unique_id", sort=False):
             grp = grp.sort_values("ds", kind="mergesort")
             ds = grp["ds"].to_numpy()
@@ -811,13 +877,23 @@ class LightGBMForecast:
         sf_feats = _build_statsforecast_features(base, max_h=int(horizon), season_length=12)
         if not sf_feats.empty:
             sf_feats = sf_feats.rename(columns={"ds": "forecast_ds"})
+            coverage = float(sf_feats["unique_id"].nunique()) / float(base["unique_id"].nunique() or 1)
             for h in range(1, int(horizon) + 1):
                 rows = all_rows_by_h.get(h) or []
                 if not rows:
                     continue
                 df_h = pd.DataFrame(rows)
-                df_h = df_h.merge(sf_feats, on=["unique_id", "forecast_ds"], how="left")
-                df_h = df_h.fillna(0.0)
+                if coverage >= 0.3:
+                    df_h = df_h.merge(sf_feats, on=["unique_id", "forecast_ds"], how="left")
+                    if "sf_available" not in df_h.columns:
+                        df_h["sf_available"] = 0.0
+                    for c in ["sf_croston_optimized", "sf_adida", "sf_auto_ets", "sf_theta"]:
+                        if c in df_h.columns:
+                            df_h[c] = df_h[c].where(df_h["sf_available"] > 0.0, 0.0)
+                    df_h = df_h.fillna(0.0)
+                else:
+                    for c in ["sf_croston_optimized", "sf_adida", "sf_auto_ets", "sf_theta", "sf_available"]:
+                        df_h[c] = 0.0
                 all_rows_by_h[h] = df_h.to_dict(orient="records")
 
         # Train one model per horizon
@@ -857,6 +933,13 @@ class LightGBMForecast:
             raise ValueError("No training rows after feature generation (check history length).")
 
         cutoff = pd.Timestamp(max_forecast_ds) - pd.offsets.MonthBegin(int(val_months - 1))
+
+        # Target-encode high-cardinality static fields (train-split only to avoid leakage)
+        te_cols = [c for c in static_cols if c in {"name", "flavour"}]
+        te_maps, _ = _compute_target_encodings(base[base["ds"] < cutoff].copy(), te_cols, prior=10.0)
+        base = _apply_target_encodings(base, te_cols, te_maps)
+        te_feature_cols = [f"{c}_te" for c in te_cols]
+        static_cols = static_cols + [c for c in te_feature_cols if c not in static_cols]
 
         # For eligibility: evaluate horizon 1 per-item
         per_item_eval: dict[str, dict[str, float]] = {}
@@ -1052,7 +1135,7 @@ class LightGBMForecast:
                 df_nz = df.loc[nz_mask].copy()
                 df_nz = _add_sample_weights(df_nz, weight_map)
                 if len(df_nz) >= 50:
-                    y_nz = df_nz["y"].to_numpy(dtype=float)
+                    y_nz = df_nz["y_orig"].to_numpy(dtype=float) if "y_orig" in df_nz.columns else df_nz["y"].to_numpy(dtype=float)
                     is_val_nz = pd.to_datetime(df_nz["forecast_ds"]) >= cutoff
                     X_nz = df_nz[feature_cols].copy()
                     X_nz["unique_id"] = X_nz["unique_id"].astype(str)
@@ -1068,7 +1151,8 @@ class LightGBMForecast:
                     w_nz_train = w_nz[~is_val_nz]
                     w_nz_val = w_nz[is_val_nz]
 
-                    objective_nz = "tweedie" if detrend_method == "none" else "regression"
+                    all_nonneg_nz = bool(np.all(y_nz_train >= 0) and np.all(y_nz_val >= 0))
+                    objective_nz = "tweedie" if all_nonneg_nz else "regression"
                     params_nz = dict(params)
                     params_nz["objective"] = objective_nz
                     params_nz["metric"] = "l2"
@@ -1202,10 +1286,13 @@ class LightGBMForecast:
             "categorical_columns": cat_cols,
             "category_mappings": mappings,
             "feature_columns": feature_cols,
-            "stat_feature_columns": ["sf_croston_optimized", "sf_adida", "sf_auto_ets", "sf_theta"],
+            "stat_feature_columns": ["sf_croston_optimized", "sf_adida", "sf_auto_ets", "sf_theta", "sf_available"],
             "amount_objective": "tweedie" if detrend_method == "none" else "regression",
             "tweedie_variance_power": 1.3,
             "sample_weighting": "inverse_demand",
+            "target_encoding_columns": te_cols,
+            "target_encoding_maps": te_maps,
+            "target_encoding_prior": 10.0,
         }
         spec_path = os.path.join(artifact_root, "feature_spec.json")
         with open(spec_path, "w", encoding="utf-8") as f:
@@ -1637,6 +1724,8 @@ class LightGBMForecast:
         static_cols: list[str] = list(spec.get("static_columns") or [])
         stat_feature_cols: list[str] = list(spec.get("stat_feature_columns") or [])
         static_interaction_cols: list[str] = list(spec.get("static_interaction_columns") or [])
+        te_cols: list[str] = list(spec.get("target_encoding_columns") or [])
+        te_maps: dict[str, Any] = dict(spec.get("target_encoding_maps") or {})
         cat_cols: list[str] = list(spec.get("categorical_columns") or [])
         mappings: dict[str, dict[str, int]] = dict(spec.get("category_mappings") or {})
         lags: list[int] = list(spec.get("lags") or [1, 2, 3, 6, 12, 24])
@@ -1737,9 +1826,10 @@ class LightGBMForecast:
             for c in static_cols:
                 static[c] = grp[c].iloc[-1] if c in grp.columns else None
 
-            # Precompute same-month stats for inference (last 36 months).
+            # Precompute same-month stats for inference (last 36 months) on original scale.
             months = np.array([pd.Timestamp(d).month for d in ds_arr], dtype=int)
-            vals_3y = y[-36:] if len(y) > 36 else y
+            base_y = y_orig
+            vals_3y = base_y[-36:] if len(base_y) > 36 else base_y
             months_3y = months[-36:] if len(months) > 36 else months
             same_month_stats: dict[int, dict[str, float]] = {}
             for m in range(1, 13):
@@ -1770,7 +1860,7 @@ class LightGBMForecast:
             last_nonzero_age = float(_nonzero_run_length(y_orig))
             recently_active = (last_nonzero_age <= 6) or (nonzero_count_last_12 >= 2)
             recent_slope = _rolling_slope(y_orig)
-            mean_last12_item = float(np.mean(y[-12:])) if len(y) else 0.0
+            mean_last12_item = float(np.mean(base_y[-12:])) if len(base_y) else 0.0
 
             # Build one row per horizon and predict with the corresponding model
             for h in horizons:
@@ -1851,9 +1941,11 @@ class LightGBMForecast:
                         for k in stat_feature_cols:
                             if k in row_vals:
                                 r[k] = row_vals[k]
+                        r["sf_available"] = float(row_vals.get("sf_available", 0.0))
                     else:
                         for k in stat_feature_cols:
                             r[k] = 0.0
+                        r["sf_available"] = 0.0
 
                 X = pd.DataFrame([r])
                 X["unique_id"] = X["unique_id"].astype(str)
@@ -1878,14 +1970,7 @@ class LightGBMForecast:
                     trend_future = _trend_model_value(forecast_ds, params)
                     yhat_amount = float(np.maximum(0.0, np.expm1(yhat_model + trend_future)))
                 if yhat_model_nz is not None:
-                    if detrend_method == "none" or not params:
-                        yhat_amount_nz = float(np.maximum(0.0, yhat_model_nz))
-                    elif detrend_method == "linear":
-                        trend_future = _trend_model_value(forecast_ds, params)
-                        yhat_amount_nz = float(np.maximum(0.0, yhat_model_nz + trend_future))
-                    else:  # log1p_linear
-                        trend_future = _trend_model_value(forecast_ds, params)
-                        yhat_amount_nz = float(np.maximum(0.0, np.expm1(yhat_model_nz + trend_future)))
+                    yhat_amount_nz = float(np.maximum(0.0, yhat_model_nz))
                 else:
                     yhat_amount_nz = None
 
@@ -1895,16 +1980,22 @@ class LightGBMForecast:
                 else:
                     p_nonzero = 1.0
 
+                month_rate_same = float(m_stats.get("nonzero_rate", 0.0))
+
+                adjustments: dict[str, Any] = {"archetype": archetype}
+                anchor_priority = 0
+
                 # Couple occurrence to month history + recent run-length.
                 cap_stats = month_caps.get((str(uid), int(forecast_ds.month)))
-                month_rate = float(cap_stats.get("nonzero_rate", 1.0)) if cap_stats else 1.0
+                month_rate_caps = float(cap_stats.get("nonzero_rate", 1.0)) if cap_stats else 1.0
                 run_length = float(_nonzero_run_length(y_orig))
                 run_penalty = float(np.exp(-run_length / 6.0))
-                if archetype == "seasonal" and month_rate >= 0.3:
+                if archetype == "seasonal" and month_rate_caps >= 0.3:
                     run_penalty = max(run_penalty, 0.7)
 
-                p_effective = float(np.clip(p_nonzero * max(0.05, month_rate) * run_penalty, 0.0, 1.0))
-                p_min = max(0.05, 0.5 * month_rate)
+                month_rate_blend = 0.6 * month_rate_same + 0.4 * month_rate_caps
+                p_effective = float(np.clip(p_nonzero * max(0.05, month_rate_blend) * run_penalty, 0.0, 1.0))
+                p_min = max(0.05, 0.5 * month_rate_blend)
 
                 if nonzero_count_last_12 >= 3:
                     floor_raw = 0.5 * float(mean_nonzero_12) + 0.5 * float(croston_mean)
@@ -1915,9 +2006,11 @@ class LightGBMForecast:
                 amount_used = yhat_amount_nz if yhat_amount_nz is not None else yhat_amount
                 yhat = float(p_effective * amount_used + (1.0 - p_effective) * floor)
                 if p_effective < max(occurrence_threshold, p_min):
-                    yhat = 0.0
-
-                adjustments: dict[str, Any] = {"archetype": archetype}
+                    if archetype == "seasonal" and month_rate_caps >= 0.3:
+                        yhat = max(yhat, 0.3 * floor)
+                        adjustments["soft_zero_floor"] = float(0.3 * floor)
+                    else:
+                        yhat = 0.0
                 adjustments["amount_model"] = "nonzero" if yhat_amount_nz is not None else "full"
                 adjustments["occurrence_floor"] = floor
 
@@ -1927,21 +2020,22 @@ class LightGBMForecast:
                     if yhat < anchor:
                         yhat = float(anchor)
                         adjustments["nonzero_level_anchor"] = anchor
+                        anchor_priority = max(anchor_priority, 1)
                 adjustments["mean_nonzero_12"] = mean_nonzero_12
                 adjustments["median_nonzero_12"] = median_nonzero_12
                 adjustments["last_nonzero_value"] = last_nz_val
 
                 # Improvement #1: recent-level anchor (skip in seasonal-off months)
-                month_rate = float(m_stats.get("nonzero_rate", 0.0))
                 if (
                     recent_level > 0.0
-                    and (archetype != "seasonal" or month_rate >= 0.25)
+                    and (archetype != "seasonal" or month_rate_same >= 0.25)
                     and (last_nonzero_age <= 9)
                     and not (
                         archetype == "seasonal"
-                        and month_rate >= 0.25
+                        and month_rate_same >= 0.25
                         and float(m_stats.get("max", 0.0)) > 1.5 * float(recent_level)
                     )
+                    and anchor_priority < 3
                 ):
                     ramp_up = False
                     nz_full_vals = y_orig[y_orig > 0.0]
@@ -1950,7 +2044,7 @@ class LightGBMForecast:
                         ramp_up = bool(last3[0] < last3[1] < last3[2])
                     slope_thresh = 0.05 * max(recent_level, 1.0)
                     regime_active = bool(recent_slope > slope_thresh and ramp_up and int(h) <= 6)
-                    if archetype == "seasonal" and month_rate >= 0.25:
+                    if archetype == "seasonal" and month_rate_same >= 0.25:
                         alpha = 0.95
                     elif archetype == "seasonal":
                         alpha = 0.9
@@ -1964,9 +2058,10 @@ class LightGBMForecast:
                     yhat = float(alpha * yhat + (1.0 - alpha) * recent_level)
                     adjustments["recent_level"] = recent_level
                     adjustments["alpha"] = alpha
+                    anchor_priority = max(anchor_priority, 1)
 
                 # Seasonal peak anchor: lift in-season peaks toward historical max
-                if archetype == "seasonal" and month_rate >= 0.25:
+                if archetype == "seasonal" and month_rate_same >= 0.25:
                     peak_alpha = 0.5
                     peak_target = float(m_stats.get("max", 0.0))
                     peak_mean = float(m_stats.get("mean", 0.0))
@@ -1978,14 +2073,16 @@ class LightGBMForecast:
                         adjustments["seasonal_mean_floor"] = float(0.8 * peak_mean)
                     adjustments["peak_alpha"] = peak_alpha
                     adjustments["peak_target"] = peak_target
+                    anchor_priority = max(anchor_priority, 3)
 
                 # Seasonal amplitude memory: lift in high-amplitude months
                 seasonal_amp_ratio = float(m_stats.get("max", 0.0)) / max(mean_last12_item, 1.0)
-                if month_rate >= 0.3 and seasonal_amp_ratio > 1.5:
+                if month_rate_same >= 0.3 and seasonal_amp_ratio > 1.5:
                     amp_target = 0.6 * float(m_stats.get("max", 0.0))
                     if yhat < amp_target:
                         yhat = float(amp_target)
                         adjustments["seasonal_amp_anchor"] = amp_target
+                        anchor_priority = max(anchor_priority, 3)
                 adjustments["seasonal_amplitude_ratio"] = seasonal_amp_ratio
 
                 # Improvement #2: Croston-style floor for intermittent alive items
@@ -1993,11 +2090,13 @@ class LightGBMForecast:
                     0.1 < overall_nonzero_rate < 0.5
                     and last_nonzero_age <= 9
                     and nonzero_count_last_12 >= 2
+                    and anchor_priority < 3
                 ):
                     floor = 0.4 * float(croston_mean)
                     if yhat < floor:
                         yhat = float(floor)
                         adjustments["croston_floor"] = floor
+                        anchor_priority = max(anchor_priority, 2)
 
                 # Improvement #3: horizon shrinkage (stable/noisy only)
                 if archetype in {"stable", "noisy"} and not adjustments.get("regime_ramp_up"):
@@ -2024,8 +2123,11 @@ class LightGBMForecast:
                     if abs(recent_slope) <= flat_thresh:
                         level_floor = 0.7 * float(recent_level)
                         if yhat < level_floor:
-                            yhat = float(level_floor)
-                            adjustments["level_floor"] = level_floor
+                            if anchor_priority < 2:
+                                yhat = float(level_floor)
+                                adjustments["level_floor"] = level_floor
+                                anchor_priority = max(anchor_priority, 1)
+                adjustments["anchor_priority"] = anchor_priority
 
                 # Improvement #4: classical override in narrow cases
                 classical_pred = float(np.mean([croston_mean, adida_mean]))
@@ -2051,7 +2153,7 @@ class LightGBMForecast:
                     if nonzero_rate < cap_nonzero_threshold:
                         yhat = min(yhat, cap_low)
                     cap_mult = cap_multiplier
-                    if archetype == "seasonal" and month_rate >= 0.25:
+                    if archetype == "seasonal" and month_rate_same >= 0.25:
                         cap_mult = 4.0
                     if adjustments.get("regime_ramp_up"):
                         cap_mult = cap_mult * 1.5
