@@ -159,6 +159,11 @@ def _month_sin_cos(month: int) -> tuple[float, float]:
     return float(np.sin(ang)), float(np.cos(ang))
 
 
+def _quarter_sin_cos(quarter: int) -> tuple[float, float]:
+    ang = 2.0 * np.pi * ((float(quarter) - 1.0) / 4.0)
+    return float(np.sin(ang)), float(np.cos(ang))
+
+
 def _nonzero_run_length(values: np.ndarray) -> int:
     # months since last non-zero ending at current index
     for i in range(len(values) - 1, -1, -1):
@@ -356,6 +361,7 @@ def _build_direct_rows_for_item(
                 "nonzero_rate": float(np.mean(hist_vals > 0.0)),
             }
 
+    start_ds = pd.Timestamp(ds[0])
     for t in range(0, n - horizon):
         if t < max_needed:
             continue
@@ -387,6 +393,10 @@ def _build_direct_rows_for_item(
         s, c = _month_sin_cos(m)
         row["month_sin"] = s
         row["month_cos"] = c
+        qs, qc = _quarter_sin_cos(int(row["quarter"]))
+        row["quarter_sin"] = qs
+        row["quarter_cos"] = qc
+        row["year_idx"] = float(forecast_ds.year - start_ds.year)
         if static_interaction_cols:
             for col in static_interaction_cols:
                 row[f"{col}_month_sin"] = 0.0
@@ -493,6 +503,126 @@ def _add_static_interactions(
         df[f"{col}_month_sin"] = df[col].astype(float) * df["month_sin"].astype(float)
         df[f"{col}_month_cos"] = df[col].astype(float) * df["month_cos"].astype(float)
     return df
+
+
+def _add_sample_weights(
+    df: pd.DataFrame,
+    weight_map: dict[str, float] | None,
+) -> pd.DataFrame:
+    if df is None or df.empty or not weight_map:
+        df["sample_weight"] = 1.0
+        return df
+    counts = df["unique_id"].astype(str).value_counts().to_dict()
+    def _row_weight(uid: str) -> float:
+        base = float(weight_map.get(str(uid), 1.0))
+        denom = float(counts.get(str(uid), 1.0))
+        return base / denom if denom > 0 else base
+    df["sample_weight"] = df["unique_id"].astype(str).map(_row_weight).fillna(1.0)
+    return df
+
+
+def _build_statsforecast_features(
+    base: pd.DataFrame,
+    *,
+    max_h: int,
+    season_length: int = 12,
+) -> pd.DataFrame:
+    """Build per-item StatsForecast features via rolling CV (leak-safe)."""
+    if base is None or base.empty:
+        return pd.DataFrame()
+    try:
+        from statsforecast import StatsForecast
+        from statsforecast.models import AutoETS, Theta, CrostonOptimized, ADIDA
+    except Exception:
+        return pd.DataFrame()
+
+    df = base.loc[:, ["unique_id", "ds", "y"]].copy()
+    df = df.dropna(subset=["unique_id", "ds"])
+    if df.empty:
+        return pd.DataFrame()
+
+    counts = df["unique_id"].value_counts()
+    eligible = counts[counts >= max(3, int(max_h) + 2)].index.tolist()
+    if not eligible:
+        return pd.DataFrame()
+    df = df[df["unique_id"].isin(eligible)].copy()
+
+    min_obs = int(counts.loc[eligible].min())
+    n_windows = max(1, min(12, min_obs - int(max_h)))
+
+    models = [
+        CrostonOptimized(),
+        ADIDA(),
+        AutoETS(season_length=int(season_length)),
+        Theta(season_length=int(season_length)),
+    ]
+    sf = StatsForecast(models=models, freq="MS", n_jobs=1)
+    try:
+        cv = sf.cross_validation(
+            df=df,
+            h=int(max_h),
+            step_size=1,
+            n_windows=int(n_windows),
+        )
+    except Exception:
+        return pd.DataFrame()
+
+    rename = {
+        "CrostonOptimized": "sf_croston_optimized",
+        "ADIDA": "sf_adida",
+        "AutoETS": "sf_auto_ets",
+        "Theta": "sf_theta",
+    }
+    keep = ["unique_id", "ds"] + [c for c in rename.keys() if c in cv.columns]
+    out = cv.loc[:, keep].copy()
+    out = out.rename(columns=rename)
+    out = out.dropna(subset=["unique_id", "ds"]).reset_index(drop=True)
+    return out
+
+
+def _build_statsforecast_future_features(
+    base: pd.DataFrame,
+    *,
+    max_h: int,
+    season_length: int = 12,
+) -> pd.DataFrame:
+    """Build per-item StatsForecast features for future horizons."""
+    if base is None or base.empty:
+        return pd.DataFrame()
+    try:
+        from statsforecast import StatsForecast
+        from statsforecast.models import AutoETS, Theta, CrostonOptimized, ADIDA
+    except Exception:
+        return pd.DataFrame()
+
+    df = base.loc[:, ["unique_id", "ds", "y"]].copy()
+    df = df.dropna(subset=["unique_id", "ds"])
+    if df.empty:
+        return pd.DataFrame()
+
+    models = [
+        CrostonOptimized(),
+        ADIDA(),
+        AutoETS(season_length=int(season_length)),
+        Theta(season_length=int(season_length)),
+    ]
+    sf = StatsForecast(models=models, freq="MS", n_jobs=1)
+    try:
+        fcst = sf.forecast(df=df, h=int(max_h))
+    except Exception:
+        return pd.DataFrame()
+
+    rename = {
+        "CrostonOptimized": "sf_croston_optimized",
+        "ADIDA": "sf_adida",
+        "AutoETS": "sf_auto_ets",
+        "Theta": "sf_theta",
+    }
+    keep = ["unique_id", "ds"] + [c for c in rename.keys() if c in fcst.columns]
+    out = fcst.loc[:, keep].copy()
+    out = out.rename(columns=rename)
+    out = out.dropna(subset=["unique_id", "ds"]).reset_index(drop=True)
+    return out
 
 
 # -------------------------
@@ -610,8 +740,8 @@ class LightGBMForecast:
             if c in base.columns and (pd.api.types.is_object_dtype(base[c]) or pd.api.types.is_categorical_dtype(base[c]))
         ]
         static_interaction_cols: list[str] = []
-        for c in static_cat_cols:
-            if c in {"name", "flavour"}:
+        for c in static_cols:
+            if c not in base.columns or c in {"name", "flavour"}:
                 continue
             unique_count = int(base[c].nunique(dropna=True))
             if unique_count <= 50:
@@ -630,6 +760,11 @@ class LightGBMForecast:
         trend_params_by_uid: dict[str, dict[str, Any]] = {}
 
         base = base.sort_values(["unique_id", "ds"], kind="mergesort").reset_index(drop=True)
+        demand_by_uid = (
+            base.groupby("unique_id")["y"].sum().astype(float).to_dict()
+            if not base.empty else {}
+        )
+        weight_map = {str(uid): 1.0 / (float(total) + 1.0) for uid, total in demand_by_uid.items()}
         for uid, grp in base.groupby("unique_id", sort=False):
             grp = grp.sort_values("ds", kind="mergesort")
             ds = grp["ds"].to_numpy()
@@ -671,6 +806,19 @@ class LightGBMForecast:
                     static_interaction_cols=static_interaction_cols,
                 )
                 all_rows_by_h[h].extend(rows)
+
+        # Add per-item StatsForecast features (Croston/ADIDA/ETS/Theta)
+        sf_feats = _build_statsforecast_features(base, max_h=int(horizon), season_length=12)
+        if not sf_feats.empty:
+            sf_feats = sf_feats.rename(columns={"ds": "forecast_ds"})
+            for h in range(1, int(horizon) + 1):
+                rows = all_rows_by_h.get(h) or []
+                if not rows:
+                    continue
+                df_h = pd.DataFrame(rows)
+                df_h = df_h.merge(sf_feats, on=["unique_id", "forecast_ds"], how="left")
+                df_h = df_h.fillna(0.0)
+                all_rows_by_h[h] = df_h.to_dict(orient="records")
 
         # Train one model per horizon
         artifact_root = os.path.join(self.store.customer_dir(), "artifacts", model_version)
@@ -732,6 +880,7 @@ class LightGBMForecast:
         occ_model: Any | None = None
         if occ_rows:
             occ_df = pd.DataFrame(occ_rows)
+            occ_df = _add_sample_weights(occ_df, weight_map)
             y_occ_src = occ_df["y_orig"] if "y_orig" in occ_df.columns else occ_df["y"]
             y_occ = (pd.to_numeric(y_occ_src, errors="coerce").fillna(0.0).to_numpy(dtype=float) > 0.0).astype(int)
             is_val_occ = pd.to_datetime(occ_df["forecast_ds"]) >= cutoff
@@ -746,6 +895,9 @@ class LightGBMForecast:
             y_occ_train = y_occ[~is_val_occ]
             X_occ_val = X_occ[is_val_occ]
             y_occ_val = y_occ[is_val_occ]
+            w_occ = occ_df["sample_weight"].to_numpy(dtype=float)
+            w_occ_train = w_occ[~is_val_occ]
+            w_occ_val = w_occ[is_val_occ]
 
             if len(X_occ_train) >= 50 and y_occ_train.sum() > 0:
                 pos = float(y_occ_train.sum())
@@ -769,6 +921,7 @@ class LightGBMForecast:
                 dtrain_occ = lgb.Dataset(
                     X_occ_train,
                     label=y_occ_train,
+                    weight=w_occ_train,
                     categorical_feature=[c for c in cat_cols if c in X_occ_train.columns],
                     free_raw_data=False,
                 )
@@ -778,6 +931,7 @@ class LightGBMForecast:
                     dval_occ = lgb.Dataset(
                         X_occ_val,
                         label=y_occ_val,
+                        weight=w_occ_val,
                         categorical_feature=[c for c in cat_cols if c in X_occ_val.columns],
                         free_raw_data=False,
                     )
@@ -812,6 +966,7 @@ class LightGBMForecast:
                 )
 
             df = pd.DataFrame(rows)
+            df = _add_sample_weights(df, weight_map)
             # Keep the label name as y
             y_target = df["y"].to_numpy(dtype=float)
 
@@ -831,13 +986,15 @@ class LightGBMForecast:
             y_train = y_target[~is_val]
             X_val = X[is_val]
             y_val = y_target[is_val]
+            w_all = df["sample_weight"].to_numpy(dtype=float)
+            w_train = w_all[~is_val]
+            w_val = w_all[is_val]
 
             if len(X_train) < 50:
                 raise ValueError("Not enough training rows to fit LightGBM. Provide more history or more items.")
 
             if detrend_method == "none":
-                all_nonneg = bool(np.all(y_train >= 0) and np.all(y_val >= 0))
-                objective = "poisson" if all_nonneg else "regression"
+                objective = "tweedie"
             else:
                 # Detrended targets can be negative; use regression.
                 objective = "regression"
@@ -855,12 +1012,26 @@ class LightGBMForecast:
                 "seed": 42,
                 "verbosity": -1,
             }
+            if objective == "tweedie":
+                params["tweedie_variance_power"] = 1.3
 
-            dtrain = lgb.Dataset(X_train, label=y_train, categorical_feature=[c for c in cat_cols if c in X_train.columns], free_raw_data=False)
+            dtrain = lgb.Dataset(
+                X_train,
+                label=y_train,
+                weight=w_train,
+                categorical_feature=[c for c in cat_cols if c in X_train.columns],
+                free_raw_data=False,
+            )
             valid_sets = [dtrain]
             valid_names = ["train"]
             if len(X_val) > 0:
-                dval = lgb.Dataset(X_val, label=y_val, categorical_feature=[c for c in cat_cols if c in X_val.columns], free_raw_data=False)
+                dval = lgb.Dataset(
+                    X_val,
+                    label=y_val,
+                    weight=w_val,
+                    categorical_feature=[c for c in cat_cols if c in X_val.columns],
+                    free_raw_data=False,
+                )
                 valid_sets.append(dval)
                 valid_names.append("val")
 
@@ -879,6 +1050,7 @@ class LightGBMForecast:
             nz_mask = pd.to_numeric(df.get("y_orig", df["y"]), errors="coerce").fillna(0.0) > 0.0
             if bool(nz_mask.any()):
                 df_nz = df.loc[nz_mask].copy()
+                df_nz = _add_sample_weights(df_nz, weight_map)
                 if len(df_nz) >= 50:
                     y_nz = df_nz["y"].to_numpy(dtype=float)
                     is_val_nz = pd.to_datetime(df_nz["forecast_ds"]) >= cutoff
@@ -892,16 +1064,21 @@ class LightGBMForecast:
                     y_nz_train = y_nz[~is_val_nz]
                     X_nz_val = X_nz[is_val_nz]
                     y_nz_val = y_nz[is_val_nz]
+                    w_nz = df_nz["sample_weight"].to_numpy(dtype=float)
+                    w_nz_train = w_nz[~is_val_nz]
+                    w_nz_val = w_nz[is_val_nz]
 
-                    all_nonneg_nz = bool(np.all(y_nz_train >= 0) and np.all(y_nz_val >= 0))
-                    objective_nz = "poisson" if (detrend_method == "none" and all_nonneg_nz) else "regression"
+                    objective_nz = "tweedie" if detrend_method == "none" else "regression"
                     params_nz = dict(params)
                     params_nz["objective"] = objective_nz
                     params_nz["metric"] = "l2"
+                    if objective_nz == "tweedie":
+                        params_nz["tweedie_variance_power"] = 1.3
 
                     dtrain_nz = lgb.Dataset(
                         X_nz_train,
                         label=y_nz_train,
+                        weight=w_nz_train,
                         categorical_feature=[c for c in cat_cols if c in X_nz_train.columns],
                         free_raw_data=False,
                     )
@@ -911,6 +1088,7 @@ class LightGBMForecast:
                         dval_nz = lgb.Dataset(
                             X_nz_val,
                             label=y_nz_val,
+                            weight=w_nz_val,
                             categorical_feature=[c for c in cat_cols if c in X_nz_val.columns],
                             free_raw_data=False,
                         )
@@ -1024,6 +1202,10 @@ class LightGBMForecast:
             "categorical_columns": cat_cols,
             "category_mappings": mappings,
             "feature_columns": feature_cols,
+            "stat_feature_columns": ["sf_croston_optimized", "sf_adida", "sf_auto_ets", "sf_theta"],
+            "amount_objective": "tweedie" if detrend_method == "none" else "regression",
+            "tweedie_variance_power": 1.3,
+            "sample_weighting": "inverse_demand",
         }
         spec_path = os.path.join(artifact_root, "feature_spec.json")
         with open(spec_path, "w", encoding="utf-8") as f:
@@ -1278,6 +1460,14 @@ class LightGBMForecast:
                 s, c = _month_sin_cos(m)
                 r["month_sin"] = s
                 r["month_cos"] = c
+                qs, qc = _quarter_sin_cos(int(r["quarter"]))
+                r["quarter_sin"] = qs
+                r["quarter_cos"] = qc
+                r["year_idx"] = float(forecast_ds.year - pd.Timestamp(ds_arr[0]).year)
+                qs, qc = _quarter_sin_cos(int(r["quarter"]))
+                r["quarter_sin"] = qs
+                r["quarter_cos"] = qc
+                r["year_idx"] = float(forecast_ds.year - pd.Timestamp(ds_arr[0]).year)
                 if static_interaction_cols:
                     for col in static_interaction_cols:
                         r[f"{col}_month_sin"] = 0.0
@@ -1445,6 +1635,7 @@ class LightGBMForecast:
         feature_cols: list[str] = list(spec.get("feature_columns") or [])
         exo_cols: list[str] = list(spec.get("exogenous_columns") or [])
         static_cols: list[str] = list(spec.get("static_columns") or [])
+        stat_feature_cols: list[str] = list(spec.get("stat_feature_columns") or [])
         static_interaction_cols: list[str] = list(spec.get("static_interaction_columns") or [])
         cat_cols: list[str] = list(spec.get("categorical_columns") or [])
         mappings: dict[str, dict[str, int]] = dict(spec.get("category_mappings") or {})
@@ -1495,6 +1686,9 @@ class LightGBMForecast:
         cap_nonzero_threshold = 0.25
         cap_multiplier = 2.0
         cap_small_floor = 0.0
+
+        sf_future = _build_statsforecast_future_features(base, max_h=int(max(horizons or [1])), season_length=12)
+        sf_future = sf_future.rename(columns={"ds": "forecast_ds"})
 
         # Load models
         boosters: dict[int, Any] = {}
@@ -1649,6 +1843,17 @@ class LightGBMForecast:
 
                 for k, v in static.items():
                     r[k] = v
+
+                if not sf_future.empty:
+                    match = sf_future[(sf_future["unique_id"] == str(uid)) & (sf_future["forecast_ds"] == forecast_ds)]
+                    if not match.empty:
+                        row_vals = match.iloc[0].to_dict()
+                        for k in stat_feature_cols:
+                            if k in row_vals:
+                                r[k] = row_vals[k]
+                    else:
+                        for k in stat_feature_cols:
+                            r[k] = 0.0
 
                 X = pd.DataFrame([r])
                 X["unique_id"] = X["unique_id"].astype(str)
