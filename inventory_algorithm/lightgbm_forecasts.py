@@ -1900,6 +1900,8 @@ class LightGBMForecast:
                 month_rate = float(cap_stats.get("nonzero_rate", 1.0)) if cap_stats else 1.0
                 run_length = float(_nonzero_run_length(y_orig))
                 run_penalty = float(np.exp(-run_length / 6.0))
+                if archetype == "seasonal" and month_rate >= 0.3:
+                    run_penalty = max(run_penalty, 0.7)
 
                 p_effective = float(np.clip(p_nonzero * max(0.05, month_rate) * run_penalty, 0.0, 1.0))
                 p_min = max(0.05, 0.5 * month_rate)
