@@ -768,16 +768,6 @@ class LightGBMForecast:
                 else:
                     base = base.merge(wide, on=["ds"], how="left")
 
-        # Apply target encodings for static fields
-        if te_cols and te_maps:
-            for col in te_cols:
-                if col not in base.columns:
-                    continue
-                series = base[col].astype(str).fillna("")
-                mapping = dict((te_maps.get(col) or {}).get("mapping") or {})
-                global_mean = float((te_maps.get(col) or {}).get("__global__", 0.0))
-                base[f"{col}_te"] = series.map(mapping).fillna(global_mean).astype(float)
-
         # Determine exogenous columns from wide data
         base_cols = {"item_id", "unique_id", "ds", "y"}
         if exogenous_columns is None:
