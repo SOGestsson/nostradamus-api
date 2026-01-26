@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Callable, Iterable
@@ -567,6 +568,74 @@ def _apply_target_encodings(
     return out
 
 
+def _tokenize_name(value: str) -> list[str]:
+    if not value:
+        return []
+    return [t for t in re.split(r"[^a-z0-9]+", value.lower()) if t]
+
+
+def _add_name_token_features(
+    base: pd.DataFrame,
+    *,
+    name_col: str = "name",
+    n_buckets: int = 16,
+) -> tuple[pd.DataFrame, list[str]]:
+    if base is None or base.empty or name_col not in base.columns:
+        return base, []
+    df = base.copy()
+    feature_cols: list[str] = [f"name_tok_{i}" for i in range(int(n_buckets))]
+    for c in feature_cols:
+        df[c] = 0.0
+    for idx, raw in enumerate(df[name_col].astype(str).fillna("")):
+        tokens = _tokenize_name(raw)
+        if not tokens:
+            continue
+        buckets = [hash(t) % int(n_buckets) for t in tokens]
+        for b in buckets:
+            df.iat[idx, df.columns.get_loc(f"name_tok_{b}")] += 1.0
+    return df, feature_cols
+
+
+def _build_name_clusters(
+    base: pd.DataFrame,
+    *,
+    name_col: str = "name",
+) -> tuple[dict[str, Any], int]:
+    if base is None or base.empty or name_col not in base.columns:
+        return {"__default__": -1, "mapping": {}}, 0
+    names = base[name_col].astype(str).fillna("").unique().tolist()
+    names = [n for n in names if n]
+    if len(names) < 3:
+        return {"__default__": -1, "mapping": {}}, 0
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
+        from sklearn.cluster import KMeans  # type: ignore
+    except Exception:
+        return {"__default__": -1, "mapping": {}}, 0
+    k = int(max(2, min(20, np.sqrt(len(names)))))
+    vectorizer = TfidfVectorizer(min_df=1, max_df=0.95, ngram_range=(1, 2))
+    X = vectorizer.fit_transform(names)
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(X)
+    mapping = {str(n): int(lbl) for n, lbl in zip(names, labels)}
+    return {"__default__": -1, "mapping": mapping}, k
+
+
+def _apply_name_cluster(
+    base: pd.DataFrame,
+    cluster_map: dict[str, Any],
+    *,
+    name_col: str = "name",
+) -> pd.DataFrame:
+    if base is None or base.empty or name_col not in base.columns:
+        return base
+    df = base.copy()
+    mapping = dict((cluster_map or {}).get("mapping") or {})
+    default = int((cluster_map or {}).get("__default__", -1))
+    df["name_cluster_id"] = df[name_col].astype(str).fillna("").map(mapping).fillna(default).astype(int)
+    return df
+
+
 def _build_statsforecast_features(
     base: pd.DataFrame,
     *,
@@ -756,6 +825,16 @@ class LightGBMForecast:
             base["item_id"] = base["item_id"].astype(str)
             base = base.merge(attrs, on="item_id", how="left", suffixes=("", "_attr"))
             static_cols = [c for c in attrs.columns if c != "item_id"]
+
+        # Name-based features: token buckets + TF-IDF cluster id
+        name_cluster_map, name_cluster_k = _build_name_clusters(base, name_col="name")
+        base = _apply_name_cluster(base, name_cluster_map, name_col="name")
+        base, name_token_cols = _add_name_token_features(base, name_col="name", n_buckets=16)
+        if "name_cluster_id" not in static_cols:
+            static_cols.append("name_cluster_id")
+        for c in name_token_cols:
+            if c not in static_cols:
+                static_cols.append(c)
 
 
         # Merge long drivers (optional) → wide monthly
@@ -1283,6 +1362,10 @@ class LightGBMForecast:
             "target_encoding_columns": te_cols,
             "target_encoding_maps": te_maps,
             "target_encoding_prior": 10.0,
+            "name_token_columns": name_token_cols,
+            "name_token_buckets": 16,
+            "name_cluster_map": name_cluster_map,
+            "name_cluster_k": name_cluster_k,
         }
         spec_path = os.path.join(artifact_root, "feature_spec.json")
         with open(spec_path, "w", encoding="utf-8") as f:
@@ -1716,6 +1799,9 @@ class LightGBMForecast:
         static_interaction_cols: list[str] = list(spec.get("static_interaction_columns") or [])
         te_cols: list[str] = list(spec.get("target_encoding_columns") or [])
         te_maps: dict[str, Any] = dict(spec.get("target_encoding_maps") or {})
+        name_token_cols: list[str] = list(spec.get("name_token_columns") or [])
+        name_token_buckets = int(spec.get("name_token_buckets") or len(name_token_cols) or 16)
+        name_cluster_map: dict[str, Any] = dict(spec.get("name_cluster_map") or {})
         cat_cols: list[str] = list(spec.get("categorical_columns") or [])
         mappings: dict[str, dict[str, int]] = dict(spec.get("category_mappings") or {})
         lags: list[int] = list(spec.get("lags") or [1, 2, 3, 6, 12, 24])
@@ -1753,6 +1839,14 @@ class LightGBMForecast:
                     base = base.merge(wide, on=["item_id", "ds"], how="left")
                 else:
                     base = base.merge(wide, on=["ds"], how="left")
+
+        # Apply target encodings and name features for inference
+        if te_cols and te_maps:
+            base = _apply_target_encodings(base, te_cols, te_maps)
+        if name_cluster_map:
+            base = _apply_name_cluster(base, name_cluster_map, name_col="name")
+        if name_token_cols:
+            base, _ = _add_name_token_features(base, name_col="name", n_buckets=name_token_buckets)
 
         if exogenous_columns is None:
             exogenous_columns = [c for c in exo_cols if c in base.columns]
@@ -2151,6 +2245,11 @@ class LightGBMForecast:
                     yhat = min(yhat, cap)
                     adjustments["cap"] = cap
                     adjustments["cap_mult"] = cap_mult
+
+                # Final non-negative clamp
+                if yhat < 0.0:
+                    yhat = 0.0
+                    adjustments["clamped_nonneg"] = True
 
                 forecasts.append({"unique_id": str(uid), "ds": forecast_ds, "yhat": yhat, "adjustments": adjustments})
 

@@ -320,6 +320,27 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
     """
 
     try:
+        # #region agent log
+        try:
+            with open("/Users/palmipetursson/Dropbox/Nostradamus/nostradamus-api/.cursor/debug.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "sessionId": "debug-session",
+                    "runId": "lightgbm_batch",
+                    "hypothesisId": "H1",
+                    "location": "api/v1/lightgbm.py:batch:entry",
+                    "message": "Batch request received",
+                    "data": {
+                        "customer_id": request.customer_id,
+                        "status": request.status,
+                        "model_version": request.model_version,
+                        "store_root": request.store_root,
+                        "sim_rows": len(request.sim_input_his or []),
+                    },
+                    "timestamp": int(time.time() * 1000),
+                }) + "\n")
+        except Exception:
+            pass
+        # #endregion
         df_hist = pd.DataFrame(request.sim_input_his)
         df_items = pd.DataFrame(request.item_attributes) if request.item_attributes else None
         df_drivers = pd.DataFrame(request.external_drivers) if request.external_drivers else None
@@ -332,6 +353,26 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
             model_version = forecaster.store.get_active_model_version(status=request.status)
         if not model_version:
             raise ValueError(f"No active model version found for status='{request.status}'")
+
+        # #region agent log
+        try:
+            with open("/Users/palmipetursson/Dropbox/Nostradamus/nostradamus-api/.cursor/debug.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "sessionId": "debug-session",
+                    "runId": "lightgbm_batch",
+                    "hypothesisId": "H2",
+                    "location": "api/v1/lightgbm.py:batch:model_version",
+                    "message": "Resolved model_version for batch",
+                    "data": {
+                        "resolved_model_version": model_version,
+                        "status": request.status,
+                        "store_root": request.store_root or _default_store_root(),
+                    },
+                    "timestamp": int(time.time() * 1000),
+                }) + "\n")
+        except Exception:
+            pass
+        # #endregion
 
         unique_ids = [str(x) for x in df_hist["item_id"].astype(str).unique().tolist()]
         eligibility = forecaster.store.get_eligibility(model_version=model_version, unique_ids=unique_ids)
