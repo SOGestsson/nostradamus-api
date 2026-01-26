@@ -636,6 +636,27 @@ def _apply_name_cluster(
     return df
 
 
+def _name_token_bucket_vocab(
+    base: pd.DataFrame,
+    *,
+    name_col: str = "name",
+    n_buckets: int = 16,
+    top_k: int = 10,
+) -> dict[str, list[str]]:
+    if base is None or base.empty or name_col not in base.columns:
+        return {}
+    counts: dict[int, dict[str, int]] = {i: {} for i in range(int(n_buckets))}
+    for raw in base[name_col].astype(str).fillna(""):
+        for tok in _tokenize_name(raw):
+            b = hash(tok) % int(n_buckets)
+            counts[b][tok] = counts[b].get(tok, 0) + 1
+    vocab: dict[str, list[str]] = {}
+    for b, tok_counts in counts.items():
+        top = sorted(tok_counts.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+        vocab[f"name_tok_{b}"] = [t for t, _ in top]
+    return vocab
+
+
 def _build_statsforecast_features(
     base: pd.DataFrame,
     *,
@@ -830,6 +851,7 @@ class LightGBMForecast:
         name_cluster_map, name_cluster_k = _build_name_clusters(base, name_col="name")
         base = _apply_name_cluster(base, name_cluster_map, name_col="name")
         base, name_token_cols = _add_name_token_features(base, name_col="name", n_buckets=16)
+        name_token_vocab = _name_token_bucket_vocab(base, name_col="name", n_buckets=16, top_k=10)
         if "name_cluster_id" not in static_cols:
             static_cols.append("name_cluster_id")
         for c in name_token_cols:
@@ -1364,6 +1386,7 @@ class LightGBMForecast:
             "target_encoding_prior": 10.0,
             "name_token_columns": name_token_cols,
             "name_token_buckets": 16,
+            "name_token_vocab": name_token_vocab,
             "name_cluster_map": name_cluster_map,
             "name_cluster_k": name_cluster_k,
         }
