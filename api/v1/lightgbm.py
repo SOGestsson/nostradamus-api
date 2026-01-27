@@ -371,9 +371,51 @@ def train_lightgbm_async(
 
 @router.get("/jobs/{job_id}")
 def get_lightgbm_job(job_id: str):
+    # #region agent log
+    _debug_log({
+        "sessionId": "debug-session",
+        "runId": "lightgbm_job_get",
+        "hypothesisId": "J5",
+        "location": "api/v1/lightgbm.py:get_job:entry",
+        "message": "Job status request received",
+        "data": {
+            "job_id": job_id,
+            "redis_enabled": bool(_redis_sync),
+        },
+        "timestamp": int(time.time() * 1000),
+    })
+    # #endregion
     job = _get_job(job_id)
     if not job:
+        # #region agent log
+        _debug_log({
+            "sessionId": "debug-session",
+            "runId": "lightgbm_job_get",
+            "hypothesisId": "J6",
+            "location": "api/v1/lightgbm.py:get_job:not_found",
+            "message": "Job not found",
+            "data": {
+                "job_id": job_id,
+            },
+            "timestamp": int(time.time() * 1000),
+        })
+        # #endregion
         raise HTTPException(status_code=404, detail='job not found')
+    # #region agent log
+    _debug_log({
+        "sessionId": "debug-session",
+        "runId": "lightgbm_job_get",
+        "hypothesisId": "J7",
+        "location": "api/v1/lightgbm.py:get_job:success",
+        "message": "Job status returned",
+        "data": {
+            "job_id": job_id,
+            "status": job.get("status"),
+            "phase": job.get("phase"),
+        },
+        "timestamp": int(time.time() * 1000),
+    })
+    # #endregion
     return job
 
 
