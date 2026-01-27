@@ -550,9 +550,25 @@ def get_lightgbm_diagnostics(
             unique_ids = None
 
         explain = forecaster.store.get_explain_summary(model_version=mv, unique_ids=unique_ids, limit=int(limit))
+        name_token_vocab = None
+        name_token_columns = None
+        name_token_buckets = None
+        name_cluster_k = None
+        try:
+            _, spec = forecaster._load_spec(mv)
+            name_token_vocab = spec.get("name_token_vocab")
+            name_token_columns = spec.get("name_token_columns")
+            name_token_buckets = spec.get("name_token_buckets")
+            name_cluster_k = spec.get("name_cluster_k")
+        except Exception:
+            pass
         return {
             "customer_id": customer_id,
             "model_version": mv,
+            "name_token_vocab": name_token_vocab,
+            "name_token_columns": name_token_columns,
+            "name_token_buckets": name_token_buckets,
+            "name_cluster_k": name_cluster_k,
             "items": [
                 {
                     "item_id": uid,
