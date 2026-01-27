@@ -28,6 +28,14 @@ from inventory_algorithm.lightgbm_forecasts import LightGBMForecast
 
 router = APIRouter()
 
+
+def _debug_log(payload: dict[str, Any]) -> None:
+    try:
+        with open("/Users/palmipetursson/Dropbox/Nostradamus/nostradamus-api/.cursor/debug.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception:
+        pass
+
 # Background job store (Redis preferred; in-memory fallback)
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
 try:
@@ -192,6 +200,25 @@ def train_lightgbm_async(
     """
 
     job_id = str(uuid.uuid4())
+    # #region agent log
+    _debug_log({
+        "sessionId": "debug-session",
+        "runId": "lightgbm_train_async",
+        "hypothesisId": "J1",
+        "location": "api/v1/lightgbm.py:train_async:entry",
+        "message": "Train_async request received",
+        "data": {
+            "job_id": job_id,
+            "customer_id": request.customer_id,
+            "status": request.status,
+            "forecast_periods": int(request.forecast_periods),
+            "sim_rows": len(request.sim_input_his or []),
+            "item_attr_rows": len(request.item_attributes or []),
+            "external_driver_rows": len(request.external_drivers or []),
+        },
+        "timestamp": int(time.time() * 1000),
+    })
+    # #endregion
     _set_job(
         job_id,
         {
@@ -213,6 +240,23 @@ def train_lightgbm_async(
                 df_hist["item_id"] = df_hist["item_id"].astype(str)
             df_items = pd.DataFrame(request.item_attributes) if request.item_attributes else None
             df_drivers = pd.DataFrame(request.external_drivers) if request.external_drivers else None
+            # #region agent log
+            _debug_log({
+                "sessionId": "debug-session",
+                "runId": "lightgbm_train_async",
+                "hypothesisId": "J2",
+                "location": "api/v1/lightgbm.py:train_async:runner_df",
+                "message": "Train_async built dataframes",
+                "data": {
+                    "job_id": job_id,
+                    "hist_rows": int(getattr(df_hist, "shape", [0, 0])[0]),
+                    "hist_cols": int(getattr(df_hist, "shape", [0, 0])[1]),
+                    "item_rows": int(getattr(df_items, "shape", [0, 0])[0]) if df_items is not None else 0,
+                    "driver_rows": int(getattr(df_drivers, "shape", [0, 0])[0]) if df_drivers is not None else 0,
+                },
+                "timestamp": int(time.time() * 1000),
+            })
+            # #endregion
 
             forecaster = LightGBMForecast(store_root=request.store_root or _default_store_root(), customer_id=request.customer_id)
 
@@ -275,6 +319,20 @@ def train_lightgbm_async(
                 )
 
         except Exception as e:
+            # #region agent log
+            _debug_log({
+                "sessionId": "debug-session",
+                "runId": "lightgbm_train_async",
+                "hypothesisId": "J3",
+                "location": "api/v1/lightgbm.py:train_async:runner_error",
+                "message": "Train_async runner failed",
+                "data": {
+                    "job_id": job_id,
+                    "error": str(e),
+                },
+                "timestamp": int(time.time() * 1000),
+            })
+            # #endregion
             _update_job(job_id, status='failed', phase='failed', finished_at=_now_ts(), error=str(e), traceback=traceback.format_exc())
             if webhook_url:
                 _send_webhook_with_retries(
@@ -290,6 +348,20 @@ def train_lightgbm_async(
 
     background_tasks.add_task(_runner)
 
+    # #region agent log
+    _debug_log({
+        "sessionId": "debug-session",
+        "runId": "lightgbm_train_async",
+        "hypothesisId": "J4",
+        "location": "api/v1/lightgbm.py:train_async:return",
+        "message": "Train_async response queued",
+        "data": {
+            "job_id": job_id,
+            "status_url": f"/api/v1/lightgbm/jobs/{job_id}",
+        },
+        "timestamp": int(time.time() * 1000),
+    })
+    # #endregion
     return {
         'job_id': job_id,
         'status': 'queued',
