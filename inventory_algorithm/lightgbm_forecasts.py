@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -574,6 +575,13 @@ def _tokenize_name(value: str) -> list[str]:
     return [t for t in re.split(r"[^a-z0-9]+", value.lower()) if t]
 
 
+def _stable_token_bucket(token: str, n_buckets: int) -> int:
+    if not token:
+        return 0
+    digest = hashlib.md5(token.encode("utf-8")).hexdigest()
+    return int(digest, 16) % int(n_buckets)
+
+
 def _add_name_token_features(
     base: pd.DataFrame,
     *,
@@ -590,7 +598,7 @@ def _add_name_token_features(
         tokens = _tokenize_name(raw)
         if not tokens:
             continue
-        buckets = [hash(t) % int(n_buckets) for t in tokens]
+        buckets = [_stable_token_bucket(t, n_buckets) for t in tokens]
         for b in buckets:
             df.iat[idx, df.columns.get_loc(f"name_tok_{b}")] += 1.0
     return df, feature_cols
@@ -648,7 +656,7 @@ def _name_token_bucket_vocab(
     counts: dict[int, dict[str, int]] = {i: {} for i in range(int(n_buckets))}
     for raw in base[name_col].astype(str).fillna(""):
         for tok in _tokenize_name(raw):
-            b = hash(tok) % int(n_buckets)
+            b = _stable_token_bucket(tok, n_buckets)
             counts[b][tok] = counts[b].get(tok, 0) + 1
     vocab: dict[str, list[str]] = {}
     for b, tok_counts in counts.items():
@@ -922,6 +930,24 @@ class LightGBMForecast:
                 w_med = 1.0
             for uid in list(weight_map.keys()):
                 weight_map[uid] = float(np.clip(weight_map[uid] / w_med, 0.5, 3.0))
+
+        # Archetype assignment for residual pooling (computed on full history)
+        archetype_by_uid: dict[str, str] = {}
+        for uid, grp in base.groupby("unique_id", sort=False):
+            grp = grp.sort_values("ds", kind="mergesort")
+            y_hist = grp["y"].to_numpy(dtype=float)
+            ds_hist = grp["ds"].to_numpy()
+            months = np.array([pd.Timestamp(d).month for d in ds_hist], dtype=int)
+            vals_3y = y_hist[-36:] if len(y_hist) > 36 else y_hist
+            months_3y = months[-36:] if len(months) > 36 else months
+            same_month_nonzero = []
+            for m in range(1, 13):
+                hist_vals = vals_3y[months_3y == m]
+                same_month_nonzero.append(float(np.mean(hist_vals > 0.0)) if len(hist_vals) else 0.0)
+            seasonal_strength = float(max(same_month_nonzero or [0.0]))
+            overall_nonzero_rate = float(np.mean(vals_3y > 0.0)) if len(vals_3y) else 0.0
+            cv_val = _cv(vals_3y if len(vals_3y) else y_hist)
+            archetype_by_uid[str(uid)] = _archetype(overall_nonzero_rate, cv_val, seasonal_strength)
         for uid, grp in base.groupby("unique_id", sort=False):
             grp = grp.sort_values("ds", kind="mergesort")
             ds = grp["ds"].to_numpy()
@@ -1034,6 +1060,7 @@ class LightGBMForecast:
 
         # For eligibility: evaluate horizon 1 per-item
         per_item_eval: dict[str, dict[str, float]] = {}
+        cv_residual_rows: list[dict[str, Any]] = []
 
         # Resolve feature columns once from the first non-empty horizon
         if feature_cols is None:
@@ -1304,9 +1331,37 @@ class LightGBMForecast:
                     trend_val = df.loc[is_val, "trend_model"].to_numpy(dtype=float)
                     yhat_orig = np.maximum(0.0, np.expm1(yhat_model + trend_val))
 
-                yhat_orig = yhat_orig * p_nonzero
+                yhat_final = yhat_orig * p_nonzero
 
-                metrics_summary[f"wape_val_h{h}"] = _wape(y_true_orig, yhat_orig)
+                metrics_summary[f"wape_val_h{h}"] = _wape(y_true_orig, yhat_final)
+
+                # Capture residuals for pooled upper-bound calibration (validation-only)
+                if "forecast_ds" in df.columns:
+                    val_ds = pd.to_datetime(df.loc[is_val, "forecast_ds"], errors="coerce")
+                else:
+                    val_ds = pd.Series([pd.NaT] * len(y_true_orig))
+                val_uids = df.loc[is_val, "unique_id"].astype(str).to_numpy()
+                for i in range(len(y_true_orig)):
+                    ds_val = val_ds.iloc[i]
+                    if pd.isna(ds_val):
+                        continue
+                    y_true = float(y_true_orig[i])
+                    yhat_i = float(yhat_final[i])
+                    residual = y_true - yhat_i
+                    cv_residual_rows.append(
+                        {
+                            "model_version": model_version,
+                            "unique_id": str(val_uids[i]),
+                            "ds": ds_val.date().isoformat(),
+                            "horizon": int(h),
+                            "y": y_true,
+                            "yhat": yhat_i,
+                            "residual": float(residual),
+                            "positive_excess": float(max(0.0, residual)),
+                            "archetype": archetype_by_uid.get(str(val_uids[i]), "unknown"),
+                            "fold_id": 0,
+                        }
+                    )
 
                 if h == 1:
                     # per-item eval for eligibility (h=1)
@@ -1355,6 +1410,53 @@ class LightGBMForecast:
 
         assert feature_cols is not None
 
+        # Build pooled residual quantiles (upper bound calibration)
+        residual_quantile_rows: list[dict[str, Any]] = []
+        if cv_residual_rows:
+            df_res = pd.DataFrame(cv_residual_rows)
+            if not df_res.empty:
+                def _coerce_h(val: Any) -> int:
+                    if isinstance(val, (tuple, list)) and len(val) == 1:
+                        val = val[0]
+                    try:
+                        return int(val)
+                    except Exception:
+                        return 0
+
+                for (arch, h), g in df_res.groupby(["archetype", "horizon"], dropna=False):
+                    vals = g["positive_excess"].to_numpy(dtype=float)
+                    vals = vals[np.isfinite(vals)]
+                    if len(vals) == 0:
+                        continue
+                    q95 = float(np.quantile(vals, 0.95))
+                    residual_quantile_rows.append(
+                        {
+                            "model_version": model_version,
+                            "archetype": str(arch) if arch is not None else "unknown",
+                            "horizon": _coerce_h(h),
+                            "scale_bucket": None,
+                            "q95_excess": q95,
+                            "n": int(len(vals)),
+                        }
+                    )
+                # Global fallback per horizon
+                for h, g in df_res.groupby(["horizon"], dropna=False):
+                    vals = g["positive_excess"].to_numpy(dtype=float)
+                    vals = vals[np.isfinite(vals)]
+                    if len(vals) == 0:
+                        continue
+                    q95 = float(np.quantile(vals, 0.95))
+                    residual_quantile_rows.append(
+                        {
+                            "model_version": model_version,
+                            "archetype": "__global__",
+                            "horizon": _coerce_h(h),
+                            "scale_bucket": None,
+                            "q95_excess": q95,
+                            "n": int(len(vals)),
+                        }
+                    )
+
         if progress_hook:
             progress_hook({"phase": "writing_artifacts"})
 
@@ -1389,6 +1491,7 @@ class LightGBMForecast:
             "name_token_vocab": name_token_vocab,
             "name_cluster_map": name_cluster_map,
             "name_cluster_k": name_cluster_k,
+            "residual_quantiles": residual_quantile_rows
         }
         spec_path = os.path.join(artifact_root, "feature_spec.json")
         with open(spec_path, "w", encoding="utf-8") as f:
@@ -1430,6 +1533,16 @@ class LightGBMForecast:
                 git_sha=None,
             )
         )
+
+        # Persist CV residuals + pooled quantiles
+        try:
+            if cv_residual_rows:
+                self.store.insert_cv_residuals(cv_residual_rows)
+            if residual_quantile_rows:
+                self.store.upsert_residual_quantiles(residual_quantile_rows)
+        except Exception:
+            # Don't fail training if residual persistence fails.
+            pass
 
         # Write backtests + eligibility
         backtest_rows: list[dict[str, Any]] = []
@@ -1902,6 +2015,17 @@ class LightGBMForecast:
         if os.path.exists(occ_path):
             occ_model = lgb.Booster(model_file=occ_path)
 
+        residual_quantiles = self.store.get_residual_quantiles(model_version)
+        if not residual_quantiles:
+            spec_q = spec.get("residual_quantiles") or []
+            for r in spec_q:
+                arch = r.get("archetype")
+                h = r.get("horizon")
+                q = r.get("q95_excess")
+                if arch is None or h is None or q is None:
+                     continue
+                residual_quantiles[(str(arch), int(h))] = float(q)
+
         if not boosters:
             raise ValueError(f"No horizon models found under {artifact_root}")
 
@@ -2274,7 +2398,32 @@ class LightGBMForecast:
                     yhat = 0.0
                     adjustments["clamped_nonneg"] = True
 
-                forecasts.append({"unique_id": str(uid), "ds": forecast_ds, "yhat": yhat, "adjustments": adjustments})
+                # Upper 95% bound from pooled residuals (archetype + horizon)
+                q = residual_quantiles.get((archetype, int(h))) or residual_quantiles.get(("__global__", int(h)))
+                if q is None:
+                    # fallback: small uplift when calibration missing
+                    fallback_base = max(1.0, 0.3 * max(recent_level, 0.0), 0.2 * float(croston_mean))
+                    q95_excess = float(fallback_base)
+                    adjustments["q95_fallback"] = True
+                else:
+                    q95_excess = float(q)
+
+                upper_95 = float(max(yhat, yhat + q95_excess))
+
+                if "cap" in adjustments:
+                    upper_95 = float(min(upper_95, float(adjustments["cap"])))
+                if upper_95 < 0.0:
+                    upper_95 = 0.0
+
+                forecasts.append(
+                    {
+                        "unique_id": str(uid),
+                        "ds": forecast_ds,
+                        "yhat": yhat,
+                        "upper_95": upper_95,
+                        "adjustments": adjustments,
+                    }
+                )
 
         fcst = pd.DataFrame(forecasts)
         if not fcst.empty:
@@ -2282,7 +2431,10 @@ class LightGBMForecast:
             # Month-start semantics: 2026-01-01 represents the total for January 2026.
             fcst["ds"] = pd.to_datetime(fcst["ds"], errors="coerce").dt.to_period("M").dt.to_timestamp(how="start")
             fcst["day"] = pd.to_datetime(fcst["ds"]).dt.strftime("%Y-%m-%d")
-            fcst = fcst[["item_id", "day", "yhat"]]
+            cols = ["item_id", "day", "yhat"]
+            if "upper_95" in fcst.columns:
+                cols.append("upper_95")
+            fcst = fcst[cols]
 
         meta = {
             "model_version": model_version,

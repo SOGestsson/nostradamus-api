@@ -163,6 +163,39 @@ class DuckDBModelStore:
             );
             """
         )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cv_residuals (
+              customer_id TEXT NOT NULL,
+              model_version TEXT NOT NULL,
+              unique_id TEXT NOT NULL,
+              ds DATE NOT NULL,
+              horizon INTEGER NOT NULL,
+              y DOUBLE,
+              yhat DOUBLE,
+              residual DOUBLE,
+              positive_excess DOUBLE,
+              archetype TEXT,
+              fold_id INTEGER,
+              created_at TIMESTAMP NOT NULL
+            );
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS residual_quantiles (
+              customer_id TEXT NOT NULL,
+              model_version TEXT NOT NULL,
+              archetype TEXT NOT NULL,
+              horizon INTEGER NOT NULL,
+              scale_bucket TEXT,
+              q95_excess DOUBLE,
+              n INTEGER,
+              updated_at TIMESTAMP NOT NULL,
+              PRIMARY KEY (customer_id, model_version, archetype, horizon, scale_bucket)
+            );
+            """
+        )
 
     def create_model_version(self, row: ModelVersionRow) -> None:
         with self.connect() as con:
@@ -276,6 +309,90 @@ class DuckDBModelStore:
                 values,
             )
 
+    def insert_cv_residuals(self, rows: Iterable[dict[str, Any]]) -> None:
+        rows_list = list(rows)
+        if not rows_list:
+            return
+        now = datetime.now(UTC)
+        values = []
+        for r in rows_list:
+            values.append(
+                (
+                    self.customer_id,
+                    r["model_version"],
+                    str(r["unique_id"]),
+                    r["ds"],
+                    int(r["horizon"]),
+                    r.get("y"),
+                    r.get("yhat"),
+                    r.get("residual"),
+                    r.get("positive_excess"),
+                    r.get("archetype"),
+                    int(r.get("fold_id", 0)),
+                    now,
+                )
+            )
+        with self.connect() as con:
+            con.executemany(
+                """
+                INSERT INTO cv_residuals (
+                  customer_id, model_version, unique_id, ds, horizon,
+                  y, yhat, residual, positive_excess, archetype, fold_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                values,
+            )
+
+    def upsert_residual_quantiles(self, rows: Iterable[dict[str, Any]]) -> None:
+        rows_list = list(rows)
+        if not rows_list:
+            return
+        now = datetime.now(UTC)
+        values = []
+        for r in rows_list:
+            values.append(
+                (
+                    self.customer_id,
+                    r["model_version"],
+                    r["archetype"],
+                    int(r["horizon"]),
+                    r.get("scale_bucket"),
+                    r.get("q95_excess"),
+                    int(r.get("n", 0)),
+                    now,
+                )
+            )
+        with self.connect() as con:
+            con.executemany(
+                """
+                INSERT INTO residual_quantiles (
+                  customer_id, model_version, archetype, horizon, scale_bucket,
+                  q95_excess, n, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (customer_id, model_version, archetype, horizon, scale_bucket) DO UPDATE SET
+                  q95_excess=excluded.q95_excess,
+                  n=excluded.n,
+                  updated_at=excluded.updated_at;
+                """,
+                values,
+            )
+
+    def get_residual_quantiles(self, model_version: str) -> dict[tuple[str, int], float]:
+        with self.connect() as con:
+            res = con.execute(
+                """
+                SELECT archetype, horizon, q95_excess
+                FROM residual_quantiles
+                WHERE customer_id=? AND model_version=?;
+                """,
+                [self.customer_id, model_version],
+            ).fetchall()
+        out: dict[tuple[str, int], float] = {}
+        for archetype, horizon, q95_excess in res or []:
+            if archetype is None or horizon is None:
+                continue
+            out[(str(archetype), int(horizon))] = float(q95_excess or 0.0)
+        return out
     def upsert_eligibility(self, rows: Iterable[dict[str, Any]]) -> None:
         rows_list = list(rows)
         if not rows_list:
