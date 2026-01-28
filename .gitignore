@@ -30,6 +30,13 @@ Thumbs.db
 # Logs
 *.log
 
+# Process IDs
+*.pid
+
+# Model artifacts and stores (generated, large, customer-specific)
+nostradamus_store/
+*.duckdb
+
 # Data files (optional - remove if you want to commit them)
 # *.json
 # *.csv
