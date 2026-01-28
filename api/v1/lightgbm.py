@@ -630,6 +630,206 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
         raise HTTPException(status_code=500, detail=f"LightGBM forecast error: {str(e)}")
 
 
+@router.post("/batch_async")
+def batch_forecast_lightgbm_async(
+    request: LightGBMBatchForecastRequest,
+    background_tasks: BackgroundTasks,
+    webhook_url: str | None = None,
+):
+    """Start batch forecast as a background job.
+
+    Returns a `job_id` immediately; poll `/jobs/{job_id}` for progress.
+    Optionally sends a completion webhook.
+    """
+    job_id = str(uuid.uuid4())
+    
+    _set_job(
+        job_id,
+        {
+            'status': 'queued',
+            'phase': 'queued',
+            'started_at': _now_ts(),
+            'customer_id': request.customer_id,
+            'model_version': request.model_version,
+            'status_filter': request.status,
+        },
+    )
+
+    def _batch_runner() -> None:
+        try:
+            _update_job(job_id, status='running', phase='processing')
+
+            df_hist = pd.DataFrame(request.sim_input_his)
+            df_items = pd.DataFrame(request.item_attributes) if request.item_attributes else None
+            df_drivers = pd.DataFrame(request.external_drivers) if request.external_drivers else None
+
+            forecaster = LightGBMForecast(store_root=request.store_root or _default_store_root(), customer_id=request.customer_id)
+
+            # Resolve model version
+            model_version = request.model_version
+            if model_version is None:
+                model_version = forecaster.store.get_active_model_version(status=request.status)
+            if not model_version:
+                raise ValueError(f"No active model version found for status='{request.status}'")
+
+            _update_job(job_id, phase='forecasting', model_version=model_version)
+
+            unique_ids = [str(x) for x in df_hist["item_id"].astype(str).unique().tolist()]
+            eligibility = forecaster.store.get_eligibility(model_version=model_version, unique_ids=unique_ids)
+
+            # ML batch prediction for all; we'll decide per item whether to use it.
+            fcst_df, meta = forecaster.batch_forecast(
+                df_hist,
+                forecast_periods=request.forecast_periods,
+                freq=request.freq,
+                item_attributes=df_items,
+                drivers=df_drivers,
+                exogenous_columns=request.exogenous_columns,
+                model_version=model_version,
+                status=request.status,
+            )
+
+            _update_job(job_id, phase='formatting')
+
+            # Build naive fallback
+            df_hist["day"] = pd.to_datetime(df_hist["day"], errors="coerce")
+            df_hist = df_hist.dropna(subset=["item_id", "day", "actual_sale"])
+            df_hist["item_id"] = df_hist["item_id"].astype(str)
+            last_vals = (
+                df_hist.sort_values(["item_id", "day"], kind="mergesort")
+                .groupby("item_id", sort=False)
+                .tail(1)
+                .set_index("item_id")["actual_sale"]
+            )
+
+            # Convert ML results to per-item format
+            out: list[dict[str, Any]] = []
+            if fcst_df.empty:
+                fcst_df = pd.DataFrame(columns=["item_id", "day", "yhat", "upper_95"])
+
+            for item_id in unique_ids:
+                elig = eligibility.get(str(item_id)) or {}
+                ml_allowed = bool(elig.get("ml_allowed")) if elig.get("ml_allowed") is not None else False
+                winner = elig.get("winner_model") or ("lgbm_direct" if ml_allowed else "naive")
+                reason = elig.get("reason_code") or ("OK" if ml_allowed else "NO_ELIGIBILITY")
+                confidence = elig.get("confidence")
+
+                use_ml = ml_allowed and str(winner).startswith("lgbm")
+                if use_ml:
+                    item_fcst = fcst_df[fcst_df["item_id"].astype(str) == str(item_id)].sort_values("day")
+                    if len(item_fcst) == int(request.forecast_periods):
+                        yhat = item_fcst["yhat"].to_numpy(dtype=float).tolist()
+                        upper_95 = None
+                        if "upper_95" in item_fcst.columns:
+                            upper_95 = item_fcst["upper_95"].to_numpy(dtype=float).tolist()
+                        days = [
+                            pd.to_datetime(d).to_period("M").to_timestamp(how="start").strftime("%Y-%m-%d")
+                            for d in item_fcst["day"].tolist()
+                        ]
+                        adjustments_list = []
+                        if "adjustments" in item_fcst.columns:
+                            try:
+                                adjustments_list = [
+                                    (a if isinstance(a, dict) else {}) for a in item_fcst["adjustments"].tolist()
+                                ]
+                            except Exception:
+                                adjustments_list = []
+                        out.append(
+                            {
+                                "item_id": item_id,
+                                "forecast": yhat,
+                                "upper_95": upper_95,
+                                "forecast_dates": days,
+                                "model_used": str(winner),
+                                "reason_code": reason,
+                                "confidence": confidence,
+                                "adjustments": adjustments_list,
+                            }
+                        )
+                        continue
+
+                    reason = "ML_NO_PREDICTION"
+
+                last = float(last_vals.get(str(item_id), 0.0)) if len(last_vals) else 0.0
+                last_day = df_hist[df_hist["item_id"].astype(str) == str(item_id)]["day"].max()
+                if pd.isna(last_day):
+                    days = []
+                else:
+                    start = pd.to_datetime(last_day).to_period('M').to_timestamp(how='start')
+                    future = pd.date_range(start=start + pd.offsets.MonthBegin(1), periods=request.forecast_periods, freq='MS')
+                    days = [d.strftime("%Y-%m-%d") for d in future]
+
+                out.append(
+                    {
+                        "item_id": item_id,
+                        "forecast": [last] * int(request.forecast_periods),
+                        "forecast_dates": days,
+                        "model_used": "naive",
+                        "reason_code": reason,
+                        "confidence": confidence,
+                        "skipped": True,
+                    }
+                )
+
+            result = {
+                "forecasts": out,
+                "total_items": len(unique_ids),
+                "forecast_type": "batch",
+                "periods": request.forecast_periods,
+                "freq": meta.get("freq"),
+                "model_version": meta.get("model_version"),
+            }
+
+            _update_job(
+                job_id,
+                status='finished',
+                phase='done',
+                finished_at=_now_ts(),
+                result=result,
+            )
+
+            if webhook_url:
+                _send_webhook_with_retries(
+                    job_id,
+                    webhook_url,
+                    {
+                        'job_id': job_id,
+                        'status': 'finished',
+                        'customer_id': request.customer_id,
+                        'result': result,
+                    },
+                )
+
+        except Exception as e:
+            _update_job(
+                job_id,
+                status='failed',
+                phase='failed',
+                finished_at=_now_ts(),
+                error=str(e),
+                traceback=traceback.format_exc(),
+            )
+            if webhook_url:
+                _send_webhook_with_retries(
+                    job_id,
+                    webhook_url,
+                    {
+                        'job_id': job_id,
+                        'status': 'failed',
+                        'customer_id': request.customer_id,
+                        'error': str(e),
+                    },
+                )
+
+    background_tasks.add_task(_batch_runner)
+
+    return {
+        'job_id': job_id,
+        'status': 'queued',
+        'status_url': f"/api/v1/lightgbm/jobs/{job_id}",
+    }
+
+
 @router.get("/diagnostics")
 def get_lightgbm_diagnostics(
     customer_id: str,
