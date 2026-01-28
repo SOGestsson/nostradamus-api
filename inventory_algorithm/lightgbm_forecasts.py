@@ -2399,7 +2399,9 @@ class LightGBMForecast:
                     adjustments["clamped_nonneg"] = True
 
                 # Upper 95% bound from pooled residuals (archetype + horizon)
-                q = residual_quantiles.get((archetype, int(h))) or residual_quantiles.get(("__global__", int(h)))
+                q = residual_quantiles.get((archetype, int(h)))
+                if q is None:
+                    q = residual_quantiles.get(("__global__", int(h)))
                 if q is None:
                     # fallback: small uplift when calibration missing
                     fallback_base = max(1.0, 0.3 * max(recent_level, 0.0), 0.2 * float(croston_mean))
