@@ -1667,8 +1667,8 @@ class LightGBMForecast:
         # - Per-item importance: abs(contribution) ranking
         # - Used/dropped static/exogenous columns (based on last available row)
         # - Basic training diagnostics
-        booster_h1 = models.get(1)
-        if booster_h1 is not None and feature_cols is not None:
+        # Calculate SHAP for ALL horizons, not just horizon 1
+        if models and feature_cols is not None:
             per_uid_diag: dict[str, dict[str, Any]] = {}
             base_by_uid = base.sort_values(["unique_id", "ds"], kind="mergesort").groupby("unique_id", sort=False)
 
@@ -1811,46 +1811,64 @@ class LightGBMForecast:
                         X[col] = 0
                 X = X[feature_cols].fillna(0)
 
+                # Calculate SHAP for all horizons
+                shap_per_horizon = {}
+                imp_top = []
+                static_contrib = []
+                static_values = {}
+
                 try:
-                    contrib = booster_h1.predict(X, pred_contrib=True)
-                    contrib_row = np.asarray(contrib[0], dtype=float)
-                    # LightGBM returns n_features + 1 (bias)
-                    bias = float(contrib_row[-1])
-                    feat_names = list(booster_h1.feature_name())
-                    feat_contrib = contrib_row[:-1]
-                    pairs = list(zip(feat_names, feat_contrib))
-                    pairs_sorted = sorted(pairs, key=lambda kv: abs(float(kv[1])), reverse=True)
-                    contrib_map = {str(n): float(v) for n, v in pairs}
+                    for h in range(1, int(horizon) + 1):
+                        booster = models.get(h)
+                        if booster is None:
+                            continue
 
-                    top_k = 20
-                    shap_top = [{"feature": n, "contribution": float(v)} for n, v in pairs_sorted[:top_k]]
-                    imp_top = [{"feature": n, "importance": float(abs(v))} for n, v in pairs_sorted[:top_k]]
+                        try:
+                            contrib = booster.predict(X, pred_contrib=True)
+                            contrib_row = np.asarray(contrib[0], dtype=float)
+                            # LightGBM returns n_features + 1 (bias)
+                            bias = float(contrib_row[-1])
+                            feat_names = list(booster.feature_name())
+                            feat_contrib = contrib_row[:-1]
+                            pairs = list(zip(feat_names, feat_contrib))
+                            pairs_sorted = sorted(pairs, key=lambda kv: abs(float(kv[1])), reverse=True)
+                            contrib_map = {str(n): float(v) for n, v in pairs}
 
-                    static_contrib = [
-                        {"feature": f, "contribution": float(contrib_map.get(f, 0.0))}
-                        for f in used_static
-                        if f in contrib_map
-                    ]
-                    static_contrib = sorted(static_contrib, key=lambda kv: abs(float(kv["contribution"])), reverse=True)
-                    static_values = {
-                        f: float(X[f].iloc[0]) for f in used_static if f in X.columns
-                    }
+                            top_k = 20
+                            shap_top = [{"feature": n, "contribution": float(v)} for n, v in pairs_sorted[:top_k]]
 
-                    shap_info = {
-                        "available": True,
-                        "method": "pred_contrib",
-                        "horizon": 1,
-                        "bias": bias,
-                        "top": shap_top,
-                    }
+                            shap_per_horizon[h] = {
+                                "available": True,
+                                "method": "pred_contrib",
+                                "horizon": h,
+                                "bias": bias,
+                                "top": shap_top,
+                            }
+
+                            # For backward compatibility, store horizon 1 data in the old fields
+                            if h == 1:
+                                imp_top = [{"feature": n, "importance": float(abs(v))} for n, v in pairs_sorted[:top_k]]
+                                static_contrib = [
+                                    {"feature": f, "contribution": float(contrib_map.get(f, 0.0))}
+                                    for f in used_static
+                                    if f in contrib_map
+                                ]
+                                static_contrib = sorted(static_contrib, key=lambda kv: abs(float(kv["contribution"])), reverse=True)
+                                static_values = {
+                                    f: float(X[f].iloc[0]) for f in used_static if f in X.columns
+                                }
+                        except Exception as e:
+                            shap_per_horizon[h] = {"available": False, "reason": f"PRED_CONTRIB_FAILED: {e}", "horizon": h}
+
+                    # For backward compatibility, keep the old 'shap' field with horizon 1 data
+                    shap_info = shap_per_horizon.get(1, {"available": False, "reason": "NO_HORIZON_1_MODEL"})
                 except Exception as e:
-                    shap_info = {"available": False, "reason": f"PRED_CONTRIB_FAILED: {e}"}
-                    imp_top = []
-                    static_contrib = []
-                    static_values = {}
+                    shap_info = {"available": False, "reason": f"SHAP_CALCULATION_FAILED: {e}"}
+                    shap_per_horizon = {}
 
                 per_uid_diag[uid] = {
-                    "shap": shap_info,
+                    "shap": shap_info,  # Horizon 1 data for backward compatibility
+                    "shap_per_horizon": shap_per_horizon,  # NEW: All horizons
                     "per_item_importance_top": imp_top,
                     "used_columns": {"static": used_static, "exogenous": used_exo},
                     "dropped_columns": {"static": dropped_static, "exogenous": dropped_exo},
