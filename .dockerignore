@@ -22,3 +22,29 @@ ENV/
 !README.md
 scripts/
 test_api.sh
+
+# Model storage (large directory - 124MB+)
+nostradamus_store/
+
+# Editor files
+.cursor/
+
+# Test data files
+*.csv
+*.parquet
+test.json
+all_sim_input_data*.json
+# create_test_data/ - NEEDED by api/v1/test_data.py, don't exclude!
+tests/
+
+# Archives
+*.tar.gz
+*.zip
+
+# Database files (if any in root)
+*.duckdb
+*.duckdb.wal
+
+# Logs
+webhook.log
+api.log

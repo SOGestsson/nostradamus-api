@@ -10,14 +10,13 @@ RUN apt-get update && apt-get install -y \
     cmake \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency files
-COPY Pipfile Pipfile.lock ./
+# Copy ONLY dependency files first (for better layer caching)
 COPY requirements.txt ./
 
-# Install dependencies from requirements.txt (fallback to avoid pipenv lock issues)
+# Install dependencies (this layer will be cached unless requirements.txt changes)
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy application code (this layer only rebuilds when code changes)
 COPY . .
 
 # Expose port
