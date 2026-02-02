@@ -152,7 +152,7 @@ def _build_item_month_caps(
 
 
 # -------------------------
-# Feature engineering (direct strategy)
+# Feature engineering (direct strategy) PP
 # -------------------------
 
 def _month_sin_cos(month: int) -> tuple[float, float]:
@@ -2507,11 +2507,43 @@ class LightGBMForecast:
                     # Use p_effective from point forecast calculation (already computed above)
                     # Apply conservative floor (0.2) to ensure upper bound reflects some uncertainty even for sparse items
                     p_effective_upper = float(np.clip(p_effective, 0.2, 1.0))  # Conservative floor at 0.2
-                    upper_95_raw = p_effective_upper * q95_pred + (1.0 - p_effective_upper) * floor
+                    
+                    # Scale quantile prediction to be more reasonable relative to point forecast
+                    # Quantile model learns full distribution (including zeros), but point forecast is occurrence-adjusted
+                    # The quantile model predicts the 95th percentile of the raw distribution, which can be much higher
+                    # than the occurrence-adjusted point forecast. We need to scale it down to match the point forecast scale.
+                    if yhat > 0 and q95_pred > 0:
+                        # Calculate how much the occurrence adjustment reduced the forecast
+                        # Point forecast: yhat = p_effective * amount_used + (1-p_effective) * floor
+                        # Raw amount (before occurrence): amount_used
+                        # Scale factor: yhat / amount_used (how much smaller is yhat vs raw amount)
+                        amount_used = yhat_amount_nz if yhat_amount_nz is not None else yhat_amount
+                        if amount_used > 0:
+                            # How much smaller is the final forecast vs the raw amount?
+                            occurrence_scale = yhat / amount_used
+                        else:
+                            occurrence_scale = 1.0
+                        
+                        # Apply similar scaling to quantile prediction
+                        # But be conservative - don't scale below 60% to maintain uncertainty
+                        quantile_scale = max(occurrence_scale, 0.6)  # Don't scale below 60% of original
+                        q95_pred_scaled = q95_pred * quantile_scale
+                        
+                        # Apply occurrence adjustment to scaled quantile
+                        upper_95_raw = p_effective_upper * q95_pred_scaled + (1.0 - p_effective_upper) * floor
+                    else:
+                        # If yhat is zero or very small, use conservative floor-based upper bound
+                        upper_95_raw = max(floor, q95_pred * 0.4)  # More conservative scaling for zero forecasts
 
                     # MEDIUM PRIORITY: Fix cap order - apply monotonicity BEFORE cap
                     # First ensure upper_95 >= yhat (monotonicity constraint)
                     # Then apply cap (this ensures cap doesn't violate monotonicity)
+                    # Also ensure upper_95 isn't unreasonably high (max 2.5x yhat for better calibration)
+                    # This prevents the upper bound from being 3x+ the point forecast
+                    if yhat > 0:
+                        max_reasonable = max(yhat * 2.5, floor * 2.0)  # Max 2.5x yhat (more conservative)
+                        upper_95_raw = min(upper_95_raw, max_reasonable)
+                    
                     upper_95 = float(max(yhat, upper_95_raw, floor))  # Monotonicity: upper_95 >= yhat
                     if "cap" in adjustments:
                         upper_95 = float(min(upper_95, float(adjustments["cap"])))  # Then apply cap
@@ -2519,6 +2551,9 @@ class LightGBMForecast:
                     # Final non-negative clamp
                     if upper_95 < 0.0:
                         upper_95 = 0.0
+                    # Ensure upper_95 is always set (not None) - use yhat as minimum with reasonable multiplier
+                    if upper_95 is None or (upper_95 == 0.0 and yhat > 0.0):
+                        upper_95 = float(max(yhat * 1.5, floor * 1.5, 1.0))  # Conservative fallback
                     adjustments["upper_95_method"] = "quantile_model"
                     adjustments["p_effective_upper"] = p_effective_upper
                 else:
@@ -2540,6 +2575,9 @@ class LightGBMForecast:
                         upper_95 = float(min(upper_95, float(adjustments["cap"])))
                     if upper_95 < 0.0:
                         upper_95 = 0.0
+                    # Ensure upper_95 is always set (not None) - use yhat as minimum with reasonable multiplier
+                    if upper_95 is None or (upper_95 == 0.0 and yhat > 0.0):
+                        upper_95 = float(max(yhat * 1.5, floor * 1.5, 1.0))  # Conservative fallback
                     adjustments["upper_95_method"] = "residual_calibration"
 
                 forecasts.append(
