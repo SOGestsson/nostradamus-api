@@ -1247,6 +1247,64 @@ class LightGBMForecast:
 
             models[h] = booster
 
+            # Train quantile model (0.95) for upper bound prediction
+            # Use y_orig (original scale) to learn full distribution including trend
+            if objective == "tweedie" or objective == "regression":
+                # Prepare target: use y_orig if available (original scale), otherwise y
+                y_q95 = df["y_orig"].to_numpy(dtype=float) if "y_orig" in df.columns else df["y"].to_numpy(dtype=float)
+                y_q95_train = y_q95[~is_val]
+                y_q95_val = y_q95[is_val] if len(X_val) > 0 else np.array([])
+
+                # Use same features and weights, but original-scale target
+                params_q95 = dict(params)
+                params_q95["objective"] = "quantile"
+                params_q95["alpha"] = 0.95
+                params_q95["metric"] = "quantile"
+
+                dtrain_q95 = lgb.Dataset(
+                    X_train,
+                    label=y_q95_train,
+                    weight=w_train,
+                    categorical_feature=[c for c in cat_cols if c in X_train.columns],
+                    free_raw_data=False,
+                )
+                valid_sets_q95 = [dtrain_q95]
+                valid_names_q95 = ["train"]
+                if len(X_val) > 0:
+                    dval_q95 = lgb.Dataset(
+                        X_val,
+                        label=y_q95_val,
+                        weight=w_val,
+                        categorical_feature=[c for c in cat_cols if c in X_val.columns],
+                        free_raw_data=False,
+                    )
+                    valid_sets_q95.append(dval_q95)
+                    valid_names_q95.append("val")
+
+                booster_q95 = lgb.train(
+                    params_q95,
+                    dtrain_q95,
+                    num_boost_round=2000,
+                    valid_sets=valid_sets_q95,
+                    valid_names=valid_names_q95,
+                    callbacks=[lgb.early_stopping(100, verbose=False)] if len(X_val) > 0 else None,
+                )
+                # Save to separate file - does NOT overwrite point model
+                booster_q95.save_model(os.path.join(artifact_root, f"lgbm_h{h}_q95.txt"))
+
+                # Log validation metrics for quantile model calibration
+                if len(X_val) > 0:
+                    # Predict quantile on validation set
+                    q95_val_pred = booster_q95.predict(X_val)
+
+                    # Get true values on original scale (same as quantile model target)
+                    y_val_true_orig = df.loc[is_val, "y_orig"].to_numpy(dtype=float) if "y_orig" in df.columns else y_val
+
+                    # Calculate coverage: fraction of validation samples where true value <= predicted quantile
+                    # For a well-calibrated 95th percentile model, coverage should be close to 0.95
+                    coverage_95 = float(np.mean(y_val_true_orig <= q95_val_pred))
+                    metrics_summary[f"q95_coverage_val_h{h}"] = coverage_95
+
             # Train magnitude model on nonzero rows only (E[y | y > 0])
             nz_mask = pd.to_numeric(df.get("y_orig", df["y"]), errors="coerce").fillna(0.0) > 0.0
             if bool(nz_mask.any()):
@@ -1491,7 +1549,9 @@ class LightGBMForecast:
             "name_token_vocab": name_token_vocab,
             "name_cluster_map": name_cluster_map,
             "name_cluster_k": name_cluster_k,
-            "residual_quantiles": residual_quantile_rows
+            "residual_quantiles": residual_quantile_rows,
+            "quantile_models": True,
+            "quantile_alpha": 0.95
         }
         spec_path = os.path.join(artifact_root, "feature_spec.json")
         with open(spec_path, "w", encoding="utf-8") as f:
@@ -2033,6 +2093,13 @@ class LightGBMForecast:
         if os.path.exists(occ_path):
             occ_model = lgb.Booster(model_file=occ_path)
 
+        # Load quantile models (0.95) for upper bound prediction
+        q95_boosters: dict[int, Any] = {}
+        for h in horizons:
+            q95_path = os.path.join(artifact_root, f"lgbm_h{h}_q95.txt")
+            if os.path.exists(q95_path):
+                q95_boosters[h] = lgb.Booster(model_file=q95_path)
+
         residual_quantiles = self.store.get_residual_quantiles(model_version)
         if not residual_quantiles:
             spec_q = spec.get("residual_quantiles") or []
@@ -2416,24 +2483,64 @@ class LightGBMForecast:
                     yhat = 0.0
                     adjustments["clamped_nonneg"] = True
 
-                # Upper 95% bound from pooled residuals (archetype + horizon)
-                q = residual_quantiles.get((archetype, int(h)))
-                if q is None:
-                    q = residual_quantiles.get(("__global__", int(h)))
-                if q is None:
-                    # fallback: small uplift when calibration missing
-                    fallback_base = max(1.0, 0.3 * max(recent_level, 0.0), 0.2 * float(croston_mean))
-                    q95_excess = float(fallback_base)
-                    adjustments["q95_fallback"] = True
+                # Upper 95% bound: use quantile model if available, otherwise fallback to residual-based
+                if h in q95_boosters:
+                    # Predict quantile directly using same X as point forecast
+                    # Quantile model was trained on y_orig, so prediction is already on original scale
+                    q95_model_pred = float(q95_boosters[h].predict(X)[0])
+                    q95_pred = float(np.maximum(0.0, q95_model_pred))  # Non-negative clamp
+
+                    # MEDIUM PRIORITY: Add trend adjustment for consistency with point forecast
+                    # Even though quantile model trains on y_orig, we add trend in inference
+                    # to match the point forecast's trend adjustment logic
+                    if detrend_method == "linear" and params:
+                        trend_future = _trend_model_value(forecast_ds, params)
+                        q95_pred = float(np.maximum(0.0, q95_pred + trend_future))
+                    elif detrend_method == "log1p_linear" and params:
+                        trend_future = _trend_model_value(forecast_ds, params)
+                        q95_pred = float(np.maximum(0.0, np.expm1(q95_pred + trend_future)))
+                    # If detrend_method == "none", no trend adjustment needed
+
+                    # HIGH PRIORITY: Apply occurrence model adjustment to upper bound
+                    # Point forecast gets zeroed when p_effective < threshold, but quantile model won't.
+                    # We need to apply the same occurrence logic for consistency.
+                    # Use p_effective from point forecast calculation (already computed above)
+                    # Apply conservative floor (0.2) to ensure upper bound reflects some uncertainty even for sparse items
+                    p_effective_upper = float(np.clip(p_effective, 0.2, 1.0))  # Conservative floor at 0.2
+                    upper_95_raw = p_effective_upper * q95_pred + (1.0 - p_effective_upper) * floor
+
+                    # MEDIUM PRIORITY: Fix cap order - apply monotonicity BEFORE cap
+                    # First ensure upper_95 >= yhat (monotonicity constraint)
+                    # Then apply cap (this ensures cap doesn't violate monotonicity)
+                    upper_95 = float(max(yhat, upper_95_raw, floor))  # Monotonicity: upper_95 >= yhat
+                    if "cap" in adjustments:
+                        upper_95 = float(min(upper_95, float(adjustments["cap"])))  # Then apply cap
+
+                    # Final non-negative clamp
+                    if upper_95 < 0.0:
+                        upper_95 = 0.0
+                    adjustments["upper_95_method"] = "quantile_model"
+                    adjustments["p_effective_upper"] = p_effective_upper
                 else:
-                    q95_excess = float(q)
+                    # Fallback to existing residual-based calculation
+                    q = residual_quantiles.get((archetype, int(h)))
+                    if q is None:
+                        q = residual_quantiles.get(("__global__", int(h)))
+                    if q is None:
+                        # fallback: small uplift when calibration missing
+                        fallback_base = max(1.0, 0.3 * max(recent_level, 0.0), 0.2 * float(croston_mean))
+                        q95_excess = float(fallback_base)
+                        adjustments["q95_fallback"] = True
+                    else:
+                        q95_excess = float(q)
 
-                upper_95 = float(max(yhat, yhat + q95_excess))
+                    upper_95 = float(max(yhat, yhat + q95_excess))
 
-                if "cap" in adjustments:
-                    upper_95 = float(min(upper_95, float(adjustments["cap"])))
-                if upper_95 < 0.0:
-                    upper_95 = 0.0
+                    if "cap" in adjustments:
+                        upper_95 = float(min(upper_95, float(adjustments["cap"])))
+                    if upper_95 < 0.0:
+                        upper_95 = 0.0
+                    adjustments["upper_95_method"] = "residual_calibration"
 
                 forecasts.append(
                     {
