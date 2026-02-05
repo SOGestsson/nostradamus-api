@@ -26,6 +26,16 @@ except Exception as e:
     _HAS_LGBM = False
     _LGBM_IMPORT_ERROR = repr(e)
 
+try:
+    import optuna  # type: ignore
+    from optuna.integration import LightGBMPruningCallback  # type: ignore
+
+    _HAS_OPTUNA = True
+except Exception:
+    optuna = None
+    LightGBMPruningCallback = None
+    _HAS_OPTUNA = False
+
 
 # -------------------------
 # Metrics
@@ -38,6 +48,115 @@ def _wape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     if denom <= 1e-12:
         return float(np.mean(np.abs(y_true - y_pred)))
     return float(np.sum(np.abs(y_true - y_pred)) / denom)
+
+
+# -------------------------
+# Hyperparameter Tuning
+# -------------------------
+
+def _tune_lgbm_hyperparameters(
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    X_val: pd.DataFrame,
+    y_val: np.ndarray,
+    *,
+    objective: str = "regression",
+    n_trials: int = 30,
+    timeout_seconds: int = 300,
+    seed: int = 42,
+) -> dict[str, Any]:
+    """Tune LightGBM hyperparameters using Optuna.
+
+    Optimizes: learning_rate, num_leaves, feature_fraction, bagging_fraction,
+               min_data_in_leaf, lambda_l1, lambda_l2.
+
+    Returns the best hyperparameters found within the given constraints.
+    Falls back to default parameters if Optuna is not available.
+    """
+    if not _HAS_OPTUNA or optuna is None or lgb is None:
+        # Return sensible defaults if Optuna not available
+        return {
+            "learning_rate": 0.05,
+            "num_leaves": 63,
+            "feature_fraction": 0.8,
+            "bagging_fraction": 0.8,
+            "bagging_freq": 1,
+            "lambda_l1": 0.0,
+            "lambda_l2": 0.0,
+        }
+
+    # Suppress Optuna logs for cleaner output
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    def objective_fn(trial: Any) -> float:
+        params = {
+            "objective": objective,
+            "metric": "l2",
+            "verbosity": -1,
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 15, 127),
+            "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
+            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
+            "bagging_freq": 1,
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 5, 50),
+            "lambda_l1": trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True),
+            "lambda_l2": trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True),
+        }
+        if objective == "tweedie":
+            params["tweedie_variance_power"] = trial.suggest_float(
+                "tweedie_variance_power", 1.1, 1.9
+            )
+
+        dtrain = lgb.Dataset(X_train, label=y_train)
+        dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
+
+        callbacks = [lgb.early_stopping(stopping_rounds=50, verbose=False)]
+        if LightGBMPruningCallback is not None:
+            callbacks.append(LightGBMPruningCallback(trial, "l2"))
+
+        try:
+            model = lgb.train(
+                params,
+                dtrain,
+                num_boost_round=1000,
+                valid_sets=[dval],
+                valid_names=["val"],
+                callbacks=callbacks,
+            )
+            preds = model.predict(X_val)
+            mse = float(np.mean((y_val - preds) ** 2))
+            return mse
+        except Exception:
+            return float("inf")
+
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=optuna.samplers.TPESampler(seed=seed),
+    )
+    study.optimize(
+        objective_fn,
+        n_trials=n_trials,
+        timeout=timeout_seconds,
+        show_progress_bar=False,
+    )
+
+    # Handle case where no trials completed successfully
+    try:
+        best_params = study.best_params
+    except ValueError:
+        # No completed trials - return defaults
+        return {
+            "learning_rate": 0.05,
+            "num_leaves": 63,
+            "feature_fraction": 0.8,
+            "bagging_fraction": 0.8,
+            "bagging_freq": 1,
+            "lambda_l1": 0.0,
+            "lambda_l2": 0.0,
+        }
+    # Add fixed params that weren't tuned
+    best_params["bagging_freq"] = 1
+    return best_params
 
 
 # -------------------------
@@ -159,6 +278,25 @@ def _month_sin_cos(month: int) -> tuple[float, float]:
     # Use 0-based month index for cyclic encoding (Jan=0,...,Dec=11)
     ang = 2.0 * np.pi * ((float(month) - 1.0) / 12.0)
     return float(np.sin(ang)), float(np.cos(ang))
+
+
+def _fourier_features(month: int, k: int = 3) -> dict[str, float]:
+    """Generate k Fourier pairs for month seasonality.
+
+    For k=3 (default), produces 6 features:
+    - month_sin_1, month_cos_1 (fundamental frequency, same as _month_sin_cos)
+    - month_sin_2, month_cos_2 (2nd harmonic - captures semi-annual patterns)
+    - month_sin_3, month_cos_3 (3rd harmonic - captures quarterly patterns)
+
+    Higher harmonics allow the model to fit more complex seasonal patterns
+    while maintaining smooth periodic behavior.
+    """
+    feats: dict[str, float] = {}
+    for i in range(1, k + 1):
+        ang = 2.0 * np.pi * i * (float(month) - 1.0) / 12.0
+        feats[f"month_sin_{i}"] = float(np.sin(ang))
+        feats[f"month_cos_{i}"] = float(np.cos(ang))
+    return feats
 
 
 def _quarter_sin_cos(quarter: int) -> tuple[float, float]:
@@ -393,17 +531,22 @@ def _build_direct_rows_for_item(
         row["month"] = m
         row["quarter"] = int(((m - 1) // 3) + 1)
         row["year"] = int(forecast_ds.year)
-        s, c = _month_sin_cos(m)
-        row["month_sin"] = s
-        row["month_cos"] = c
+        # Extended Fourier features (k=3 harmonics)
+        fourier_feats = _fourier_features(m, k=3)
+        row.update(fourier_feats)
+        # Backward compat aliases for single harmonic
+        row["month_sin"] = fourier_feats["month_sin_1"]
+        row["month_cos"] = fourier_feats["month_cos_1"]
         qs, qc = _quarter_sin_cos(int(row["quarter"]))
         row["quarter_sin"] = qs
         row["quarter_cos"] = qc
         row["year_idx"] = float(forecast_ds.year - start_ds.year)
         if static_interaction_cols:
             for col in static_interaction_cols:
-                row[f"{col}_month_sin"] = 0.0
-                row[f"{col}_month_cos"] = 0.0
+                # Interactions with all Fourier harmonics
+                for i in range(1, 4):
+                    row[f"{col}_month_sin_{i}"] = 0.0
+                    row[f"{col}_month_cos_{i}"] = 0.0
 
         # Lags are defined as: lag_1 = y[t], lag_2=y[t-1], ...
         for lag in lags:
@@ -498,13 +641,29 @@ def _add_static_interactions(
 ) -> pd.DataFrame:
     if not static_interaction_cols:
         return df
-    if "month_sin" not in df.columns or "month_cos" not in df.columns:
+    # Check for Fourier features (new format with harmonics)
+    has_fourier_harmonics = "month_sin_1" in df.columns and "month_cos_1" in df.columns
+    # Backward compat check
+    has_old_format = "month_sin" in df.columns or "month_cos" in df.columns
+    if not has_fourier_harmonics and not has_old_format:
         return df
     for col in static_interaction_cols:
         if col not in df.columns:
             continue
-        df[f"{col}_month_sin"] = df[col].astype(float) * df["month_sin"].astype(float)
-        df[f"{col}_month_cos"] = df[col].astype(float) * df["month_cos"].astype(float)
+        col_vals = df[col].astype(float)
+        # Backward compat: old-format interaction columns ({col}_month_sin, {col}_month_cos)
+        if "month_sin" in df.columns:
+            df[f"{col}_month_sin"] = col_vals * df["month_sin"].astype(float)
+        if "month_cos" in df.columns:
+            df[f"{col}_month_cos"] = col_vals * df["month_cos"].astype(float)
+        # New format: interactions with all Fourier harmonics (k=3)
+        for i in range(1, 4):
+            sin_col = f"month_sin_{i}"
+            cos_col = f"month_cos_{i}"
+            if sin_col in df.columns:
+                df[f"{col}_{sin_col}"] = col_vals * df[sin_col].astype(float)
+            if cos_col in df.columns:
+                df[f"{col}_{cos_col}"] = col_vals * df[cos_col].astype(float)
     return df
 
 
@@ -825,6 +984,9 @@ class LightGBMForecast:
         lgbm_min_data_in_leaf: int = 50,
         lgbm_min_data_in_bin: int = 1,
         val_months: int = 6,
+        tune_hyperparameters: bool = False,
+        optuna_n_trials: int = 30,
+        optuna_timeout: int = 300,
         progress_hook: Callable[[dict[str, Any]], None] | None = None,
     ) -> TrainResult:
         # Monthly-only for v1
@@ -1152,6 +1314,39 @@ class LightGBMForecast:
                 metrics_summary["occurrence_threshold"] = 0.2
                 metrics_summary["occurrence_pos_rate_train"] = float(pos / max(1.0, pos + neg))
 
+        # Optuna hyperparameter tuning (using horizon 1 data)
+        tuned_params: dict[str, Any] | None = None
+        if tune_hyperparameters and _HAS_OPTUNA and all_rows_by_h.get(1):
+            if progress_hook:
+                progress_hook({"phase": "tuning_hyperparameters", "n_trials": optuna_n_trials})
+            tune_df = pd.DataFrame(all_rows_by_h[1])
+            tune_df = _add_sample_weights(tune_df, weight_map)
+            is_tune_val = pd.to_datetime(tune_df["forecast_ds"]) >= cutoff
+            X_tune = tune_df[feature_cols].copy()
+            X_tune["unique_id"] = X_tune["unique_id"].astype(str)
+            X_tune, _ = _encode_categories(X_tune, cat_cols, mappings=mappings)
+            X_tune = _add_static_interactions(X_tune, static_interaction_cols)
+            X_tune = X_tune.fillna(0)
+            y_tune = tune_df["y"].to_numpy(dtype=float)
+
+            X_tune_train = X_tune[~is_tune_val]
+            y_tune_train = y_tune[~is_tune_val]
+            X_tune_val = X_tune[is_tune_val]
+            y_tune_val = y_tune[is_tune_val]
+
+            if len(X_tune_train) >= 50 and len(X_tune_val) >= 10:
+                tune_objective = "tweedie" if detrend_method == "none" else "regression"
+                tuned_params = _tune_lgbm_hyperparameters(
+                    X_tune_train, y_tune_train,
+                    X_tune_val, y_tune_val,
+                    objective=tune_objective,
+                    n_trials=optuna_n_trials,
+                    timeout_seconds=optuna_timeout,
+                )
+                metrics_summary["tuned_hyperparameters"] = tuned_params
+                if progress_hook:
+                    progress_hook({"phase": "tuning_complete", "best_params": tuned_params})
+
         for h in range(1, int(horizon) + 1):
             rows = all_rows_by_h[h]
             if not rows:
@@ -1200,21 +1395,40 @@ class LightGBMForecast:
                 # Detrended targets can be negative; use regression.
                 objective = "regression"
 
-            params = {
-                "objective": objective,
-                "metric": "l2",
-                "learning_rate": 0.05,
-                "num_leaves": 63,
-                "feature_fraction": 0.8,
-                "bagging_fraction": 0.8,
-                "bagging_freq": 1,
-                "min_data_in_leaf": int(max(1, lgbm_min_data_in_leaf)),
-                "min_data_in_bin": int(max(1, lgbm_min_data_in_bin)),
-                "seed": 42,
-                "verbosity": -1,
-            }
+            # Use tuned params if available, otherwise defaults
+            if tuned_params:
+                params = {
+                    "objective": objective,
+                    "metric": "l2",
+                    "learning_rate": tuned_params.get("learning_rate", 0.05),
+                    "num_leaves": tuned_params.get("num_leaves", 63),
+                    "feature_fraction": tuned_params.get("feature_fraction", 0.8),
+                    "bagging_fraction": tuned_params.get("bagging_fraction", 0.8),
+                    "bagging_freq": tuned_params.get("bagging_freq", 1),
+                    "min_data_in_leaf": int(max(1, tuned_params.get("min_data_in_leaf", lgbm_min_data_in_leaf))),
+                    "min_data_in_bin": int(max(1, lgbm_min_data_in_bin)),
+                    "lambda_l1": tuned_params.get("lambda_l1", 0.0),
+                    "lambda_l2": tuned_params.get("lambda_l2", 0.0),
+                    "seed": 42,
+                    "verbosity": -1,
+                }
+            else:
+                params = {
+                    "objective": objective,
+                    "metric": "l2",
+                    "learning_rate": 0.05,
+                    "num_leaves": 63,
+                    "feature_fraction": 0.8,
+                    "bagging_fraction": 0.8,
+                    "bagging_freq": 1,
+                    "min_data_in_leaf": int(max(1, lgbm_min_data_in_leaf)),
+                    "min_data_in_bin": int(max(1, lgbm_min_data_in_bin)),
+                    "seed": 42,
+                    "verbosity": -1,
+                }
             if objective == "tweedie":
-                params["tweedie_variance_power"] = 1.3
+                tweedie_power = tuned_params.get("tweedie_variance_power", 1.3) if tuned_params else 1.3
+                params["tweedie_variance_power"] = tweedie_power
 
             dtrain = lgb.Dataset(
                 X_train,
@@ -1527,6 +1741,7 @@ class LightGBMForecast:
             "horizons": list(range(1, int(horizon) + 1)),
             "target": "y",
             "detrend_method": detrend_method,
+            "fourier_harmonics": 3,  # k=3 Fourier pairs for month seasonality
             "occurrence_model": "shared" if occ_model is not None else None,
             "occurrence_threshold": 0.2 if occ_model is not None else None,
             "lags": lags,
@@ -1551,7 +1766,9 @@ class LightGBMForecast:
             "name_cluster_k": name_cluster_k,
             "residual_quantiles": residual_quantile_rows,
             "quantile_models": True,
-            "quantile_alpha": 0.95
+            "quantile_alpha": 0.95,
+            "hyperparameter_tuning": tune_hyperparameters,
+            "tuned_hyperparameters": tuned_params if tuned_params else None,
         }
         spec_path = os.path.join(artifact_root, "feature_spec.json")
         with open(spec_path, "w", encoding="utf-8") as f:
@@ -1813,25 +2030,22 @@ class LightGBMForecast:
                 r["month"] = m
                 r["quarter"] = int(((m - 1) // 3) + 1)
                 r["year"] = int(forecast_ds.year)
-                s, c = _month_sin_cos(m)
-                r["month_sin"] = s
-                r["month_cos"] = c
-                qs, qc = _quarter_sin_cos(int(r["quarter"]))
-                r["quarter_sin"] = qs
-                r["quarter_cos"] = qc
-                r["year_idx"] = float(forecast_ds.year - pd.Timestamp(ds_arr[0]).year)
+                # Extended Fourier features (k=3 harmonics)
+                fourier_feats = _fourier_features(m, k=3)
+                r.update(fourier_feats)
+                # Backward compat aliases
+                r["month_sin"] = fourier_feats["month_sin_1"]
+                r["month_cos"] = fourier_feats["month_cos_1"]
                 qs, qc = _quarter_sin_cos(int(r["quarter"]))
                 r["quarter_sin"] = qs
                 r["quarter_cos"] = qc
                 r["year_idx"] = float(forecast_ds.year - pd.Timestamp(ds_arr[0]).year)
                 if static_interaction_cols:
                     for col in static_interaction_cols:
-                        r[f"{col}_month_sin"] = 0.0
-                        r[f"{col}_month_cos"] = 0.0
-                if static_interaction_cols:
-                    for col in static_interaction_cols:
-                        r[f"{col}_month_sin"] = 0.0
-                        r[f"{col}_month_cos"] = 0.0
+                        # Interactions with all Fourier harmonics
+                        for i in range(1, 4):
+                            r[f"{col}_month_sin_{i}"] = 0.0
+                            r[f"{col}_month_cos_{i}"] = 0.0
 
                 for lag in lags_local:
                     idx = t - (lag - 1)
@@ -2198,9 +2412,12 @@ class LightGBMForecast:
                 r["month"] = m
                 r["quarter"] = int(((m - 1) // 3) + 1)
                 r["year"] = int(forecast_ds.year)
-                s, c = _month_sin_cos(m)
-                r["month_sin"] = s
-                r["month_cos"] = c
+                # Extended Fourier features (k=3 harmonics)
+                fourier_feats = _fourier_features(m, k=3)
+                r.update(fourier_feats)
+                # Backward compat aliases
+                r["month_sin"] = fourier_feats["month_sin_1"]
+                r["month_cos"] = fourier_feats["month_cos_1"]
 
                 for lag in lags:
                     idx = t - (lag - 1)

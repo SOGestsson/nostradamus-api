@@ -135,6 +135,11 @@ class LightGBMTrainRequest(BaseModel):
         lgbm_min_data_in_leaf: int = 50
         lgbm_min_data_in_bin: int = 1
 
+        # Optuna hyperparameter tuning
+        tune_hyperparameters: bool = False
+        optuna_n_trials: int = 30
+        optuna_timeout: int = 300
+
 
 class LightGBMBatchForecastRequest(BaseModel):
         """Request model for batch forecasting with a trained LightGBM model."""

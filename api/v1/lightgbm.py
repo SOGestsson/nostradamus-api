@@ -168,6 +168,9 @@ def train_lightgbm(request: LightGBMTrainRequest):
             min_improvement=request.min_improvement,
             lgbm_min_data_in_leaf=getattr(request, "lgbm_min_data_in_leaf", 50),
             lgbm_min_data_in_bin=getattr(request, "lgbm_min_data_in_bin", 1),
+            tune_hyperparameters=getattr(request, "tune_hyperparameters", False),
+            optuna_n_trials=getattr(request, "optuna_n_trials", 30),
+            optuna_timeout=getattr(request, "optuna_timeout", 300),
         )
 
         return {
@@ -283,6 +286,9 @@ def train_lightgbm_async(
                 min_improvement=request.min_improvement,
                 lgbm_min_data_in_leaf=getattr(request, "lgbm_min_data_in_leaf", 50),
                 lgbm_min_data_in_bin=getattr(request, "lgbm_min_data_in_bin", 1),
+                tune_hyperparameters=getattr(request, "tune_hyperparameters", False),
+                optuna_n_trials=getattr(request, "optuna_n_trials", 30),
+                optuna_timeout=getattr(request, "optuna_timeout", 300),
                 progress_hook=progress_hook,
             )
 
