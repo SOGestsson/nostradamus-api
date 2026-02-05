@@ -2418,6 +2418,12 @@ class LightGBMForecast:
                 # Backward compat aliases
                 r["month_sin"] = fourier_feats["month_sin_1"]
                 r["month_cos"] = fourier_feats["month_cos_1"]
+                # Quarter Fourier features
+                qs, qc = _quarter_sin_cos(int(r["quarter"]))
+                r["quarter_sin"] = qs
+                r["quarter_cos"] = qc
+                # Year index from start of history
+                r["year_idx"] = float(forecast_ds.year - pd.Timestamp(ds_arr[0]).year) if len(ds_arr) else 0.0
 
                 for lag in lags:
                     idx = t - (lag - 1)
