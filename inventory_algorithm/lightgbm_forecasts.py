@@ -36,6 +36,9 @@ except Exception:
     LightGBMPruningCallback = None
     _HAS_OPTUNA = False
 
+# Version marker for debugging code loading issues
+_LIGHTGBM_FORECASTS_VERSION = "2026-02-06-fourier-v2"
+
 
 # -------------------------
 # Metrics
@@ -543,7 +546,10 @@ def _build_direct_rows_for_item(
         row["year_idx"] = float(forecast_ds.year - start_ds.year)
         if static_interaction_cols:
             for col in static_interaction_cols:
-                # Interactions with all Fourier harmonics
+                # Old format backward compat placeholders
+                row[f"{col}_month_sin"] = 0.0
+                row[f"{col}_month_cos"] = 0.0
+                # New format: interactions with all Fourier harmonics (k=3)
                 for i in range(1, 4):
                     row[f"{col}_month_sin_{i}"] = 0.0
                     row[f"{col}_month_cos_{i}"] = 0.0
@@ -1253,6 +1259,10 @@ class LightGBMForecast:
             X_occ, _ = _encode_categories(X_occ, cat_cols, mappings=mappings)
             X_occ = _add_static_interactions(X_occ, static_interaction_cols)
             X_occ = X_occ.fillna(0)
+
+            # IMPORTANT: Update feature_cols to include interaction columns added by _add_static_interactions
+            # This ensures the spec's feature_columns matches what the model was actually trained on
+            feature_cols = list(X_occ.columns)
 
             X_occ_train = X_occ[~is_val_occ]
             y_occ_train = y_occ[~is_val_occ]
@@ -2042,7 +2052,10 @@ class LightGBMForecast:
                 r["year_idx"] = float(forecast_ds.year - pd.Timestamp(ds_arr[0]).year)
                 if static_interaction_cols:
                     for col in static_interaction_cols:
-                        # Interactions with all Fourier harmonics
+                        # Old format backward compat placeholders
+                        r[f"{col}_month_sin"] = 0.0
+                        r[f"{col}_month_cos"] = 0.0
+                        # New format: interactions with all Fourier harmonics (k=3)
                         for i in range(1, 4):
                             r[f"{col}_month_sin_{i}"] = 0.0
                             r[f"{col}_month_cos_{i}"] = 0.0
@@ -2491,10 +2504,23 @@ class LightGBMForecast:
                 X, _ = _encode_categories(X, cat_cols, mappings=mappings)
                 X = _add_static_interactions(X, static_interaction_cols)
 
+                # Track columns before and after filling for diagnostics
+                cols_before_fill = set(X.columns)
+                missing_cols = [c for c in feature_cols if c not in X.columns]
+
                 for c in feature_cols:
                     if c not in X.columns:
                         X[c] = 0
                 X = X[feature_cols].fillna(0)
+
+                # Debug: verify feature count matches expectation
+                if X.shape[1] != len(feature_cols):
+                    import warnings
+                    warnings.warn(
+                        f"[lightgbm_forecasts v{_LIGHTGBM_FORECASTS_VERSION}] "
+                        f"Feature mismatch: X has {X.shape[1]} cols, expected {len(feature_cols)}. "
+                        f"Missing cols filled: {len(missing_cols)}"
+                    )
 
                 yhat_model = float(boosters[h].predict(X)[0])
                 yhat_model_nz = None
@@ -2838,5 +2864,6 @@ class LightGBMForecast:
                 "nonzero_threshold": cap_nonzero_threshold,
                 "small_floor": cap_small_floor,
             },
+            "_code_version": _LIGHTGBM_FORECASTS_VERSION,  # Debug marker
         }
         return fcst, meta
