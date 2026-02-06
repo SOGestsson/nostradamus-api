@@ -359,6 +359,63 @@ def _archetype(nonzero_rate: float, cv: float, seasonal_strength: float) -> str:
     return "stable"
 
 
+def _compute_global_monthly_effects(
+    base: pd.DataFrame,
+    *,
+    lookback_months: int = 36,
+) -> dict[int, float]:
+    """Compute global month-of-year effects across all items.
+    
+    Returns a dict mapping month (1-12) to median demand level across all items.
+    Uses robust aggregation (median) to handle outliers and sparse data.
+    
+    Args:
+        base: DataFrame with columns ['ds', 'y'] (or 'y_orig' if available)
+        lookback_months: Number of recent months to use for aggregation
+        
+    Returns:
+        dict[int, float]: {month: median_demand_level} for months 1-12
+    """
+    if base is None or base.empty or "ds" not in base.columns:
+        return {m: 0.0 for m in range(1, 13)}
+    
+    # Use y_orig if available (original scale), otherwise y
+    y_col = "y_orig" if "y_orig" in base.columns else "y"
+    if y_col not in base.columns:
+        return {m: 0.0 for m in range(1, 13)}
+    
+    df = base.copy()
+    df["ds"] = pd.to_datetime(df["ds"], errors="coerce")
+    df = df.dropna(subset=["ds"])
+    if df.empty:
+        return {m: 0.0 for m in range(1, 13)}
+    
+    # Sort by date and take last N months (by date, not by row count)
+    df = df.sort_values("ds", kind="mergesort")
+    if len(df) > 0:
+        max_ds = df["ds"].max()
+        if pd.notna(max_ds):
+            # Calculate cutoff date: lookback_months before the latest date
+            cutoff_ds = pd.Timestamp(max_ds) - pd.DateOffset(months=lookback_months)
+            df = df[df["ds"] >= cutoff_ds].copy()
+    
+    df["month"] = df["ds"].dt.month
+    y_vals = pd.to_numeric(df[y_col], errors="coerce").fillna(0.0)
+    
+    # Compute median per month across all items (robust to outliers)
+    global_monthly: dict[int, float] = {}
+    for m in range(1, 13):
+        month_data = y_vals[df["month"] == m]
+        # Use median of non-zero values, or 0 if all zeros
+        non_zero = month_data[month_data > 0.0]
+        if len(non_zero) > 0:
+            global_monthly[m] = float(np.median(non_zero))
+        else:
+            global_monthly[m] = 0.0
+    
+    return global_monthly
+
+
 def _month_index(ds: pd.Timestamp, start_ds: pd.Timestamp) -> int:
     """Integer number of months between two month-start timestamps."""
     ds = pd.Timestamp(ds)
@@ -482,6 +539,7 @@ def _build_direct_rows_for_item(
     lags: list[int],
     roll_windows: list[int],
     static_interaction_cols: list[str] | None = None,
+    global_monthly: dict[int, float] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
 
@@ -599,6 +657,24 @@ def _build_direct_rows_for_item(
 
         mean_last12 = float(np.mean(base_y[t - 11 : t + 1]))
         row["seasonal_amplitude_ratio"] = float(m_stats["max"]) / max(mean_last12, 1.0)
+
+        # Global seasonal components (cross-item learning)
+        # Add global month-of-year effect and item vs global ratio
+        if global_monthly is not None:
+            global_month_level = global_monthly.get(m, 0.0)
+            row["global_month_level"] = global_month_level
+            # Ratio: how does this item's month pattern compare to global?
+            # Use item's same_month_mean vs global median for that month
+            item_month_mean = float(m_stats.get("mean", 0.0))
+            if global_month_level > 0.0:
+                row["item_vs_global_ratio"] = float(item_month_mean / global_month_level)
+            else:
+                # If global is zero, use item's mean as ratio (or 1.0 if item also zero)
+                row["item_vs_global_ratio"] = 1.0 if item_month_mean == 0.0 else float(item_month_mean)
+        else:
+            # Fallback if global_monthly not provided
+            row["global_month_level"] = 0.0
+            row["item_vs_global_ratio"] = 1.0
 
         # Simple decay signal: slope of last 12 months
         row["rolling_12_slope"] = float(_rolling_slope(y[: t + 1]))
@@ -1099,6 +1175,14 @@ class LightGBMForecast:
             for uid in list(weight_map.keys()):
                 weight_map[uid] = float(np.clip(weight_map[uid] / w_med, 0.5, 3.0))
 
+        # Compute global monthly effects across all items (for cross-item learning)
+        # This helps static features like item_group, flavour, etc. by providing
+        # a baseline seasonal pattern that items can deviate from
+        global_monthly_effects = _compute_global_monthly_effects(
+            base,
+            lookback_months=36,
+        )
+
         # Archetype assignment for residual pooling (computed on full history)
         archetype_by_uid: dict[str, str] = {}
         for uid, grp in base.groupby("unique_id", sort=False):
@@ -1155,6 +1239,7 @@ class LightGBMForecast:
                     lags=lags,
                     roll_windows=roll_windows,
                     static_interaction_cols=static_interaction_cols,
+                    global_monthly=global_monthly_effects,
                 )
                 all_rows_by_h[h].extend(rows)
 
@@ -2078,6 +2163,58 @@ class LightGBMForecast:
                 r["zero_ratio_12"] = float(np.mean(last12 == 0.0))
                 r["nonzero_run_length"] = float(_nonzero_run_length(y_model[: t + 1]))
 
+                # Conditional-on-nonzero level features (use original scale)
+                window_nz = y_orig[t - 11 : t + 1] if len(y_orig) >= 12 else y_orig
+                nz_vals = window_nz[window_nz > 0.0]
+                mean_nonzero_12 = float(np.mean(nz_vals)) if len(nz_vals) else 0.0
+                median_nonzero_12 = float(np.median(nz_vals)) if len(nz_vals) else 0.0
+                nz_full_vals = y_orig[y_orig > 0.0]
+                last_nz_val = float(nz_full_vals[-1]) if len(nz_full_vals) else 0.0
+                r["mean_nonzero_12"] = mean_nonzero_12
+                r["median_nonzero_12"] = median_nonzero_12
+                r["last_nonzero_value"] = last_nz_val
+
+                # Same-month historical features (per item) - last 36 months
+                months = np.array([pd.Timestamp(d).month for d in ds_arr], dtype=int)
+                vals_3y = y_orig[-36:] if len(y_orig) > 36 else y_orig
+                months_3y = months[-36:] if len(months) > 36 else months
+                same_month_stats_local: dict[int, dict[str, float]] = {}
+                for month_i in range(1, 13):
+                    hist_vals = vals_3y[months_3y == month_i]
+                    if len(hist_vals) == 0:
+                        same_month_stats_local[month_i] = {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0}
+                    else:
+                        same_month_stats_local[month_i] = {
+                            "mean": float(np.mean(hist_vals)),
+                            "max": float(np.max(hist_vals)),
+                            "nonzero_rate": float(np.mean(hist_vals > 0.0)),
+                        }
+                m_stats = same_month_stats_local.get(m, {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0})
+                r["same_month_mean_3y"] = float(m_stats["mean"])
+                r["same_month_max_3y"] = float(m_stats["max"])
+                r["same_month_nonzero_rate_3y"] = float(m_stats["nonzero_rate"])
+                r["item_month_nonzero_rate"] = float(m_stats["nonzero_rate"])
+
+                mean_last12 = float(np.mean(y_orig[t - 11 : t + 1])) if t >= 11 else float(np.mean(y_orig[:t + 1]))
+                r["seasonal_amplitude_ratio"] = float(m_stats["max"]) / max(mean_last12, 1.0)
+
+                # Global seasonal components (cross-item learning)
+                # Use global_monthly_effects computed earlier in train_and_register
+                if global_monthly_effects is not None:
+                    global_month_level = global_monthly_effects.get(m, 0.0)
+                    r["global_month_level"] = global_month_level
+                    item_month_mean = float(m_stats.get("mean", 0.0))
+                    if global_month_level > 0.0:
+                        r["item_vs_global_ratio"] = float(item_month_mean / global_month_level)
+                    else:
+                        r["item_vs_global_ratio"] = 1.0 if item_month_mean == 0.0 else float(item_month_mean)
+                else:
+                    r["global_month_level"] = 0.0
+                    r["item_vs_global_ratio"] = 1.0
+
+                # Simple decay signal: slope of last 12 months
+                r["rolling_12_slope"] = float(_rolling_slope(y_model[: t + 1]))
+
                 # Exogenous values at time t
                 for k in exogenous_columns or []:
                     if k in grp.columns:
@@ -2296,6 +2433,13 @@ class LightGBMForecast:
 
         base = base.sort_values(["unique_id", "ds"], kind="mergesort")
 
+        # Compute global monthly effects for inference (same as training)
+        # This enables cross-item learning and helps static features
+        global_monthly_effects = _compute_global_monthly_effects(
+            base,
+            lookback_months=36,
+        )
+
         month_caps = _build_item_month_caps(base, lookback_years=4)
         cap_nonzero_threshold = 0.25
         cap_multiplier = 2.0
@@ -2475,6 +2619,23 @@ class LightGBMForecast:
                 # Alias: per-item month nonzero rate computed server-side.
                 r["item_month_nonzero_rate"] = float(m_stats["nonzero_rate"])
                 r["seasonal_amplitude_ratio"] = float(m_stats["max"]) / max(mean_last12_item, 1.0)
+
+                # Global seasonal components (cross-item learning)
+                # Add global month-of-year effect and item vs global ratio
+                if global_monthly_effects is not None:
+                    global_month_level = global_monthly_effects.get(m, 0.0)
+                    r["global_month_level"] = global_month_level
+                    # Ratio: how does this item's month pattern compare to global?
+                    item_month_mean = float(m_stats.get("mean", 0.0))
+                    if global_month_level > 0.0:
+                        r["item_vs_global_ratio"] = float(item_month_mean / global_month_level)
+                    else:
+                        # If global is zero, use item's mean as ratio (or 1.0 if item also zero)
+                        r["item_vs_global_ratio"] = 1.0 if item_month_mean == 0.0 else float(item_month_mean)
+                else:
+                    # Fallback if global_monthly_effects not provided
+                    r["global_month_level"] = 0.0
+                    r["item_vs_global_ratio"] = 1.0
 
                 # Simple decay signal: slope of last 12 months
                 r["rolling_12_slope"] = float(_rolling_slope(y[: t + 1]))
