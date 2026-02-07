@@ -6,6 +6,9 @@ from typing import List, Dict, Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, AliasChoices
 
+class CoreSimInput(BaseModel):
+    """Core input model for simulation data, used in both SimInput and SimulationRequest."""
+    inv_df: List[Dict[str, Any]]
 
 class SimInput(BaseModel):
     """Input model for simulation data containing historical sales and item configuration."""

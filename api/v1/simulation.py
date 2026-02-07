@@ -1,15 +1,59 @@
 """
 Inventory simulation endpoints.
 """
+import json
 import traceback
+
+import pandas as pd
 
 from fastapi import APIRouter, HTTPException
 
 import inventory_algorithm.inventory_opt_and_forecasting_package as inv
-from api.models import SimInput, SimulationRequest
+import inventory_algorithm.simulator_class as sim
+from api.models import CoreSimInput, SimInput, SimulationRequest
 from api.deps import build_dataframes
 
 router = APIRouter()
+
+
+def coerce_sim_input_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Coerce columns/dtypes to what inventory_algorithm.simulator_class expects.
+
+    This avoids `None` values leaking into numeric arrays (e.g. actual_sale), which
+    can crash when the simulator calls math.isnan().
+    """
+    required_cols = [
+        "item_id",
+        "day",
+        "forecast",
+        "variance",
+        "actual_sale",
+        "order_day",
+        "delivery",
+        "extra_params",
+    ]
+
+    out = df.copy()
+    for col in required_cols:
+        if col not in out.columns:
+            out[col] = None
+
+    out = out[required_cols]
+
+    # Strings
+    out["day"] = out["day"].astype("object")
+    out["extra_params"] = out["extra_params"].fillna("").astype(str)
+
+    # Floats (None -> NaN)
+    for col in ["forecast", "variance", "actual_sale"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce").astype("float64")
+
+    # Ints
+    for col in ["item_id", "order_day", "delivery"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype("int64")
+
+    return out
+
 
 
 @router.post("/simulate")
@@ -160,3 +204,47 @@ def run_histogram_buy_freq(request: SimulationRequest):
         error_details = traceback.format_exc()
         print(f"Full error traceback:\n{error_details}")
         raise HTTPException(status_code=500, detail=f"Histogram buy error: {str(e)}")
+
+
+@router.post("/raw_simulate")
+def run_raw_simulation(request: CoreSimInput):
+    """Run inventory simulation directly from a prepared simulator input DataFrame.
+
+    Expects `request.inv_df` to represent the simulator input dataset (records).
+    """
+    try:
+        print("Starting raw simulation...")
+
+        inv_df = pd.DataFrame(request.inv_df)
+        inv_df = coerce_sim_input_df(inv_df)
+
+        required_cols = {"item_id", "day", "forecast", "order_day", "delivery", "extra_params"}
+        missing = sorted(required_cols - set(inv_df.columns))
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=f"inv_df is missing required columns: {missing}",
+            )
+
+        # Run simulator
+        sim_result = sim.inventory_simulator(inv_df)
+
+        if not hasattr(sim_result, "simulator_output"):
+            return {"simulator_output": sim_result}
+
+        output = sim_result.simulator_output
+        try:
+            print(output.head(100))
+        except Exception:
+            pass
+
+        if hasattr(output, "to_dict"):
+            return {"simulator_output": output.to_dict(orient="records")}
+        return {"simulator_output": output}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_details = traceback.format_exc()
+        print(f"Full error traceback:\n{error_details}")
+        raise HTTPException(status_code=500, detail=f"Raw simulation error: {str(e)}")
