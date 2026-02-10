@@ -91,16 +91,22 @@ def _update_job(job_id: str, **fields: Any) -> None:
 
 def _get_job(job_id: str) -> dict[str, Any] | None:
     if _redis_sync is not None:
-        raw = _redis_sync.hgetall(_job_key(job_id))
-        if not raw:
-            return None
-        out: dict[str, Any] = {}
-        for k, v in raw.items():
-            try:
-                out[k] = json.loads(v)
-            except Exception:
-                out[k] = v
-        return out
+        try:
+            raw = _redis_sync.hgetall(_job_key(job_id))
+            if not raw:
+                # Fall back to in-memory if not in Redis
+                with _JOBS_LOCK:
+                    return dict(_JOBS.get(job_id)) if job_id in _JOBS else None
+            out: dict[str, Any] = {}
+            for k, v in raw.items():
+                try:
+                    out[k] = json.loads(v)
+                except Exception:
+                    out[k] = v
+            return out
+        except Exception:
+            # Fall back to in-memory storage if Redis is unavailable
+            pass
     with _JOBS_LOCK:
         return dict(_JOBS.get(job_id)) if job_id in _JOBS else None
 
@@ -391,38 +397,52 @@ def get_lightgbm_job(job_id: str):
         "timestamp": int(time.time() * 1000),
     })
     # #endregion
-    job = _get_job(job_id)
-    if not job:
+    try:
+        job = _get_job(job_id)
+        if not job:
+            # #region agent log
+            _debug_log({
+                "sessionId": "debug-session",
+                "runId": "lightgbm_job_get",
+                "hypothesisId": "J6",
+                "location": "api/v1/lightgbm.py:get_job:not_found",
+                "message": "Job not found",
+                "data": {
+                    "job_id": job_id,
+                },
+                "timestamp": int(time.time() * 1000),
+            })
+            # #endregion
+            raise HTTPException(status_code=404, detail='job not found')
         # #region agent log
         _debug_log({
             "sessionId": "debug-session",
             "runId": "lightgbm_job_get",
-            "hypothesisId": "J6",
-            "location": "api/v1/lightgbm.py:get_job:not_found",
-            "message": "Job not found",
+            "hypothesisId": "J7",
+            "location": "api/v1/lightgbm.py:get_job:success",
+            "message": "Job status returned",
             "data": {
                 "job_id": job_id,
+                "status": job.get("status"),
+                "phase": job.get("phase"),
             },
             "timestamp": int(time.time() * 1000),
         })
         # #endregion
-        raise HTTPException(status_code=404, detail='job not found')
-    # #region agent log
-    _debug_log({
-        "sessionId": "debug-session",
-        "runId": "lightgbm_job_get",
-        "hypothesisId": "J7",
-        "location": "api/v1/lightgbm.py:get_job:success",
-        "message": "Job status returned",
-        "data": {
-            "job_id": job_id,
-            "status": job.get("status"),
-            "phase": job.get("phase"),
-        },
-        "timestamp": int(time.time() * 1000),
-    })
-    # #endregion
-    return job
+        return job
+    except HTTPException:
+        raise
+    except Exception as e:
+        _debug_log({
+            "sessionId": "debug-session",
+            "runId": "lightgbm_job_get",
+            "hypothesisId": "J8",
+            "location": "api/v1/lightgbm.py:get_job:error",
+            "message": f"Error fetching job: {str(e)}",
+            "data": {"job_id": job_id, "error": str(e), "traceback": traceback.format_exc()},
+            "timestamp": int(time.time() * 1000),
+        })
+        raise HTTPException(status_code=500, detail=f"Error fetching job: {str(e)}")
 
 
 @router.post("/batch")
@@ -859,11 +879,15 @@ def get_lightgbm_diagnostics(
     """
 
     try:
+        # DEBUG: Log request params
+        print(f"[DEBUG /diagnostics] customer_id={customer_id}, model_version={model_version}, status={status}")
+
         forecaster = LightGBMForecast(store_root=store_root or _default_store_root(), customer_id=customer_id)
 
         mv = model_version
         if mv is None:
             mv = forecaster.store.get_active_model_version(status=status)
+            print(f"[DEBUG /diagnostics] resolved model_version from status={status}: {mv}")
         if not mv:
             raise ValueError(f"No active model version found for status='{status}'")
 
@@ -874,6 +898,8 @@ def get_lightgbm_diagnostics(
             unique_ids = None
 
         explain = forecaster.store.get_explain_summary(model_version=mv, unique_ids=unique_ids, limit=int(limit))
+        # DEBUG: Log results
+        print(f"[DEBUG /diagnostics] explain returned {len(explain)} items")
         name_token_vocab = None
         name_token_columns = None
         name_token_buckets = None

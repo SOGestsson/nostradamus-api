@@ -441,7 +441,13 @@ class DuckDBModelStore:
 
     def upsert_explain_summary(self, rows: Iterable[dict[str, Any]]) -> None:
         rows_list = list(rows)
+        # DEBUG: Log rows count
+        print(f"[DEBUG upsert_explain_summary] customer_id={self.customer_id}, rows_count={len(rows_list)}")
+        if rows_list:
+            sample_mv = rows_list[0].get("model_version") if rows_list else None
+            print(f"[DEBUG upsert_explain_summary] sample model_version={sample_mv}")
         if not rows_list:
+            print("[DEBUG upsert_explain_summary] EMPTY rows_list, returning early!")
             return
         now = datetime.now(UTC)
         values = []
@@ -507,8 +513,26 @@ class DuckDBModelStore:
 
         Returns mapping: unique_id -> {top_features, group_contrib, support_share, updated_at}
         """
+        # DEBUG: Log query params
+        print(f"[DEBUG get_explain_summary] customer_id={self.customer_id}, model_version={model_version}, limit={limit}")
 
         with self.connect() as con:
+            # DEBUG: Check what model_versions exist for this customer
+            try:
+                debug_rows = con.execute(
+                    """
+                    SELECT DISTINCT model_version, COUNT(*) as cnt
+                    FROM explain_item_summary
+                    WHERE customer_id=?
+                    GROUP BY model_version
+                    ORDER BY model_version DESC
+                    LIMIT 5;
+                    """,
+                    [self.customer_id],
+                ).fetchall()
+                print(f"[DEBUG get_explain_summary] existing model_versions for customer: {debug_rows}")
+            except Exception as debug_e:
+                print(f"[DEBUG get_explain_summary] debug query error: {debug_e}")
             if unique_ids:
                 placeholders = ",".join(["?"] * len(unique_ids))
                 rows = con.execute(
@@ -530,6 +554,9 @@ class DuckDBModelStore:
                     """,
                     [self.customer_id, model_version, int(limit)],
                 ).fetchall()
+
+        # DEBUG: Log rows returned
+        print(f"[DEBUG get_explain_summary] rows returned from DB: {len(rows) if rows else 0}")
 
         out: dict[str, dict[str, Any]] = {}
         for uid, topj, groupj, support_share, updated_at in rows:

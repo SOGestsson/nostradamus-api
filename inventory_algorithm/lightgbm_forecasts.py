@@ -307,6 +307,77 @@ def _quarter_sin_cos(quarter: int) -> tuple[float, float]:
     return float(np.sin(ang)), float(np.cos(ang))
 
 
+def _get_easter_date(year: int) -> tuple[int, int]:
+    """Calculate Easter Sunday for a given year using the Anonymous Gregorian algorithm.
+
+    Returns (month, day) tuple.
+    Easter can fall between March 22 and April 25.
+    """
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return month, day
+
+
+def _easter_features(ds: pd.Timestamp, year_easter_cache: dict[int, tuple[int, int]] | None = None) -> dict[str, float]:
+    """Generate Easter-related temporal features for a given date.
+
+    Returns dict with:
+    - days_to_easter: days until Easter (negative if after)
+    - is_easter_month: 1 if same month as Easter, 0 otherwise
+    - is_pre_easter_4w: 1 if within 4 weeks before Easter
+    - easter_proximity: 1.0 at Easter, decaying to 0 over 4 weeks
+    """
+    year = ds.year
+    month = ds.month
+    day = ds.day
+
+    # Use cache if provided, otherwise compute
+    if year_easter_cache is not None and year in year_easter_cache:
+        easter_month, easter_day = year_easter_cache[year]
+    else:
+        easter_month, easter_day = _get_easter_date(year)
+        if year_easter_cache is not None:
+            year_easter_cache[year] = (easter_month, easter_day)
+
+    # Calculate days to Easter (positive = before Easter, negative = after)
+    from datetime import date
+    try:
+        easter_date = date(year, easter_month, easter_day)
+        current_date = date(year, month, day)
+        days_to_easter = (easter_date - current_date).days
+    except ValueError:
+        days_to_easter = 0
+
+    # Features
+    is_easter_month = 1.0 if month == easter_month else 0.0
+    is_pre_easter_4w = 1.0 if 0 <= days_to_easter <= 28 else 0.0
+
+    # Easter proximity: peaks at Easter, decays over 4 weeks before and after
+    if abs(days_to_easter) <= 28:
+        easter_proximity = max(0.0, 1.0 - abs(days_to_easter) / 28.0)
+    else:
+        easter_proximity = 0.0
+
+    return {
+        "days_to_easter": float(days_to_easter),
+        "is_easter_month": is_easter_month,
+        "is_pre_easter_4w": is_pre_easter_4w,
+        "easter_proximity": easter_proximity,
+    }
+
+
 def _nonzero_run_length(values: np.ndarray) -> int:
     # months since last non-zero ending at current index
     for i in range(len(values) - 1, -1, -1):
@@ -602,15 +673,14 @@ def _build_direct_rows_for_item(
         row["quarter_sin"] = qs
         row["quarter_cos"] = qc
         row["year_idx"] = float(forecast_ds.year - start_ds.year)
-        if static_interaction_cols:
-            for col in static_interaction_cols:
-                # Old format backward compat placeholders
-                row[f"{col}_month_sin"] = 0.0
-                row[f"{col}_month_cos"] = 0.0
-                # New format: interactions with all Fourier harmonics (k=3)
-                for i in range(1, 4):
-                    row[f"{col}_month_sin_{i}"] = 0.0
-                    row[f"{col}_month_cos_{i}"] = 0.0
+
+        # Easter features for paskavara (Easter items)
+        easter_feats = _easter_features(forecast_ds)
+        row.update(easter_feats)
+
+        # Note: static interaction columns (e.g., item_type_month_sin) are computed by
+        # _add_static_interactions() which is called after DataFrame construction.
+        # Do not pre-create placeholders here to avoid duplicate columns.
 
         # Lags are defined as: lag_1 = y[t], lag_2=y[t-1], ...
         for lag in lags:
@@ -729,23 +799,37 @@ def _add_static_interactions(
     has_old_format = "month_sin" in df.columns or "month_cos" in df.columns
     if not has_fourier_harmonics and not has_old_format:
         return df
+    # Build all new columns first to avoid DataFrame fragmentation
+    new_cols: dict[str, pd.Series] = {}
+    existing_cols = set(df.columns)
     for col in static_interaction_cols:
         if col not in df.columns:
             continue
         col_vals = df[col].astype(float)
         # Backward compat: old-format interaction columns ({col}_month_sin, {col}_month_cos)
         if "month_sin" in df.columns:
-            df[f"{col}_month_sin"] = col_vals * df["month_sin"].astype(float)
+            new_col_name = f"{col}_month_sin"
+            if new_col_name not in existing_cols:
+                new_cols[new_col_name] = col_vals * df["month_sin"].astype(float)
         if "month_cos" in df.columns:
-            df[f"{col}_month_cos"] = col_vals * df["month_cos"].astype(float)
+            new_col_name = f"{col}_month_cos"
+            if new_col_name not in existing_cols:
+                new_cols[new_col_name] = col_vals * df["month_cos"].astype(float)
         # New format: interactions with all Fourier harmonics (k=3)
         for i in range(1, 4):
             sin_col = f"month_sin_{i}"
             cos_col = f"month_cos_{i}"
             if sin_col in df.columns:
-                df[f"{col}_{sin_col}"] = col_vals * df[sin_col].astype(float)
+                new_col_name = f"{col}_{sin_col}"
+                if new_col_name not in existing_cols:
+                    new_cols[new_col_name] = col_vals * df[sin_col].astype(float)
             if cos_col in df.columns:
-                df[f"{col}_{cos_col}"] = col_vals * df[cos_col].astype(float)
+                new_col_name = f"{col}_{cos_col}"
+                if new_col_name not in existing_cols:
+                    new_cols[new_col_name] = col_vals * df[cos_col].astype(float)
+    # Add all new columns at once using concat to avoid fragmentation
+    if new_cols:
+        df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
     return df
 
 
@@ -833,8 +917,12 @@ def _add_name_token_features(
         return base, []
     df = base.copy()
     feature_cols: list[str] = [f"name_tok_{i}" for i in range(int(n_buckets))]
-    for c in feature_cols:
-        df[c] = 0.0
+    # Initialize all token columns at once to avoid fragmentation
+    token_init = pd.DataFrame(
+        {c: np.zeros(len(df), dtype=float) for c in feature_cols},
+        index=df.index
+    )
+    df = pd.concat([df, token_init], axis=1)
     for idx, raw in enumerate(df[name_col].astype(str).fillna("")):
         tokens = _tokenize_name(raw)
         if not tokens:
@@ -1145,6 +1233,12 @@ class LightGBMForecast:
         for c in static_cols:
             if c not in base.columns or c in {"name", "flavour"} or c.endswith("_te"):
                 continue
+            # Skip name_tok_* columns - they are numeric token counts, not categorical
+            if c.startswith("name_tok_"):
+                continue
+            # Skip name_cluster_id - it's a derived numeric feature
+            if c == "name_cluster_id":
+                continue
             unique_count = int(base[c].nunique(dropna=True))
             if unique_count <= 50:
                 static_interaction_cols.append(c)
@@ -1316,14 +1410,18 @@ class LightGBMForecast:
         cv_residual_rows: list[dict[str, Any]] = []
 
         # Resolve feature columns once from the first non-empty horizon
+        # base_feature_cols: columns from raw rows (used for selecting from raw DataFrames)
+        # feature_cols: full list including interaction columns (used for training/spec)
+        base_feature_cols: list[str] | None = None
         if feature_cols is None:
             for rows in all_rows_by_h.values():
                 if rows:
                     df_spec = pd.DataFrame(rows)
                     excluded = {"y", "decision_ds", "forecast_ds", "y_orig", "trend_model", "lag_1_orig"}
-                    feature_cols = [c for c in df_spec.columns if c not in excluded]
+                    base_feature_cols = [c for c in df_spec.columns if c not in excluded]
+                    feature_cols = base_feature_cols.copy()
                     break
-        if not feature_cols:
+        if not feature_cols or not base_feature_cols:
             raise ValueError("Could not determine feature columns (no training rows).")
 
         # Train shared occurrence model (y > 0) across all horizons
@@ -1339,7 +1437,7 @@ class LightGBMForecast:
             y_occ = (pd.to_numeric(y_occ_src, errors="coerce").fillna(0.0).to_numpy(dtype=float) > 0.0).astype(int)
             is_val_occ = pd.to_datetime(occ_df["forecast_ds"]) >= cutoff
 
-            X_occ = occ_df[feature_cols].copy()
+            X_occ = occ_df[base_feature_cols].copy()
             X_occ["unique_id"] = X_occ["unique_id"].astype(str)
             X_occ, _ = _encode_categories(X_occ, cat_cols, mappings=mappings)
             X_occ = _add_static_interactions(X_occ, static_interaction_cols)
@@ -1417,7 +1515,7 @@ class LightGBMForecast:
             tune_df = pd.DataFrame(all_rows_by_h[1])
             tune_df = _add_sample_weights(tune_df, weight_map)
             is_tune_val = pd.to_datetime(tune_df["forecast_ds"]) >= cutoff
-            X_tune = tune_df[feature_cols].copy()
+            X_tune = tune_df[base_feature_cols].copy()
             X_tune["unique_id"] = X_tune["unique_id"].astype(str)
             X_tune, _ = _encode_categories(X_tune, cat_cols, mappings=mappings)
             X_tune = _add_static_interactions(X_tune, static_interaction_cols)
@@ -1464,7 +1562,7 @@ class LightGBMForecast:
             # Time split by forecast_ds
             is_val = pd.to_datetime(df["forecast_ds"]) >= cutoff
 
-            X = df[feature_cols].copy()
+            X = df[base_feature_cols].copy()
             X["unique_id"] = X["unique_id"].astype(str)
 
             X, _ = _encode_categories(X, cat_cols, mappings=mappings)
@@ -1622,7 +1720,7 @@ class LightGBMForecast:
                 if len(df_nz) >= 50:
                     y_nz = df_nz["y_orig"].to_numpy(dtype=float) if "y_orig" in df_nz.columns else df_nz["y"].to_numpy(dtype=float)
                     is_val_nz = pd.to_datetime(df_nz["forecast_ds"]) >= cutoff
-                    X_nz = df_nz[feature_cols].copy()
+                    X_nz = df_nz[base_feature_cols].copy()
                     X_nz["unique_id"] = X_nz["unique_id"].astype(str)
                     X_nz, _ = _encode_categories(X_nz, cat_cols, mappings=mappings)
                     X_nz = _add_static_interactions(X_nz, static_interaction_cols)
@@ -1931,7 +2029,10 @@ class LightGBMForecast:
             top_features = []
 
         # Eligibility based on per-item horizon-1 validation
-        for uid in base["unique_id"].astype(str).unique().tolist():
+        # DEBUG: Log base DataFrame info before eligibility loop
+        unique_ids_list = base["unique_id"].astype(str).unique().tolist()
+        print(f"[DEBUG train_and_register] Starting eligibility loop: base.shape={base.shape}, unique_ids={len(unique_ids_list)}, model_version={model_version}")
+        for uid in unique_ids_list:
             series_len = int((base[base["unique_id"].astype(str) == str(uid)]).shape[0])
 
             evalr = per_item_eval.get(str(uid))
@@ -1950,6 +2051,16 @@ class LightGBMForecast:
                         "requires_features": [],
                     }
                 )
+                # Still add to explain_rows for diagnostics API even with short history
+                explain_rows.append(
+                    {
+                        "model_version": model_version,
+                        "unique_id": str(uid),
+                        "top_features": top_features,
+                        "group_contrib": {"reason": "SHORT_HISTORY"},
+                        "support_share": None,
+                    }
+                )
                 continue
 
             if not evalr or evalr.get("n", 0) < 2:
@@ -1965,6 +2076,16 @@ class LightGBMForecast:
                         "confidence": 0.0,
                         "min_history_points": int(min_history_points),
                         "requires_features": [],
+                    }
+                )
+                # Still add to explain_rows for diagnostics API even with no eval data
+                explain_rows.append(
+                    {
+                        "model_version": model_version,
+                        "unique_id": str(uid),
+                        "top_features": top_features,
+                        "group_contrib": {"reason": "NO_EVAL_DATA"},
+                        "support_share": None,
                     }
                 )
                 continue
@@ -2033,6 +2154,25 @@ class LightGBMForecast:
                     "support_share": None,
                 }
             )
+
+        # Add diagnostic counts to metrics_summary for debugging
+        total_items = len(base["unique_id"].astype(str).unique())
+        items_with_eval = len(per_item_eval)
+        items_short_history = sum(1 for r in eligibility_rows if r.get("reason_code") == "SHORT_HISTORY")
+        items_no_eval = sum(1 for r in eligibility_rows if r.get("reason_code") == "NO_EVAL_DATA")
+        items_ml_allowed = sum(1 for r in eligibility_rows if r.get("ml_allowed"))
+        metrics_summary["_debug_total_items"] = total_items
+        metrics_summary["_debug_items_with_eval"] = items_with_eval
+        metrics_summary["_debug_items_short_history"] = items_short_history
+        metrics_summary["_debug_items_no_eval_data"] = items_no_eval
+        metrics_summary["_debug_items_ml_allowed"] = items_ml_allowed
+        metrics_summary["_debug_explain_rows_count"] = len(explain_rows)
+        metrics_summary["_debug_store_customer_id"] = self.store.customer_id
+        metrics_summary["_debug_store_db_path"] = self.store.db_path()
+        metrics_summary["_debug_model_version"] = model_version
+
+        # DEBUG: Print explain_rows count after eligibility loop
+        print(f"[DEBUG train_and_register] After eligibility loop: explain_rows={len(explain_rows)}, eligibility_rows={len(eligibility_rows)}, model_version={model_version}")
 
         # Per-item diagnostics (stored as JSON under explain_item_summary.group_contrib_json)
         # - SHAP-like attributions: LightGBM's pred_contrib output (TreeSHAP)
@@ -2135,15 +2275,12 @@ class LightGBMForecast:
                 r["quarter_sin"] = qs
                 r["quarter_cos"] = qc
                 r["year_idx"] = float(forecast_ds.year - pd.Timestamp(ds_arr[0]).year)
-                if static_interaction_cols:
-                    for col in static_interaction_cols:
-                        # Old format backward compat placeholders
-                        r[f"{col}_month_sin"] = 0.0
-                        r[f"{col}_month_cos"] = 0.0
-                        # New format: interactions with all Fourier harmonics (k=3)
-                        for i in range(1, 4):
-                            r[f"{col}_month_sin_{i}"] = 0.0
-                            r[f"{col}_month_cos_{i}"] = 0.0
+
+                # Easter features for paskavara (Easter items)
+                easter_feats = _easter_features(forecast_ds)
+                r.update(easter_feats)
+
+                # Note: static interaction columns are computed by _add_static_interactions()
 
                 for lag in lags_local:
                     idx = t - (lag - 1)
@@ -2163,57 +2300,71 @@ class LightGBMForecast:
                 r["zero_ratio_12"] = float(np.mean(last12 == 0.0))
                 r["nonzero_run_length"] = float(_nonzero_run_length(y_model[: t + 1]))
 
-                # Conditional-on-nonzero level features (use original scale)
-                window_nz = y_orig[t - 11 : t + 1] if len(y_orig) >= 12 else y_orig
-                nz_vals = window_nz[window_nz > 0.0]
-                mean_nonzero_12 = float(np.mean(nz_vals)) if len(nz_vals) else 0.0
-                median_nonzero_12 = float(np.median(nz_vals)) if len(nz_vals) else 0.0
-                nz_full_vals = y_orig[y_orig > 0.0]
-                last_nz_val = float(nz_full_vals[-1]) if len(nz_full_vals) else 0.0
-                r["mean_nonzero_12"] = mean_nonzero_12
-                r["median_nonzero_12"] = median_nonzero_12
-                r["last_nonzero_value"] = last_nz_val
+                # Additional features for SHAP accuracy (wrapped in try/except to prevent crashes)
+                try:
+                    # Conditional-on-nonzero level features (use original scale)
+                    window_nz = y_orig[t - 11 : t + 1] if t >= 11 else y_orig[:t + 1]
+                    nz_vals = window_nz[window_nz > 0.0]
+                    mean_nonzero_12 = float(np.mean(nz_vals)) if len(nz_vals) else 0.0
+                    median_nonzero_12 = float(np.median(nz_vals)) if len(nz_vals) else 0.0
+                    nz_full_vals = y_orig[y_orig > 0.0]
+                    last_nz_val = float(nz_full_vals[-1]) if len(nz_full_vals) else 0.0
+                    r["mean_nonzero_12"] = mean_nonzero_12
+                    r["median_nonzero_12"] = median_nonzero_12
+                    r["last_nonzero_value"] = last_nz_val
 
-                # Same-month historical features (per item) - last 36 months
-                months = np.array([pd.Timestamp(d).month for d in ds_arr], dtype=int)
-                vals_3y = y_orig[-36:] if len(y_orig) > 36 else y_orig
-                months_3y = months[-36:] if len(months) > 36 else months
-                same_month_stats_local: dict[int, dict[str, float]] = {}
-                for month_i in range(1, 13):
-                    hist_vals = vals_3y[months_3y == month_i]
-                    if len(hist_vals) == 0:
-                        same_month_stats_local[month_i] = {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0}
+                    # Same-month historical features (per item) - last 36 months
+                    months = np.array([pd.Timestamp(d).month for d in ds_arr], dtype=int)
+                    vals_3y = y_orig[-36:] if len(y_orig) > 36 else y_orig
+                    months_3y = months[-36:] if len(months) > 36 else months
+                    same_month_stats_local: dict[int, dict[str, float]] = {}
+                    for month_i in range(1, 13):
+                        hist_vals = vals_3y[months_3y == month_i]
+                        if len(hist_vals) == 0:
+                            same_month_stats_local[month_i] = {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0}
+                        else:
+                            same_month_stats_local[month_i] = {
+                                "mean": float(np.mean(hist_vals)),
+                                "max": float(np.max(hist_vals)),
+                                "nonzero_rate": float(np.mean(hist_vals > 0.0)),
+                            }
+                    m_stats = same_month_stats_local.get(m, {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0})
+                    r["same_month_mean_3y"] = float(m_stats["mean"])
+                    r["same_month_max_3y"] = float(m_stats["max"])
+                    r["same_month_nonzero_rate_3y"] = float(m_stats["nonzero_rate"])
+                    r["item_month_nonzero_rate"] = float(m_stats["nonzero_rate"])
+
+                    mean_last12 = float(np.mean(y_orig[t - 11 : t + 1])) if t >= 11 else float(np.mean(y_orig[:t + 1]))
+                    r["seasonal_amplitude_ratio"] = float(m_stats["max"]) / max(mean_last12, 1.0)
+
+                    # Global seasonal components (cross-item learning)
+                    if global_monthly_effects is not None:
+                        global_month_level = global_monthly_effects.get(m, 0.0)
+                        r["global_month_level"] = global_month_level
+                        item_month_mean = float(m_stats.get("mean", 0.0))
+                        if global_month_level > 0.0:
+                            r["item_vs_global_ratio"] = float(item_month_mean / global_month_level)
+                        else:
+                            r["item_vs_global_ratio"] = 1.0 if item_month_mean == 0.0 else float(item_month_mean)
                     else:
-                        same_month_stats_local[month_i] = {
-                            "mean": float(np.mean(hist_vals)),
-                            "max": float(np.max(hist_vals)),
-                            "nonzero_rate": float(np.mean(hist_vals > 0.0)),
-                        }
-                m_stats = same_month_stats_local.get(m, {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0})
-                r["same_month_mean_3y"] = float(m_stats["mean"])
-                r["same_month_max_3y"] = float(m_stats["max"])
-                r["same_month_nonzero_rate_3y"] = float(m_stats["nonzero_rate"])
-                r["item_month_nonzero_rate"] = float(m_stats["nonzero_rate"])
+                        r["global_month_level"] = 0.0
+                        r["item_vs_global_ratio"] = 1.0
 
-                mean_last12 = float(np.mean(y_orig[t - 11 : t + 1])) if t >= 11 else float(np.mean(y_orig[:t + 1]))
-                r["seasonal_amplitude_ratio"] = float(m_stats["max"]) / max(mean_last12, 1.0)
-
-                # Global seasonal components (cross-item learning)
-                # Use global_monthly_effects computed earlier in train_and_register
-                if global_monthly_effects is not None:
-                    global_month_level = global_monthly_effects.get(m, 0.0)
-                    r["global_month_level"] = global_month_level
-                    item_month_mean = float(m_stats.get("mean", 0.0))
-                    if global_month_level > 0.0:
-                        r["item_vs_global_ratio"] = float(item_month_mean / global_month_level)
-                    else:
-                        r["item_vs_global_ratio"] = 1.0 if item_month_mean == 0.0 else float(item_month_mean)
-                else:
+                    # Simple decay signal: slope of last 12 months
+                    r["rolling_12_slope"] = float(_rolling_slope(y_model[: t + 1]))
+                except Exception:
+                    # Fallback to safe defaults if feature calculation fails
+                    r["mean_nonzero_12"] = 0.0
+                    r["median_nonzero_12"] = 0.0
+                    r["last_nonzero_value"] = 0.0
+                    r["same_month_mean_3y"] = 0.0
+                    r["same_month_max_3y"] = 0.0
+                    r["same_month_nonzero_rate_3y"] = 0.0
+                    r["item_month_nonzero_rate"] = 0.0
+                    r["seasonal_amplitude_ratio"] = 0.0
                     r["global_month_level"] = 0.0
                     r["item_vs_global_ratio"] = 1.0
-
-                # Simple decay signal: slope of last 12 months
-                r["rolling_12_slope"] = float(_rolling_slope(y_model[: t + 1]))
+                    r["rolling_12_slope"] = 0.0
 
                 # Exogenous values at time t
                 for k in exogenous_columns or []:
@@ -2261,23 +2412,27 @@ class LightGBMForecast:
                             top_k = 20
                             shap_top = [{"feature": n, "contribution": float(v)} for n, v in pairs_sorted[:top_k]]
 
+                            # Calculate static feature contributions for this horizon
+                            horizon_static_contrib = [
+                                {"feature": f, "contribution": float(contrib_map.get(f, 0.0))}
+                                for f in used_static
+                                if f in contrib_map
+                            ]
+                            horizon_static_contrib = sorted(horizon_static_contrib, key=lambda kv: abs(float(kv["contribution"])), reverse=True)
+
                             shap_per_horizon[h] = {
                                 "available": True,
                                 "method": "pred_contrib",
                                 "horizon": h,
                                 "bias": bias,
                                 "top": shap_top,
+                                "static_contrib": horizon_static_contrib,  # NEW: per-horizon static contributions
                             }
 
                             # For backward compatibility, store horizon 1 data in the old fields
                             if h == 1:
                                 imp_top = [{"feature": n, "importance": float(abs(v))} for n, v in pairs_sorted[:top_k]]
-                                static_contrib = [
-                                    {"feature": f, "contribution": float(contrib_map.get(f, 0.0))}
-                                    for f in used_static
-                                    if f in contrib_map
-                                ]
-                                static_contrib = sorted(static_contrib, key=lambda kv: abs(float(kv["contribution"])), reverse=True)
+                                static_contrib = horizon_static_contrib
                                 static_values = {
                                     f: float(X[f].iloc[0]) for f in used_static if f in X.columns
                                 }
@@ -2312,6 +2467,8 @@ class LightGBMForecast:
 
         self.store.upsert_backtest_metrics(backtest_rows)
         self.store.upsert_eligibility(eligibility_rows)
+        # DEBUG: Log before upsert
+        print(f"[DEBUG train_and_register] About to upsert_explain_summary: explain_rows={len(explain_rows)}, customer_id={self.store.customer_id}, model_version={model_version}")
         self.store.upsert_explain_summary(explain_rows)
 
         if progress_hook:
@@ -2581,6 +2738,10 @@ class LightGBMForecast:
                 r["quarter_cos"] = qc
                 # Year index from start of history
                 r["year_idx"] = float(forecast_ds.year - pd.Timestamp(ds_arr[0]).year) if len(ds_arr) else 0.0
+
+                # Easter features for paskavara (Easter items)
+                easter_feats = _easter_features(forecast_ds)
+                r.update(easter_feats)
 
                 for lag in lags:
                     idx = t - (lag - 1)
