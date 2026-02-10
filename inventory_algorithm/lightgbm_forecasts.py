@@ -907,32 +907,6 @@ def _stable_token_bucket(token: str, n_buckets: int) -> int:
     return int(digest, 16) % int(n_buckets)
 
 
-def _add_name_token_features(
-    base: pd.DataFrame,
-    *,
-    name_col: str = "name",
-    n_buckets: int = 16,
-) -> tuple[pd.DataFrame, list[str]]:
-    if base is None or base.empty or name_col not in base.columns:
-        return base, []
-    df = base.copy()
-    feature_cols: list[str] = [f"name_tok_{i}" for i in range(int(n_buckets))]
-    # Initialize all token columns at once to avoid fragmentation
-    token_init = pd.DataFrame(
-        {c: np.zeros(len(df), dtype=float) for c in feature_cols},
-        index=df.index
-    )
-    df = pd.concat([df, token_init], axis=1)
-    for idx, raw in enumerate(df[name_col].astype(str).fillna("")):
-        tokens = _tokenize_name(raw)
-        if not tokens:
-            continue
-        buckets = [_stable_token_bucket(t, n_buckets) for t in tokens]
-        for b in buckets:
-            df.iat[idx, df.columns.get_loc(f"name_tok_{b}")] += 1.0
-    return df, feature_cols
-
-
 def _build_name_clusters(
     base: pd.DataFrame,
     *,
@@ -980,18 +954,601 @@ def _name_token_bucket_vocab(
     n_buckets: int = 16,
     top_k: int = 10,
 ) -> dict[str, list[str]]:
-    if base is None or base.empty or name_col not in base.columns:
+    """Deprecated: token-bucket name features are no longer used.
+
+    Kept for backward compatibility with old specs; returns an empty vocab.
+    """
+    _ = base, name_col, n_buckets, top_k
+    return {}
+
+
+# ================================================================
+# Attribute routing for static item_features
+# ================================================================
+
+# Default attribute type classification.
+# These are sensible defaults for a typical Icelandic food wholesaler.
+DEFAULT_ATTRIBUTE_TYPES: dict[str, list[str]] = {
+    "calendar": [
+        "jolavara",
+        "paskavara",
+        "thorravara",
+        "bolludagsvara",
+        "sprengidagsvara",
+        "sumarvara",
+    ],
+    "trend": [
+        "sykurlaus",
+        "laktosafritt",
+        "glutenfritt",
+        "lifraent",
+        "vegan",
+        "protein",
+        "heilsuvara",
+    ],
+    "segment": [
+        "item_group",
+        "brand",
+        "category",
+        "sub_category",
+        "supplier_group",
+    ],
+}
+
+
+def classify_attribute(
+    col_name: str,
+    attribute_types: dict[str, list[str]] | None = None,
+) -> str:
+    """Classify a static attribute into its mechanism type.
+
+    Returns one of: 'calendar', 'trend', 'segment', 'generic'.
+    'generic' = treat with standard Fourier interaction (backward compat).
+    """
+    types = attribute_types or DEFAULT_ATTRIBUTE_TYPES
+    for attr_type, cols in types.items():
+        if col_name in cols:
+            return attr_type
+    return "generic"
+
+
+def route_static_columns(
+    static_cols: list[str],
+    base: pd.DataFrame,
+    attribute_types: dict[str, list[str]] | None = None,
+) -> dict[str, list[str]]:
+    """Route all static columns into their mechanism buckets.
+
+    Returns dict with keys: 'calendar', 'trend', 'segment', 'generic',
+    each containing a list of column names.
+
+    Columns not present in base are excluded.
+    Also excludes internal/derived columns (name_cluster_id, *_te, etc.)
+    and the deprecated name_tok_* token buckets.
+    """
+    types = attribute_types or DEFAULT_ATTRIBUTE_TYPES
+    routed: dict[str, list[str]] = {
+        "calendar": [],
+        "trend": [],
+        "segment": [],
+        "generic": [],
+    }
+
+    skip_prefixes = ("name_tok_",)
+    skip_exact = {"name", "flavour", "name_cluster_id"}
+
+    for col in static_cols:
+        if col not in base.columns:
+            continue
+        if any(col.startswith(p) for p in skip_prefixes):
+            continue
+        if col in skip_exact or col.endswith("_te"):
+            continue
+
+        attr_type = classify_attribute(col, types)
+        routed[attr_type].append(col)
+
+    return routed
+
+
+def _calendar_proximity_features(
+    forecast_month: int,
+    static: dict[str, Any],
+    calendar_cols: list[str],
+    forecast_ds: pd.Timestamp | None = None,
+) -> dict[str, float]:
+    """Generate sharp calendar proximity features for seasonal attributes."""
+    feats: dict[str, float] = {}
+    m = int(forecast_month)
+
+    # Calendar definitions: tuned for Icelandic food wholesale patterns.
+    CALENDAR_DEFS: dict[str, dict[str, Any]] = {
+        "jolavara": {
+            "peak_months": [11, 12],
+            "ramp_months": [10],
+            "active_window": [10, 11, 12, 1],
+            "peak_center": 12,
+            "decay_width": 3,
+        },
+        "paskavara": {
+            "peak_months": [3, 4],
+            "ramp_months": [2, 3],
+            "active_window": [2, 3, 4, 5],
+            "peak_center": 4,
+            "decay_width": 2,
+        },
+        "thorravara": {
+            "peak_months": [1, 2],
+            "ramp_months": [1],
+            "active_window": [1, 2],
+            "peak_center": 1,
+            "decay_width": 1,
+        },
+        "bolludagsvara": {
+            "peak_months": [2],
+            "ramp_months": [1, 2],
+            "active_window": [1, 2, 3],
+            "peak_center": 2,
+            "decay_width": 1,
+        },
+        "sprengidagsvara": {
+            "peak_months": [2],
+            "ramp_months": [2],
+            "active_window": [2, 3],
+            "peak_center": 2,
+            "decay_width": 1,
+        },
+        "sumarvara": {
+            "peak_months": [6, 7, 8],
+            "ramp_months": [5],
+            "active_window": [5, 6, 7, 8, 9],
+            "peak_center": 7,
+            "decay_width": 3,
+        },
+    }
+
+    for col in calendar_cols:
+        val = float(static.get(col, 0) or 0.0)
+        if val == 0.0:
+            continue
+
+        defn = CALENDAR_DEFS.get(col)
+        if defn is None:
+            feats[f"{col}_calendar_active"] = val
+            continue
+
+        feats[f"{col}_peak"] = val if m in defn["peak_months"] else 0.0
+        feats[f"{col}_ramp"] = val if m in defn["ramp_months"] else 0.0
+        feats[f"{col}_active_window"] = val if m in defn["active_window"] else 0.0
+
+        peak_center = defn["peak_center"]
+        decay_width = defn["decay_width"]
+        dist = min(abs(m - peak_center), 12 - abs(m - peak_center))
+        proximity = max(0.0, 1.0 - dist / max(decay_width, 1))
+        feats[f"{col}_proximity"] = val * proximity
+
+        if dist > decay_width + 1:
+            feats[f"{col}_off_season"] = val * 1.0
+        else:
+            feats[f"{col}_off_season"] = 0.0
+
+    # Easter proximity linked to paskavara flag using existing _easter_features.
+    if forecast_ds is not None and float(static.get("paskavara", 0) or 0.0) > 0.0:
+        easter_feats = _easter_features(forecast_ds)
+        feats["paska_easter_proximity"] = float(static.get("paskavara", 0) or 0.0) * float(
+            easter_feats.get("easter_proximity", 0.0)
+        )
+        feats["paska_pre_easter_4w"] = float(static.get("paskavara", 0) or 0.0) * float(
+            easter_feats.get("is_pre_easter_4w", 0.0)
+        )
+
+    return feats
+
+
+def _compute_global_trend_by_attribute(
+    base: pd.DataFrame,
+    trend_cols: list[str],
+    *,
+    lookback_months: int = 24,
+) -> dict[str, float]:
+    """Compute average YoY growth rate for items with each trend attribute."""
+    if base is None or base.empty:
+        return {f"global_yoy_{c}": 0.0 for c in trend_cols}
+
+    growth_rates: dict[str, float] = {}
+    df = base.copy()
+    df["ds"] = pd.to_datetime(df["ds"], errors="coerce")
+    df = df.dropna(subset=["ds"])
+    if df.empty:
+        return {f"global_yoy_{c}": 0.0 for c in trend_cols}
+
+    max_ds = df["ds"].max()
+    cutoff_recent = max_ds - pd.DateOffset(months=12)
+    cutoff_prior = max_ds - pd.DateOffset(months=24)
+
+    for col in trend_cols:
+        if col not in df.columns:
+            growth_rates[f"global_yoy_{col}"] = 0.0
+            continue
+        flagged = df[pd.to_numeric(df[col], errors="coerce").fillna(0.0) > 0.0]
+        if flagged.empty or len(flagged) < 6:
+            growth_rates[f"global_yoy_{col}"] = 0.0
+            continue
+
+        recent = float(flagged[flagged["ds"] > cutoff_recent]["y"].sum())
+        prior = float(
+            flagged[(flagged["ds"] > cutoff_prior) & (flagged["ds"] <= cutoff_recent)]["y"].sum()
+        )
+
+        if prior > 1.0:
+            growth_rates[f"global_yoy_{col}"] = (recent - prior) / prior
+        elif recent > 0.0:
+            growth_rates[f"global_yoy_{col}"] = 1.0
+        else:
+            growth_rates[f"global_yoy_{col}"] = 0.0
+
+    return growth_rates
+
+
+def _trend_attribute_features(
+    year_idx: float,
+    rolling_12_slope: float,
+    static: dict[str, Any],
+    trend_cols: list[str],
+    global_yoy: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Generate trend/lifecycle interaction features for secular attributes."""
+    feats: dict[str, float] = {}
+    for col in trend_cols:
+        val = float(static.get(col, 0) or 0.0)
+        if val == 0.0:
+            continue
+
+        feats[f"{col}_year_idx"] = val * float(year_idx)
+        feats[f"{col}_year_sq"] = val * (float(year_idx) ** 2) * 0.01
+        feats[f"{col}_slope"] = val * float(rolling_12_slope)
+        if global_yoy is not None:
+            yoy_key = f"global_yoy_{col}"
+            feats[f"{col}_global_yoy"] = val * float(global_yoy.get(yoy_key, 0.0))
+    return feats
+
+
+def _detect_lifecycle_phase(
+    y_orig: np.ndarray,
+    *,
+    min_history: int = 6,
+) -> dict[str, float]:
+    """Detect product lifecycle phase from demand history."""
+    n = len(y_orig)
+    feats: dict[str, float] = {
+        "lifecycle_age_months": float(n),
+        "lifecycle_is_launch": 0.0,
+        "lifecycle_is_growth": 0.0,
+        "lifecycle_is_mature": 0.0,
+        "lifecycle_is_decline": 0.0,
+        "lifecycle_phase": 2.0,
+    }
+
+    if n < min_history:
+        feats["lifecycle_is_launch"] = 1.0
+        feats["lifecycle_phase"] = 0.0
+        return feats
+
+    if n <= 6:
+        feats["lifecycle_is_launch"] = 1.0
+        feats["lifecycle_phase"] = 0.0
+        return feats
+
+    if n >= 12:
+        recent_6 = y_orig[-6:]
+        prior_6 = y_orig[-12:-6]
+    else:
+        half = n // 2
+        recent_6 = y_orig[half:]
+        prior_6 = y_orig[:half]
+
+    recent_mean = float(np.mean(recent_6)) if len(recent_6) else 0.0
+    prior_mean = float(np.mean(prior_6)) if len(prior_6) else 0.0
+
+    if prior_mean > 1.0:
+        change_ratio = (recent_mean - prior_mean) / prior_mean
+    elif recent_mean > 0.0:
+        change_ratio = 1.0
+    else:
+        change_ratio = 0.0
+
+    window = y_orig[-12:] if n >= 12 else y_orig
+    if len(window) >= 3 and float(np.std(window)) > 1e-12:
+        x = np.arange(len(window), dtype=float)
+        slope, _ = np.polyfit(x, window, deg=1)
+        normalized_slope = slope / max(float(np.mean(window)), 1.0)
+    else:
+        normalized_slope = 0.0
+
+    if change_ratio > 0.15 and normalized_slope > 0.02:
+        feats["lifecycle_is_growth"] = 1.0
+        feats["lifecycle_phase"] = 1.0
+    elif change_ratio < -0.15 and normalized_slope < -0.02:
+        feats["lifecycle_is_decline"] = 1.0
+        feats["lifecycle_phase"] = 3.0
+    else:
+        feats["lifecycle_is_mature"] = 1.0
+        feats["lifecycle_phase"] = 2.0
+
+    return feats
+
+
+def _precompute_segment_monthly_stats(
+    base: pd.DataFrame,
+    segment_cols: list[str],
+    *,
+    lookback_months: int = 36,
+) -> dict[str, dict[Any, dict[int, dict[str, float]]]]:
+    """Precompute per-segment, per-month demand statistics."""
+    if base is None or base.empty:
         return {}
-    counts: dict[int, dict[str, int]] = {i: {} for i in range(int(n_buckets))}
-    for raw in base[name_col].astype(str).fillna(""):
-        for tok in _tokenize_name(raw):
-            b = _stable_token_bucket(tok, n_buckets)
-            counts[b][tok] = counts[b].get(tok, 0) + 1
-    vocab: dict[str, list[str]] = {}
-    for b, tok_counts in counts.items():
-        top = sorted(tok_counts.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
-        vocab[f"name_tok_{b}"] = [t for t, _ in top]
-    return vocab
+
+    df = base.copy()
+    df["ds"] = pd.to_datetime(df["ds"], errors="coerce")
+    df = df.dropna(subset=["ds"])
+    if df.empty:
+        return {}
+
+    max_ds = df["ds"].max()
+    cutoff = max_ds - pd.DateOffset(months=lookback_months)
+    df = df[df["ds"] >= cutoff].copy()
+    df["month"] = df["ds"].dt.month
+    df["y_num"] = pd.to_numeric(df["y"], errors="coerce").fillna(0.0)
+
+    result: dict[str, dict[Any, dict[int, dict[str, float]]]] = {}
+    for col in segment_cols:
+        if col not in df.columns:
+            continue
+        col_stats: dict[Any, dict[int, dict[str, float]]] = {}
+        for (seg_val, month), grp in df.groupby([col, "month"], sort=False):
+            if pd.isna(seg_val):
+                continue
+            vals = grp["y_num"].to_numpy(dtype=float)
+            if len(vals) == 0:
+                continue
+            if seg_val not in col_stats:
+                col_stats[seg_val] = {}
+            col_stats[seg_val][int(month)] = {
+                "mean": float(np.mean(vals)),
+                "std": float(np.std(vals, ddof=0)) if len(vals) > 1 else 0.0,
+                "median": float(np.median(vals)),
+                "count": float(len(vals)),
+                "nonzero_rate": float(np.mean(vals > 0.0)),
+            }
+        result[col] = col_stats
+    return result
+
+
+def _segment_features_for_row(
+    forecast_month: int,
+    static: dict[str, Any],
+    segment_cols: list[str],
+    segment_stats: dict[str, dict[Any, dict[int, dict[str, float]]]],
+    item_same_month_mean: float,
+) -> dict[str, float]:
+    """Look up precomputed segment features for a single row."""
+    feats: dict[str, float] = {}
+    m = int(forecast_month)
+
+    for col in segment_cols:
+        val = static.get(col)
+        if val is None or pd.isna(val):
+            feats[f"{col}_seg_month_mean"] = 0.0
+            feats[f"{col}_seg_month_std"] = 0.0
+            feats[f"{col}_seg_month_nonzero"] = 0.0
+            feats[f"{col}_vs_segment"] = 1.0
+            continue
+        col_data = segment_stats.get(col, {})
+        month_data = col_data.get(val, {}).get(m)
+        if month_data is None:
+            feats[f"{col}_seg_month_mean"] = 0.0
+            feats[f"{col}_seg_month_std"] = 0.0
+            feats[f"{col}_seg_month_nonzero"] = 0.0
+            feats[f"{col}_vs_segment"] = 1.0
+            continue
+
+        seg_mean = float(month_data.get("mean", 0.0))
+        feats[f"{col}_seg_month_mean"] = seg_mean
+        feats[f"{col}_seg_month_std"] = float(month_data.get("std", 0.0))
+        feats[f"{col}_seg_month_nonzero"] = float(month_data.get("nonzero_rate", 0.0))
+
+        if seg_mean > 0.0:
+            feats[f"{col}_vs_segment"] = float(item_same_month_mean) / seg_mean
+        else:
+            feats[f"{col}_vs_segment"] = 1.0
+
+    return feats
+
+
+def _build_direct_rows_for_item_v2(
+    *,
+    unique_id: str,
+    ds: np.ndarray,
+    y: np.ndarray,
+    y_orig: np.ndarray | None,
+    trend_params: dict[str, Any] | None,
+    exo: dict[str, np.ndarray],
+    static: dict[str, Any],
+    horizon: int,
+    lags: list[int],
+    roll_windows: list[int],
+    calendar_cols: list[str] | None = None,
+    trend_cols: list[str] | None = None,
+    segment_cols: list[str] | None = None,
+    generic_interaction_cols: list[str] | None = None,
+    global_monthly: dict[int, float] | None = None,
+    global_yoy: dict[str, float] | None = None,
+    segment_stats: dict[str, dict[Any, dict[int, dict[str, float]]]] | None = None,
+) -> list[dict[str, Any]]:
+    """Build supervised rows with three-mechanism attribute routing."""
+    rows: list[dict[str, Any]] = []
+    calendar_cols = calendar_cols or []
+    trend_cols = trend_cols or []
+    segment_cols = segment_cols or []
+    generic_interaction_cols = generic_interaction_cols or []
+
+    n = len(y)
+    max_needed = max(max(roll_windows) - 1, 1) if roll_windows else 1
+
+    months = np.array([pd.Timestamp(d).month for d in ds], dtype=int)
+    base_y = y_orig if y_orig is not None else y
+    vals_3y = base_y[-36:] if len(base_y) > 36 else base_y
+    months_3y = months[-36:] if len(months) > 36 else months
+    same_month_stats: dict[int, dict[str, float]] = {}
+    for m in range(1, 13):
+        hist_vals = vals_3y[months_3y == m]
+        if len(hist_vals) == 0:
+            same_month_stats[m] = {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0}
+        else:
+            same_month_stats[m] = {
+                "mean": float(np.mean(hist_vals)),
+                "max": float(np.max(hist_vals)),
+                "nonzero_rate": float(np.mean(hist_vals > 0.0)),
+            }
+
+    lifecycle_feats = _detect_lifecycle_phase(base_y if base_y is not None else y)
+    start_ds = pd.Timestamp(ds[0])
+
+    for t in range(0, n - horizon):
+        if t < max_needed:
+            continue
+
+        forecast_ds = pd.Timestamp(ds[t]) + pd.offsets.MonthBegin(horizon)
+        target = float(y[t + horizon])
+        target_orig = float(y_orig[t + horizon]) if y_orig is not None else target
+
+        trend_model_at_forecast = 0.0
+        if trend_params is not None:
+            trend_model_at_forecast = _trend_model_value(forecast_ds, trend_params)
+
+        row: dict[str, Any] = {
+            "unique_id": unique_id,
+            "decision_ds": pd.Timestamp(ds[t]),
+            "forecast_ds": forecast_ds,
+            "y": target,
+            "y_orig": target_orig,
+            "trend_model": float(trend_model_at_forecast),
+        }
+
+        m = int(forecast_ds.month)
+        row["month"] = m
+        row["quarter"] = int(((m - 1) // 3) + 1)
+        row["year"] = int(forecast_ds.year)
+
+        fourier_feats = _fourier_features(m, k=3)
+        row.update(fourier_feats)
+        row["month_sin"] = fourier_feats["month_sin_1"]
+        row["month_cos"] = fourier_feats["month_cos_1"]
+        qs, qc = _quarter_sin_cos(int(row["quarter"]))
+        row["quarter_sin"] = qs
+        row["quarter_cos"] = qc
+        row["year_idx"] = float(forecast_ds.year - start_ds.year)
+
+        easter_feats = _easter_features(forecast_ds)
+        row.update(easter_feats)
+
+        if calendar_cols:
+            cal_feats = _calendar_proximity_features(
+                m,
+                static,
+                calendar_cols,
+                forecast_ds=forecast_ds,
+            )
+            row.update(cal_feats)
+
+        if trend_cols:
+            rolling_slope = float(_rolling_slope(y[: t + 1]))
+            trend_feats = _trend_attribute_features(
+                year_idx=row["year_idx"],
+                rolling_12_slope=rolling_slope,
+                static=static,
+                trend_cols=trend_cols,
+                global_yoy=global_yoy,
+            )
+            row.update(trend_feats)
+
+        if segment_cols and segment_stats:
+            item_month_mean = float(same_month_stats.get(m, {}).get("mean", 0.0))
+            seg_feats = _segment_features_for_row(
+                m,
+                static,
+                segment_cols,
+                segment_stats,
+                item_month_mean,
+            )
+            row.update(seg_feats)
+
+        row.update(lifecycle_feats)
+
+        for lag in lags:
+            idx = t - (lag - 1)
+            row[f"lag_{lag}"] = float(y[idx]) if idx >= 0 else 0.0
+
+        if y_orig is not None:
+            row["lag_1_orig"] = float(y_orig[t])
+
+        for w in roll_windows:
+            start = t - (w - 1)
+            window = y[start : t + 1]
+            row[f"roll_mean_{w}"] = float(np.mean(window))
+            if w >= 2:
+                row[f"roll_std_{w}"] = float(np.std(window, ddof=0))
+
+        row["diff1"] = float(y[t] - y[t - 1])
+        row["diff12"] = float(y[t] - y[t - 12]) if t >= 12 else 0.0
+
+        last12 = y[t - 11 : t + 1]
+        row["zero_ratio_12"] = float(np.mean(last12 == 0.0))
+        row["nonzero_run_length"] = float(_nonzero_run_length(y[: t + 1]))
+
+        nz_source = y_orig if y_orig is not None else y
+        window_nz = nz_source[t - 11 : t + 1]
+        nz_vals = window_nz[window_nz > 0.0]
+        row["mean_nonzero_12"] = float(np.mean(nz_vals)) if len(nz_vals) else 0.0
+        row["median_nonzero_12"] = float(np.median(nz_vals)) if len(nz_vals) else 0.0
+        nz_full = nz_source[: t + 1]
+        nz_full_vals = nz_full[nz_full > 0.0]
+        last_nz_val = float(nz_full_vals[-1]) if len(nz_full_vals) else 0.0
+        row["last_nonzero_value"] = float(last_nz_val)
+
+        m_stats = same_month_stats.get(m, {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0})
+        row["same_month_mean_3y"] = float(m_stats["mean"])
+        row["same_month_max_3y"] = float(m_stats["max"])
+        row["same_month_nonzero_rate_3y"] = float(m_stats["nonzero_rate"])
+        row["item_month_nonzero_rate"] = float(m_stats["nonzero_rate"])
+
+        mean_last12 = float(np.mean(base_y[t - 11 : t + 1]))
+        row["seasonal_amplitude_ratio"] = float(m_stats["max"]) / max(mean_last12, 1.0)
+
+        if global_monthly is not None:
+            global_month_level = global_monthly.get(m, 0.0)
+            row["global_month_level"] = global_month_level
+            item_month_mean = float(m_stats.get("mean", 0.0))
+            if global_month_level > 0.0:
+                row["item_vs_global_ratio"] = float(item_month_mean / global_month_level)
+            else:
+                row["item_vs_global_ratio"] = 1.0 if item_month_mean == 0.0 else float(item_month_mean)
+        else:
+            row["global_month_level"] = 0.0
+            row["item_vs_global_ratio"] = 1.0
+
+        row["rolling_12_slope"] = float(_rolling_slope(y[: t + 1]))
+
+        for k, arr in exo.items():
+            if len(arr) == n:
+                row[k] = arr[t]
+
+        for k, v in static.items():
+            row[k] = v
+
+        rows.append(row)
+
+    return rows
 
 
 def _build_statsforecast_features(
@@ -1187,16 +1744,11 @@ class LightGBMForecast:
             base = base.merge(attrs, on="item_id", how="left", suffixes=("", "_attr"))
             static_cols = [c for c in attrs.columns if c != "item_id"]
 
-        # Name-based features: token buckets + TF-IDF cluster id
+        # Name-based features: TF-IDF cluster id only (token buckets removed)
         name_cluster_map, name_cluster_k = _build_name_clusters(base, name_col="name")
         base = _apply_name_cluster(base, name_cluster_map, name_col="name")
-        base, name_token_cols = _add_name_token_features(base, name_col="name", n_buckets=16)
-        name_token_vocab = _name_token_bucket_vocab(base, name_col="name", n_buckets=16, top_k=10)
         if "name_cluster_id" not in static_cols:
             static_cols.append("name_cluster_id")
-        for c in name_token_cols:
-            if c not in static_cols:
-                static_cols.append(c)
 
 
         # Merge long drivers (optional) → wide monthly
@@ -1223,21 +1775,24 @@ class LightGBMForecast:
         lags = [1, 2, 3, 6, 12, 24]
         roll_windows = [3, 6, 12]
 
-        # Low-cardinality static categories for month interactions
+        # Route static attributes into calendar/trend/segment/generic buckets
+        attribute_types = DEFAULT_ATTRIBUTE_TYPES
+        routed = route_static_columns(static_cols, base, attribute_types)
+        calendar_cols = routed["calendar"]
+        trend_cols = routed["trend"]
+        segment_cols = routed["segment"]
+        generic_interaction_cols = routed["generic"]
+
+        # Low-cardinality static categories for month interactions (generic only)
         static_cat_cols = [
             c
             for c in static_cols
-            if c in base.columns and (pd.api.types.is_object_dtype(base[c]) or pd.api.types.is_categorical_dtype(base[c]))
+            if c in base.columns
+            and (pd.api.types.is_object_dtype(base[c]) or pd.api.types.is_categorical_dtype(base[c]))
         ]
         static_interaction_cols: list[str] = []
-        for c in static_cols:
-            if c not in base.columns or c in {"name", "flavour"} or c.endswith("_te"):
-                continue
-            # Skip name_tok_* columns - they are numeric token counts, not categorical
-            if c.startswith("name_tok_"):
-                continue
-            # Skip name_cluster_id - it's a derived numeric feature
-            if c == "name_cluster_id":
+        for c in generic_interaction_cols:
+            if c not in base.columns:
                 continue
             unique_count = int(base[c].nunique(dropna=True))
             if unique_count <= 50:
@@ -1274,6 +1829,16 @@ class LightGBMForecast:
         # a baseline seasonal pattern that items can deviate from
         global_monthly_effects = _compute_global_monthly_effects(
             base,
+            lookback_months=36,
+        )
+
+        # Global trend stats for trend attributes
+        global_yoy = _compute_global_trend_by_attribute(base, trend_cols)
+
+        # Segment-level per-month stats
+        segment_stats = _precompute_segment_monthly_stats(
+            base,
+            segment_cols,
             lookback_months=36,
         )
 
@@ -1321,7 +1886,7 @@ class LightGBMForecast:
                 static[c] = v
 
             for h in range(1, int(horizon) + 1):
-                rows = _build_direct_rows_for_item(
+                rows = _build_direct_rows_for_item_v2(
                     unique_id=str(uid),
                     ds=ds,
                     y=y_model,
@@ -1332,8 +1897,13 @@ class LightGBMForecast:
                     horizon=h,
                     lags=lags,
                     roll_windows=roll_windows,
-                    static_interaction_cols=static_interaction_cols,
+                    calendar_cols=calendar_cols,
+                    trend_cols=trend_cols,
+                    segment_cols=segment_cols,
+                    generic_interaction_cols=generic_interaction_cols,
                     global_monthly=global_monthly_effects,
+                    global_yoy=global_yoy,
+                    segment_stats=segment_stats,
                 )
                 all_rows_by_h[h].extend(rows)
 
@@ -1952,9 +2522,6 @@ class LightGBMForecast:
             "target_encoding_columns": te_cols,
             "target_encoding_maps": te_maps,
             "target_encoding_prior": 10.0,
-            "name_token_columns": name_token_cols,
-            "name_token_buckets": 16,
-            "name_token_vocab": name_token_vocab,
             "name_cluster_map": name_cluster_map,
             "name_cluster_k": name_cluster_k,
             "residual_quantiles": residual_quantile_rows,
@@ -1962,6 +2529,13 @@ class LightGBMForecast:
             "quantile_alpha": 0.95,
             "hyperparameter_tuning": tune_hyperparameters,
             "tuned_hyperparameters": tuned_params if tuned_params else None,
+            "attribute_routing": {
+                "calendar": calendar_cols,
+                "trend": trend_cols,
+                "segment": segment_cols,
+                "generic_interaction": generic_interaction_cols,
+            },
+            "global_yoy": global_yoy,
         }
         spec_path = os.path.join(artifact_root, "feature_spec.json")
         with open(spec_path, "w", encoding="utf-8") as f:
@@ -2534,6 +3108,7 @@ class LightGBMForecast:
         static_interaction_cols: list[str] = list(spec.get("static_interaction_columns") or [])
         te_cols: list[str] = list(spec.get("target_encoding_columns") or [])
         te_maps: dict[str, Any] = dict(spec.get("target_encoding_maps") or {})
+        # Name-token fields may be present in older specs but are no longer used.
         name_token_cols: list[str] = list(spec.get("name_token_columns") or [])
         name_token_buckets = int(spec.get("name_token_buckets") or len(name_token_cols) or 16)
         name_cluster_map: dict[str, Any] = dict(spec.get("name_cluster_map") or {})
@@ -2580,8 +3155,22 @@ class LightGBMForecast:
             base = _apply_target_encodings(base, te_cols, te_maps)
         if name_cluster_map:
             base = _apply_name_cluster(base, name_cluster_map, name_col="name")
-        if name_token_cols:
-            base, _ = _add_name_token_features(base, name_col="name", n_buckets=name_token_buckets)
+        # name_tok_* features are deprecated and not recomputed at inference.
+
+        # Resolve routing configuration for attribute mechanisms (may be missing for old models)
+        routing = spec.get("attribute_routing", {}) or {}
+        calendar_cols = list(routing.get("calendar") or [])
+        trend_cols = list(routing.get("trend") or [])
+        segment_cols = list(routing.get("segment") or [])
+        generic_interaction_cols = list(routing.get("generic_interaction") or [])
+        global_yoy = dict(spec.get("global_yoy") or {})
+
+        # Precompute segment stats for inference when available
+        segment_stats = _precompute_segment_monthly_stats(
+            base,
+            segment_cols,
+            lookback_months=36,
+        ) if segment_cols else {}
 
         if exogenous_columns is None:
             exogenous_columns = [c for c in exo_cols if c in base.columns]
