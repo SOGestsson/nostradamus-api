@@ -483,7 +483,7 @@ class ClassicalForecasts:
     def _local_forecast_path(self, hist: pd.DataFrame, h: int) -> pd.DataFrame:
         """
         Local fallback using StatsForecast models (AutoARIMA, ETS, Croston, etc.).
-        Returns DataFrame with 'ds' and 'yhat'.
+        Returns DataFrame with 'ds', 'yhat', and 'upper_95'.
         """
         from statsforecast import StatsForecast
         
@@ -516,22 +516,34 @@ class ClassicalForecasts:
         
         # Fit and forecast
         sf.fit(df)
-        fcst = sf.forecast(h=h, df=df)
+        fcst = sf.forecast(h=h, df=df, level=[95])
         
         # Build output DataFrame
         last_ds = pd.to_datetime(df['ds'].iloc[-1])
         future_ds = pd.date_range(start=last_ds, periods=h+1, freq=self.freq)[1:]  # Skip first (it's last_ds)
         
-        # Get forecast column
-        forecast_cols = [col for col in fcst.columns if col not in ['unique_id', 'ds']]
+        # Get point forecast column (exclude interval columns like *-hi-95, *-lo-95)
+        forecast_cols = [
+            col for col in fcst.columns
+            if col not in ['unique_id', 'ds'] and not col.endswith('-hi-95') and not col.endswith('-lo-95')
+        ]
         if not forecast_cols:
             raise ValueError(f"No forecast column found in output for {self.local_model}")
-        
         forecast_col = forecast_cols[0]
+        yhat = fcst[forecast_col].to_numpy(dtype=float)
+        # StatsForecast uses {ModelName}-hi-95 per Nixtla docs; fallback to any -hi-95 if alias differs
+        hi_col = f"{forecast_col}-hi-95"
+        if hi_col in fcst.columns:
+            upper = fcst[hi_col].to_numpy(dtype=float)
+        else:
+            hi_candidates = [c for c in fcst.columns if c.endswith('-hi-95')]
+            upper = fcst[hi_candidates[0]].to_numpy(dtype=float) if hi_candidates else np.maximum(yhat * 1.5, yhat + 1.0)
+        upper_95 = np.maximum(np.maximum(upper, yhat), 0.0)
         
         out = pd.DataFrame({
             'ds': future_ds,
-            'yhat': fcst[forecast_col].to_numpy(dtype=float)
+            'yhat': yhat,
+            'upper_95': upper_95
         })
         return out
 
@@ -565,7 +577,7 @@ class ClassicalForecasts:
     ) -> pd.DataFrame:
         """Select best StatsForecast model per series and forecast.
 
-        Returns DataFrame with columns: ['unique_id', 'ds', 'yhat', 'model_used'].
+        Returns DataFrame with columns: ['unique_id', 'ds', 'yhat', 'model_used', 'upper_95'].
         """
         from statsforecast import StatsForecast
         from utilsforecast.evaluation import evaluate
@@ -892,12 +904,21 @@ class ClassicalForecasts:
             if not uids:
                 continue
             sf_one = StatsForecast(models=[factory()], freq=self.freq, n_jobs=1)
-            fcst = sf_one.forecast(df=df[df['unique_id'].isin(uids)], h=h)
+            fcst = sf_one.forecast(df=df[df['unique_id'].isin(uids)], h=h, level=[95])
             if model_name not in fcst.columns:
                 raise RuntimeError(f"Expected forecast column '{model_name}' not found")
             part = fcst.loc[:, ['unique_id', 'ds']].copy()
-            part['yhat'] = fcst[model_name].to_numpy(dtype=float)
+            yhat = fcst[model_name].to_numpy(dtype=float)
+            part['yhat'] = yhat
             part['model_used'] = model_name
+            # StatsForecast uses {ModelName}-hi-95 per Nixtla docs; fallback to any -hi-95 if alias differs
+            hi_col = f"{model_name}-hi-95"
+            if hi_col in fcst.columns:
+                upper = fcst[hi_col].to_numpy(dtype=float)
+            else:
+                hi_candidates = [c for c in fcst.columns if c.endswith('-hi-95')]
+                upper = fcst[hi_candidates[0]].to_numpy(dtype=float) if hi_candidates else np.maximum(yhat * 1.5, yhat + 1.0)
+            part['upper_95'] = np.maximum(np.maximum(upper, yhat), 0.0)
             parts.append(part)
 
         if not parts:
@@ -905,6 +926,7 @@ class ClassicalForecasts:
 
         out = pd.concat(parts, ignore_index=True)
         out['yhat'] = out['yhat'].clip(lower=0.0)
+        out['upper_95'] = out['upper_95'].clip(lower=out['yhat'])
         return out.sort_values(['unique_id', 'ds']).reset_index(drop=True)
 
     def auto_model_forecast_single(
@@ -916,8 +938,8 @@ class ClassicalForecasts:
         n_windows: int = 1,
         lookback_days: Optional[int] = None,
         lookback_periods: Optional[int] = None,
-    ) -> tuple[np.ndarray, str]:
-        """Auto-select a model for a single series; returns (forecast_path, model_used)."""
+    ) -> tuple[np.ndarray, str, np.ndarray]:
+        """Auto-select a model for a single series; returns (forecast_path, model_used, upper_95)."""
         df = item_hist.rename(columns={'day': 'ds', 'actual_sale': 'y'}).loc[:, ['ds', 'y']].copy()
         df['unique_id'] = 'item'
         panel = self.auto_model_forecast_panel(
@@ -931,7 +953,8 @@ class ClassicalForecasts:
         )
         model_used = str(panel['model_used'].iloc[0])
         path = panel['yhat'].to_numpy(dtype=float)
-        return path, model_used
+        upper_95 = panel['upper_95'].to_numpy(dtype=float)
+        return path, model_used, upper_95
 
     def forecast_panel_with_selected_models(
         self,
@@ -945,7 +968,7 @@ class ClassicalForecasts:
         on a transformed representation (e.g., monthly aggregates) but forecasting
         should be performed at the original frequency.
 
-        Returns DataFrame with columns: ['unique_id', 'ds', 'yhat', 'model_used'].
+        Returns DataFrame with columns: ['unique_id', 'ds', 'yhat', 'model_used', 'upper_95'].
         """
         from statsforecast import StatsForecast
 
@@ -972,12 +995,21 @@ class ClassicalForecasts:
                 factory = factories.get('Naive')
                 model_name = 'Naive'
             sf_one = StatsForecast(models=[factory()], freq=self.freq, n_jobs=1)
-            fcst = sf_one.forecast(df=df[df['unique_id'].isin(uids)], h=h)
+            fcst = sf_one.forecast(df=df[df['unique_id'].isin(uids)], h=h, level=[95])
             if model_name not in fcst.columns:
                 raise RuntimeError(f"Expected forecast column '{model_name}' not found")
             part = fcst.loc[:, ['unique_id', 'ds']].copy()
-            part['yhat'] = fcst[model_name].to_numpy(dtype=float)
+            yhat = fcst[model_name].to_numpy(dtype=float)
+            part['yhat'] = yhat
             part['model_used'] = model_name
+            # StatsForecast uses {ModelName}-hi-95 per Nixtla docs; fallback to any -hi-95 if alias differs
+            hi_col = f"{model_name}-hi-95"
+            if hi_col in fcst.columns:
+                upper = fcst[hi_col].to_numpy(dtype=float)
+            else:
+                hi_candidates = [c for c in fcst.columns if c.endswith('-hi-95')]
+                upper = fcst[hi_candidates[0]].to_numpy(dtype=float) if hi_candidates else np.maximum(yhat * 1.5, yhat + 1.0)
+            part['upper_95'] = np.maximum(np.maximum(upper, yhat), 0.0)
             parts.append(part)
 
         if not parts:
@@ -985,24 +1017,29 @@ class ClassicalForecasts:
 
         out = pd.concat(parts, ignore_index=True)
         out['yhat'] = out['yhat'].clip(lower=0.0)
+        out['upper_95'] = out['upper_95'].clip(lower=out['yhat'])
         return out.sort_values(['unique_id', 'ds']).reset_index(drop=True)
 
     # ---------- Public: daily path ----------
-    def daily_path(self, item_hist: pd.DataFrame, periods: int) -> np.ndarray:
+    def daily_path(
+        self, item_hist: pd.DataFrame, periods: int
+    ) -> tuple[np.ndarray, Optional[np.ndarray]]:
         """
-        Returns a length=periods np.array of forecasts (float),
-        aligned to the next period after the last 'day' in item_hist.
+        Returns (path, upper_95) where path is a length=periods np.array of forecasts (float),
+        aligned to the next period after the last 'day' in item_hist. upper_95 is the 95% quantile
+        band when available (local/AutoModel) or None (TimeGPT).
         """
         if self.mode == 'timegpt':
             fcst = self._timegpt_forecast_path(item_hist, periods)
-        else:
-            if self.local_model in ('auto_model', 'automodel'):
-                path, _ = self.auto_model_forecast_single(item_hist, h=periods)
-                return np.maximum(path, 0.0)
-            fcst = self._local_forecast_path(item_hist, periods)
-
+            path = fcst['yhat'].to_numpy(dtype=float)
+            return np.maximum(path, 0.0), None
+        if self.local_model in ('auto_model', 'automodel'):
+            path, _, upper_95 = self.auto_model_forecast_single(item_hist, h=periods)
+            return np.maximum(path, 0.0), np.maximum(upper_95, 0.0)
+        fcst = self._local_forecast_path(item_hist, periods)
         path = fcst['yhat'].to_numpy(dtype=float)
-        return np.maximum(path, 0.0)
+        upper_95 = fcst['upper_95'].to_numpy(dtype=float)
+        return np.maximum(path, 0.0), np.maximum(upper_95, 0.0)
 
     # ---------- Public: lead-time totals for service levels ----------
     def leadtime_total_quantile(self,
@@ -1039,7 +1076,7 @@ class ClassicalForecasts:
                     totals[t] = np.maximum(draws, 0.0).sum()
                 return float(np.quantile(totals, serv_lev, method='higher'))
 
-        path = self.daily_path(item_hist, periods)
+        path, _ = self.daily_path(item_hist, periods)
         hist = item_hist['actual_sale'].to_numpy(dtype=float)
         if len(hist) >= self.season_length + 1:
             resids = hist[self.season_length:] - hist[:-self.season_length]

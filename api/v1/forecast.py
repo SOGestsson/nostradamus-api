@@ -355,13 +355,16 @@ def generate_forecast(request: ForecastRequest):
 
                     grp = grp.sort_values('ds')
                     model_used = str(grp['model_used'].iloc[0])
-                    results.append({
+                    item_result = {
                         'item_id': item_id_out,
                         'forecast': grp['yhat'].to_numpy(dtype=float).tolist(),
                         'forecast_dates': [pd.to_datetime(d).strftime('%Y-%m-%d') for d in grp['ds'].tolist()],
                         'model_used': model_used,
                         'periods_forecasted': int(len(grp))
-                    })
+                    }
+                    if 'upper_95' in grp.columns:
+                        item_result['upper_95'] = grp['upper_95'].to_numpy(dtype=float).tolist()
+                    results.append(item_result)
                     print(f"  ✓ Item {uid}: auto_model -> {model_used}")
                 except Exception as e:
                     print(f"  ✗ Item {uid}: {str(e)}")
@@ -376,7 +379,9 @@ def generate_forecast(request: ForecastRequest):
                 try:
                     item_data = df_his[df_his['item_id'] == item_id].sort_values('day').reset_index(drop=True)
 
-                    forecast_values = forecaster.daily_path(item_data, periods=request.forecast_periods)
+                    forecast_values, upper_95_values = forecaster.daily_path(
+                        item_data, periods=request.forecast_periods
+                    )
 
                     last_date = item_data['day'].max()
                     offset = to_offset(freq_req)
@@ -386,13 +391,16 @@ def generate_forecast(request: ForecastRequest):
                         freq=freq_req
                     )
 
-                    results.append({
+                    item_result = {
                         'item_id': int(item_id) if isinstance(item_id, (int, float)) else str(item_id),
                         'forecast': forecast_values.tolist(),
                         'forecast_dates': [d.strftime('%Y-%m-%d') for d in future_dates],
                         'model_used': request.local_model if request.mode == 'local' else 'timegpt',
                         'periods_forecasted': len(forecast_values)
-                    })
+                    }
+                    if upper_95_values is not None:
+                        item_result['upper_95'] = upper_95_values.tolist()
+                    results.append(item_result)
 
                     print(f"  ✓ Item {item_id}: forecast generated")
 
@@ -492,13 +500,16 @@ async def generate_forecast_async(request: ForecastRequest):
 
                     grp = grp.sort_values('ds')
                     model_used = str(grp['model_used'].iloc[0])
-                    results.append({
+                    item_result = {
                         'item_id': item_id_out,
                         'forecast': grp['yhat'].to_numpy(dtype=float).tolist(),
                         'forecast_dates': [pd.to_datetime(d).strftime('%Y-%m-%d') for d in grp['ds'].tolist()],
                         'model_used': model_used,
                         'periods_forecasted': int(len(grp))
-                    })
+                    }
+                    if 'upper_95' in grp.columns:
+                        item_result['upper_95'] = grp['upper_95'].to_numpy(dtype=float).tolist()
+                    results.append(item_result)
                     print(f"  ✓ Item {uid}: async auto_model -> {model_used}")
                 except Exception as e:
                     print(f"  ✗ Item {uid}: {str(e)}")
@@ -513,7 +524,9 @@ async def generate_forecast_async(request: ForecastRequest):
                 try:
                     item_data = df_his[df_his['item_id'] == item_id].sort_values('day').reset_index(drop=True)
 
-                    forecast_values = await asyncio.to_thread(forecaster.daily_path, item_data, request.forecast_periods)
+                    forecast_values, upper_95_values = await asyncio.to_thread(
+                        forecaster.daily_path, item_data, request.forecast_periods
+                    )
 
                     last_date = item_data['day'].max()
                     offset = to_offset(freq_req)
@@ -523,13 +536,16 @@ async def generate_forecast_async(request: ForecastRequest):
                         freq=freq_req
                     )
 
-                    results.append({
+                    item_result = {
                         'item_id': int(item_id) if isinstance(item_id, (int, float)) else str(item_id),
                         'forecast': forecast_values.tolist(),
                         'forecast_dates': [d.strftime('%Y-%m-%d') for d in future_dates],
                         'model_used': request.local_model if request.mode == 'local' else 'timegpt',
                         'periods_forecasted': len(forecast_values)
-                    })
+                    }
+                    if upper_95_values is not None:
+                        item_result['upper_95'] = upper_95_values.tolist()
+                    results.append(item_result)
 
                     print(f"  ✓ Item {item_id}: async forecast generated")
 

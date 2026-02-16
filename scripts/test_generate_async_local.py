@@ -26,7 +26,8 @@ def fake_daily_path(self, item_hist, periods):
         last = float(item_hist['actual_sale'].iloc[-1])
     except Exception:
         last = 0.0
-    return np.array([last for _ in range(periods)], dtype=float)
+    path = np.array([last for _ in range(periods)], dtype=float)
+    return path, None
 
 cf.ClassicalForecasts.daily_path = fake_daily_path
 
