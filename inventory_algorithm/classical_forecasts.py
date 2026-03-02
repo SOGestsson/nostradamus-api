@@ -514,9 +514,19 @@ class ClassicalForecasts:
             n_jobs=1
         )
         
-        # Fit and forecast
+        # Fit and forecast. StatsForecast 2.x requires prediction_intervals when level is passed.
         sf.fit(df)
-        fcst = sf.forecast(h=h, df=df, level=[95])
+        try:
+            from statsforecast.utils import ConformalIntervals
+            n_windows = 2
+            min_len = df.groupby('unique_id').size().min() if 'unique_id' in df.columns else len(df)
+            if min_len > n_windows * h:
+                intervals = ConformalIntervals(h=h, n_windows=n_windows)
+                fcst = sf.forecast(h=h, df=df, level=[95], prediction_intervals=intervals)
+            else:
+                fcst = sf.forecast(h=h, df=df)
+        except Exception:
+            fcst = sf.forecast(h=h, df=df)
         
         # Build output DataFrame
         last_ds = pd.to_datetime(df['ds'].iloc[-1])
@@ -904,7 +914,18 @@ class ClassicalForecasts:
             if not uids:
                 continue
             sf_one = StatsForecast(models=[factory()], freq=self.freq, n_jobs=1)
-            fcst = sf_one.forecast(df=df[df['unique_id'].isin(uids)], h=h, level=[95])
+            subset = df[df['unique_id'].isin(uids)]
+            try:
+                from statsforecast.utils import ConformalIntervals
+                min_len = subset.groupby('unique_id').size().min()
+                n_windows = 2
+                if min_len > n_windows * h:
+                    intervals = ConformalIntervals(h=h, n_windows=n_windows)
+                    fcst = sf_one.forecast(df=subset, h=h, level=[95], prediction_intervals=intervals)
+                else:
+                    fcst = sf_one.forecast(df=subset, h=h)
+            except Exception:
+                fcst = sf_one.forecast(df=subset, h=h)
             if model_name not in fcst.columns:
                 raise RuntimeError(f"Expected forecast column '{model_name}' not found")
             part = fcst.loc[:, ['unique_id', 'ds']].copy()
@@ -995,7 +1016,18 @@ class ClassicalForecasts:
                 factory = factories.get('Naive')
                 model_name = 'Naive'
             sf_one = StatsForecast(models=[factory()], freq=self.freq, n_jobs=1)
-            fcst = sf_one.forecast(df=df[df['unique_id'].isin(uids)], h=h, level=[95])
+            subset = df[df['unique_id'].isin(uids)]
+            try:
+                from statsforecast.utils import ConformalIntervals
+                min_len = subset.groupby('unique_id').size().min()
+                n_windows = 2
+                if min_len > n_windows * h:
+                    intervals = ConformalIntervals(h=h, n_windows=n_windows)
+                    fcst = sf_one.forecast(df=subset, h=h, level=[95], prediction_intervals=intervals)
+                else:
+                    fcst = sf_one.forecast(df=subset, h=h)
+            except Exception:
+                fcst = sf_one.forecast(df=subset, h=h)
             if model_name not in fcst.columns:
                 raise RuntimeError(f"Expected forecast column '{model_name}' not found")
             part = fcst.loc[:, ['unique_id', 'ds']].copy()
