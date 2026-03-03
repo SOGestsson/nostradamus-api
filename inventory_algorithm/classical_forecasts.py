@@ -573,6 +573,17 @@ class ClassicalForecasts:
             'upper_90': upper_90,
             'upper_95': upper_95
         })
+        # Replace any non-finite values with safe fallbacks based on yhat.
+        for col in ['yhat', 'upper_70', 'upper_90', 'upper_95']:
+            vals = out[col].to_numpy(dtype=float)
+            mask = ~np.isfinite(vals)
+            if np.any(mask):
+                # For yhat, fall back to 0; for quantiles, fall back to yhat.
+                if col == 'yhat':
+                    vals[mask] = 0.0
+                else:
+                    vals[mask] = np.maximum(out['yhat'].to_numpy(dtype=float)[mask], 0.0)
+                out[col] = vals
         return out
 
     def _to_statsforecast_df(self, hist: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, object]]:
@@ -982,6 +993,13 @@ class ClassicalForecasts:
 
         out = pd.concat(parts, ignore_index=True)
         out['yhat'] = out['yhat'].clip(lower=0.0)
+        # Replace non-finite quantiles with safe fallbacks and enforce nesting.
+        for col in ['upper_70', 'upper_90', 'upper_95']:
+            vals = out[col].to_numpy(dtype=float)
+            mask = ~np.isfinite(vals)
+            if np.any(mask):
+                vals[mask] = np.maximum(out['yhat'].to_numpy(dtype=float)[mask], 0.0)
+                out[col] = vals
         out['upper_95'] = out['upper_95'].clip(lower=out['yhat'])
         out['upper_90'] = out['upper_90'].clip(lower=out['yhat'], upper=out['upper_95'])
         out['upper_70'] = out['upper_70'].clip(lower=out['yhat'], upper=out['upper_90'])
@@ -1105,6 +1123,13 @@ class ClassicalForecasts:
 
         out = pd.concat(parts, ignore_index=True)
         out['yhat'] = out['yhat'].clip(lower=0.0)
+        # Replace non-finite quantiles with safe fallbacks and enforce nesting.
+        for col in ['upper_70', 'upper_90', 'upper_95']:
+            vals = out[col].to_numpy(dtype=float)
+            mask = ~np.isfinite(vals)
+            if np.any(mask):
+                vals[mask] = np.maximum(out['yhat'].to_numpy(dtype=float)[mask], 0.0)
+                out[col] = vals
         out['upper_95'] = out['upper_95'].clip(lower=out['yhat'])
         out['upper_90'] = out['upper_90'].clip(lower=out['yhat'], upper=out['upper_95'])
         out['upper_70'] = out['upper_70'].clip(lower=out['yhat'], upper=out['upper_90'])
