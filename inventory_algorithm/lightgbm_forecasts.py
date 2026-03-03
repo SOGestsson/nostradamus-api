@@ -3745,6 +3745,11 @@ class LightGBMForecast:
                         "unique_id": str(uid),
                         "ds": forecast_ds,
                         "yhat": yhat,
+                        # Provide a small set of aligned upper-quantiles for downstream inventory logic.
+                        # upper_70/upper_90 are derived deterministically from upper_95 to avoid retraining
+                        # additional quantile models. (Inventory layer can refine later.)
+                        "upper_70": float(max(yhat, yhat + 0.4 * max(0.0, float(upper_95) - yhat), 0.0)),
+                        "upper_90": float(max(yhat, yhat + 0.8 * max(0.0, float(upper_95) - yhat), 0.0)),
                         "upper_95": upper_95,
                         "adjustments": adjustments,
                     }
@@ -3757,6 +3762,10 @@ class LightGBMForecast:
             fcst["ds"] = pd.to_datetime(fcst["ds"], errors="coerce").dt.to_period("M").dt.to_timestamp(how="start")
             fcst["day"] = pd.to_datetime(fcst["ds"]).dt.strftime("%Y-%m-%d")
             cols = ["item_id", "day", "yhat"]
+            if "upper_70" in fcst.columns:
+                cols.append("upper_70")
+            if "upper_90" in fcst.columns:
+                cols.append("upper_90")
             if "upper_95" in fcst.columns:
                 cols.append("upper_95")
             fcst = fcst[cols]

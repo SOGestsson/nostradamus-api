@@ -543,7 +543,7 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
         # Convert ML results to per-item format
         out: list[dict[str, Any]] = []
         if fcst_df.empty:
-            fcst_df = pd.DataFrame(columns=["item_id", "day", "yhat", "upper_95"])
+            fcst_df = pd.DataFrame(columns=["item_id", "day", "yhat", "upper_70", "upper_90", "upper_95"])
 
         for item_id in unique_ids:
             elig = eligibility.get(str(item_id)) or {}
@@ -557,6 +557,12 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
                 item_fcst = fcst_df[fcst_df["item_id"].astype(str) == str(item_id)].sort_values("day")
                 if len(item_fcst) == int(request.forecast_periods):
                     yhat = item_fcst["yhat"].to_numpy(dtype=float).tolist()
+                    upper_70 = None
+                    if "upper_70" in item_fcst.columns:
+                        upper_70 = item_fcst["upper_70"].to_numpy(dtype=float).tolist()
+                    upper_90 = None
+                    if "upper_90" in item_fcst.columns:
+                        upper_90 = item_fcst["upper_90"].to_numpy(dtype=float).tolist()
                     upper_95 = None
                     if "upper_95" in item_fcst.columns:
                         upper_95 = item_fcst["upper_95"].to_numpy(dtype=float).tolist()
@@ -577,6 +583,8 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
                         {
                             "item_id": item_id,
                             "forecast": yhat,
+                            "upper_70": upper_70,
+                            "upper_90": upper_90,
                             "upper_95": upper_95,
                             "forecast_dates": days,
                             "model_used": str(winner),
@@ -731,7 +739,7 @@ def batch_forecast_lightgbm_async(
             # Convert ML results to per-item format
             out: list[dict[str, Any]] = []
             if fcst_df.empty:
-                fcst_df = pd.DataFrame(columns=["item_id", "day", "yhat", "upper_95"])
+                fcst_df = pd.DataFrame(columns=["item_id", "day", "yhat", "upper_70", "upper_90", "upper_95"])
 
             for item_id in unique_ids:
                 elig = eligibility.get(str(item_id)) or {}
@@ -745,6 +753,12 @@ def batch_forecast_lightgbm_async(
                     item_fcst = fcst_df[fcst_df["item_id"].astype(str) == str(item_id)].sort_values("day")
                     if len(item_fcst) == int(request.forecast_periods):
                         yhat = item_fcst["yhat"].to_numpy(dtype=float).tolist()
+                        upper_70 = None
+                        if "upper_70" in item_fcst.columns:
+                            upper_70 = item_fcst["upper_70"].to_numpy(dtype=float).tolist()
+                        upper_90 = None
+                        if "upper_90" in item_fcst.columns:
+                            upper_90 = item_fcst["upper_90"].to_numpy(dtype=float).tolist()
                         upper_95 = None
                         if "upper_95" in item_fcst.columns:
                             upper_95 = item_fcst["upper_95"].to_numpy(dtype=float).tolist()
@@ -764,6 +778,8 @@ def batch_forecast_lightgbm_async(
                             {
                                 "item_id": item_id,
                                 "forecast": yhat,
+                                "upper_70": upper_70,
+                                "upper_90": upper_90,
                                 "upper_95": upper_95,
                                 "forecast_dates": days,
                                 "model_used": str(winner),

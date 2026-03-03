@@ -362,6 +362,10 @@ def generate_forecast(request: ForecastRequest):
                         'model_used': model_used,
                         'periods_forecasted': int(len(grp))
                     }
+                    if 'upper_70' in grp.columns:
+                        item_result['upper_70'] = grp['upper_70'].to_numpy(dtype=float).tolist()
+                    if 'upper_90' in grp.columns:
+                        item_result['upper_90'] = grp['upper_90'].to_numpy(dtype=float).tolist()
                     if 'upper_95' in grp.columns:
                         item_result['upper_95'] = grp['upper_95'].to_numpy(dtype=float).tolist()
                     results.append(item_result)
@@ -379,7 +383,7 @@ def generate_forecast(request: ForecastRequest):
                 try:
                     item_data = df_his[df_his['item_id'] == item_id].sort_values('day').reset_index(drop=True)
 
-                    forecast_values, upper_95_values = forecaster.daily_path(
+                    forecast_values, quantiles = forecaster.daily_path(
                         item_data, periods=request.forecast_periods
                     )
 
@@ -398,8 +402,13 @@ def generate_forecast(request: ForecastRequest):
                         'model_used': request.local_model if request.mode == 'local' else 'timegpt',
                         'periods_forecasted': len(forecast_values)
                     }
-                    if upper_95_values is not None:
-                        item_result['upper_95'] = upper_95_values.tolist()
+                    if quantiles is not None:
+                        if quantiles.get('upper_70') is not None:
+                            item_result['upper_70'] = quantiles['upper_70'].tolist()
+                        if quantiles.get('upper_90') is not None:
+                            item_result['upper_90'] = quantiles['upper_90'].tolist()
+                        if quantiles.get('upper_95') is not None:
+                            item_result['upper_95'] = quantiles['upper_95'].tolist()
                     results.append(item_result)
 
                     print(f"  ✓ Item {item_id}: forecast generated")
@@ -507,6 +516,10 @@ async def generate_forecast_async(request: ForecastRequest):
                         'model_used': model_used,
                         'periods_forecasted': int(len(grp))
                     }
+                    if 'upper_70' in grp.columns:
+                        item_result['upper_70'] = grp['upper_70'].to_numpy(dtype=float).tolist()
+                    if 'upper_90' in grp.columns:
+                        item_result['upper_90'] = grp['upper_90'].to_numpy(dtype=float).tolist()
                     if 'upper_95' in grp.columns:
                         item_result['upper_95'] = grp['upper_95'].to_numpy(dtype=float).tolist()
                     results.append(item_result)
@@ -524,7 +537,7 @@ async def generate_forecast_async(request: ForecastRequest):
                 try:
                     item_data = df_his[df_his['item_id'] == item_id].sort_values('day').reset_index(drop=True)
 
-                    forecast_values, upper_95_values = await asyncio.to_thread(
+                    forecast_values, quantiles = await asyncio.to_thread(
                         forecaster.daily_path, item_data, request.forecast_periods
                     )
 
@@ -543,8 +556,13 @@ async def generate_forecast_async(request: ForecastRequest):
                         'model_used': request.local_model if request.mode == 'local' else 'timegpt',
                         'periods_forecasted': len(forecast_values)
                     }
-                    if upper_95_values is not None:
-                        item_result['upper_95'] = upper_95_values.tolist()
+                    if quantiles is not None:
+                        if quantiles.get('upper_70') is not None:
+                            item_result['upper_70'] = quantiles['upper_70'].tolist()
+                        if quantiles.get('upper_90') is not None:
+                            item_result['upper_90'] = quantiles['upper_90'].tolist()
+                        if quantiles.get('upper_95') is not None:
+                            item_result['upper_95'] = quantiles['upper_95'].tolist()
                     results.append(item_result)
 
                     print(f"  ✓ Item {item_id}: async forecast generated")
