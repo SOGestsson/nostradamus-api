@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Request, Depends, Header
 import logging
 
 from api.models import ForecastRequest
+from api.daily_forecast_utils import monthly_to_daily
 from inventory_algorithm.classical_forecasts import ClassicalForecasts
 
 router = APIRouter()
@@ -433,6 +434,134 @@ def generate_forecast(request: ForecastRequest):
             'frequency': freq_req
         }
             
+    except Exception as e:
+        error_details = traceback.format_exc()
+        print(f"Full error traceback:\n{error_details}")
+        raise HTTPException(status_code=500, detail=f"Forecast error: {str(e)}")
+
+
+@router.post("/generate_daily")
+def generate_forecast_daily(request: ForecastRequest):
+    """
+    Classical forecast at monthly frequency, returned at daily level.
+
+    Uses the same request as POST /generate. Runs the classical (StatsForecast)
+    forecast to get monthly point forecasts and quantiles (upper_70, upper_90,
+    upper_95), then expands each month to daily:
+    - daily forecast = monthly forecast / number of days in month
+    - daily variance from quantiles (normal fit, average of sigma from 70/90/95,
+      then variance_month / n_days), or fallback (daily_forecast * 0.2)^2 when
+      no quantiles. All variance clamped non-negative.
+
+    Returns per item: forecast_dates (daily), forecast (daily), variance (daily).
+    Intended for monthly input (freq M/MS/ME); other frequencies work but expansion
+    is one day per period.
+    """
+    try:
+        if request.local_model in ('auto_model', 'automodel') and request.mode != 'local':
+            raise HTTPException(status_code=400, detail="local_model='auto_model' requires mode='local' (StatsForecast only)")
+
+        df_his = pd.DataFrame(request.sim_input_his)
+        required_cols = ['item_id', 'actual_sale', 'day']
+        missing_cols = [col for col in required_cols if col not in df_his.columns]
+        if missing_cols:
+            raise HTTPException(status_code=400, detail=f"Missing required columns: {missing_cols}")
+
+        df_his['day'] = pd.to_datetime(df_his['day'])
+        df_his, freq_req = _normalize_and_aggregate_history(df_his, request.freq)
+
+        forecaster = ClassicalForecasts(
+            mode=request.mode,
+            api_key=request.api_key,
+            quantiles=request.quantiles,
+            local_model=request.local_model,
+            season_length=request.season_length,
+            freq=freq_req,
+        )
+
+        results = []
+        unique_items = df_his['item_id'].unique()
+
+        if request.mode == 'local' and request.local_model in ('auto_model', 'automodel'):
+            metric = request.auto_model_metric or 'wape_bias'
+            cv_h_eff = int(request.auto_model_cv_h) if request.auto_model_cv_h is not None else int(min(request.forecast_periods, max(1, int(request.season_length))))
+            cv_h_eff = max(1, cv_h_eff)
+            n_windows = int(max(1, request.auto_model_n_windows)) if request.auto_model_n_windows is not None else int(max(1, math.ceil(max(1, int(request.season_length)) / float(cv_h_eff))))
+            n_windows = min(n_windows, 24)
+
+            panel_fcst = forecaster.auto_model_forecast_panel(
+                df_his,
+                h=request.forecast_periods,
+                metric=metric,
+                cv_h=request.auto_model_cv_h,
+                n_windows=n_windows,
+                lookback_days=request.auto_model_lookback_days,
+                lookback_periods=request.auto_model_lookback_periods,
+            )
+            id_map = {str(v): v for v in unique_items}
+            for uid, grp in panel_fcst.groupby('unique_id', sort=False):
+                try:
+                    original_item_id = id_map.get(str(uid), uid)
+                    item_id_out = int(original_item_id) if isinstance(original_item_id, (int, float)) else str(original_item_id)
+                    grp = grp.sort_values('ds')
+                    model_used = str(grp['model_used'].iloc[0])
+                    f_dates = [pd.to_datetime(d).strftime('%Y-%m-%d') for d in grp['ds'].tolist()]
+                    f_vals = grp['yhat'].to_numpy(dtype=float).tolist()
+                    u70 = grp['upper_70'].to_numpy(dtype=float).tolist() if 'upper_70' in grp.columns else None
+                    u90 = grp['upper_90'].to_numpy(dtype=float).tolist() if 'upper_90' in grp.columns else None
+                    u95 = grp['upper_95'].to_numpy(dtype=float).tolist() if 'upper_95' in grp.columns else None
+                    daily_dates, daily_forecast, daily_variance = monthly_to_daily(f_dates, f_vals, u70, u90, u95)
+                    results.append({
+                        'item_id': item_id_out,
+                        'forecast_dates': daily_dates,
+                        'forecast': daily_forecast,
+                        'variance': daily_variance,
+                        'model_used': model_used,
+                        'periods_forecasted': len(daily_dates),
+                    })
+                except Exception as e:
+                    results.append({'item_id': str(uid), 'error': str(e), 'forecast_dates': [], 'forecast': [], 'variance': []})
+        else:
+            for item_id in unique_items:
+                try:
+                    item_data = df_his[df_his['item_id'] == item_id].sort_values('day').reset_index(drop=True)
+                    forecast_values, quantiles = forecaster.daily_path(item_data, periods=request.forecast_periods)
+                    last_date = item_data['day'].max()
+                    offset = to_offset(freq_req)
+                    future_dates = pd.date_range(start=last_date + offset, periods=request.forecast_periods, freq=freq_req)
+                    f_dates = [d.strftime('%Y-%m-%d') for d in future_dates]
+                    f_vals = forecast_values.tolist()
+                    u70 = quantiles['upper_70'].tolist() if quantiles and quantiles.get('upper_70') is not None else None
+                    u90 = quantiles['upper_90'].tolist() if quantiles and quantiles.get('upper_90') is not None else None
+                    u95 = quantiles['upper_95'].tolist() if quantiles and quantiles.get('upper_95') is not None else None
+                    daily_dates, daily_forecast, daily_variance = monthly_to_daily(f_dates, f_vals, u70, u90, u95)
+                    results.append({
+                        'item_id': int(item_id) if isinstance(item_id, (int, float)) else str(item_id),
+                        'forecast_dates': daily_dates,
+                        'forecast': daily_forecast,
+                        'variance': daily_variance,
+                        'model_used': request.local_model if request.mode == 'local' else 'timegpt',
+                        'periods_forecasted': len(daily_dates),
+                    })
+                except Exception as e:
+                    results.append({
+                        'item_id': int(item_id) if isinstance(item_id, (int, float)) else str(item_id),
+                        'error': str(e),
+                        'forecast_dates': [],
+                        'forecast': [],
+                        'variance': [],
+                    })
+
+        return {
+            'forecasts': results,
+            'total_items': len(unique_items),
+            'mode': request.mode,
+            'model': request.local_model if request.mode == 'local' else 'timegpt',
+            'periods': request.forecast_periods,
+            'frequency': freq_req,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         error_details = traceback.format_exc()
         print(f"Full error traceback:\n{error_details}")

@@ -676,14 +676,90 @@ class ClassicalForecasts:
         # obviously-wrong models (accuracy).
         buckets: dict[str, list[str]] = {}
         best_by_uid: dict[str, str] = {uid: 'Naive' for uid in counts.index.tolist()}
+        # Track uids that look like "event-seasonal" (most demand in the same month each year).
+        event_seasonal_uid: dict[str, bool] = {}
+        # Track uids with a strong monotone trend, where naive forecasts are often too flat.
+        strong_trend_uid: dict[str, bool] = {}
+        # Track uids that appear to have a recent level shift where pure SeasonalNaive
+        # tends to lag badly (we'll bias towards adaptive models in those buckets).
+        level_shift_uid: dict[str, bool] = {}
+
+        def _looks_event_seasonal(g: pd.DataFrame, season_length: int) -> bool:
+            """Heuristic: demand mostly concentrated in the same calendar month each year.
+
+            Cheap O(n) test used only to bias candidate model sets; avoids extra CV.
+            """
+            if season_length < 2:
+                return False
+            # Require at least ~2 seasons of data.
+            if len(g) < 2 * season_length:
+                return False
+            nz = g[g['y'] > 0.0].copy()
+            if nz.empty:
+                return False
+            nz['month'] = pd.to_datetime(nz['ds']).dt.month
+            counts_month = nz['month'].value_counts(normalize=True)
+            top_frac = float(counts_month.iloc[0]) if not counts_month.empty else 0.0
+            # If >= 60% of all non-zero months fall in the same calendar month,
+            # treat as event-seasonal (e.g., Christmas-only items).
+            return top_frac >= 0.6
+        def _looks_level_shift(y: np.ndarray) -> bool:
+            """Heuristic: detect a relatively recent discrete level change.
+
+            We compare the last few observations to the preceding window and look for
+            a large relative change in the local mean. This is intentionally simple
+            and only used to *bias* candidate model sets (never to hard-code picks).
+            """
+            y = np.asarray(y, dtype=float)
+            y = y[np.isfinite(y)]
+            n = y.size
+            # Need enough data for two short windows.
+            if n < 12:
+                return False
+            # Use up to 6 points for each side, but shrink on shorter series.
+            m = int(min(6, max(3, n // 4)))
+            if 2 * m > n:
+                return False
+            prev = y[-2 * m : -m]
+            curr = y[-m:]
+            prev_mean = float(prev.mean())
+            curr_mean = float(curr.mean())
+            # Ignore if both windows are essentially zero.
+            if prev_mean <= 0 and curr_mean <= 0:
+                return False
+            # Require at least a 60% relative jump up or down.
+            ref = max(prev_mean, curr_mean, 1e-6)
+            rel_change = abs(curr_mean - prev_mean) / ref
+            return rel_change >= 0.6
 
         for uid, n_obs in counts.items():
-            y = df.loc[df['unique_id'] == uid, 'y'].to_numpy(dtype=float)
-            prof = _series_profile(y)
+            g_uid = df.loc[df['unique_id'] == uid, ['unique_id', 'ds', 'y']].copy()
+            y_full = g_uid['y'].to_numpy(dtype=float)
+            # Trim leading zeros for profiling/bucketing so launch-phase zeros don't
+            # dominate n, zero_frac, or trend detection. Keep zeros after the first
+            # positive month (true stockouts/off-season).
+            mask_pos = y_full > 0.0
+            if mask_pos.any():
+                first_pos = int(np.argmax(mask_pos))
+                y_eff = y_full[first_pos:]
+            else:
+                y_eff = y_full
+            prof = _series_profile(y_eff)
             bucket = _bucket_series(prof, season_length=season_for_models, min_arima_len=min_arima_len)
+            n_eff = int(prof.get('n', float(len(y_eff))))  # effective history length
+            # Record event-seasonal flag (only meaningful when we have ~2 seasons of data).
+            event_seasonal_uid[uid] = _looks_event_seasonal(g_uid, int(season_for_models))
+            # Strong trend: high absolute correlation with time index.
+            try:
+                trend_corr = float(prof.get('trend_corr', 0.0))  # type: ignore[arg-type]
+            except Exception:
+                trend_corr = 0.0
+            strong_trend_uid[uid] = bool(abs(trend_corr) >= 0.7)
+            # Level shift: sizeable relative change between recent windows of the series.
+            level_shift_uid[uid] = _looks_level_shift(y_eff)
 
             # Heuristic selections for very short series (skip CV entirely)
-            if bucket == 'short' or int(n_obs) < min_len:
+            if bucket == 'short' or int(n_eff) < min_len:
                 # Intermittent series: if we skip CV due to length, avoid collapsing to Naive
                 # (Naive tends to win trivial off-season windows).
                 if bucket == 'intermittent':
@@ -703,16 +779,26 @@ class ClassicalForecasts:
 
                 # Monthly fallbacks:
                 # - Intermittent already handled above.
-                # - 12-23 months: SeasonalWindowAverage is typically a better baseline than Naive.
+                # - 12-23 months: use a short-horizon average/smoothing instead of copying
+                #   last year. Favor SeasonalWindowAverage for \"swinging\" items and a
+                #   simple seasonal ETS for clearly trending ones.
                 # - Otherwise: simple moving average over all available months -> HistoricAverage.
-                if is_monthly and 12 <= int(n_obs) <= 23:
-                    best_by_uid[uid] = 'SeasonalWindowAverage'
+                if is_monthly and 12 <= int(n_eff) <= 23:
+                    # Reuse trend_corr from prof; strong trend -> AutoETS, otherwise SWA.
+                    try:
+                        trend_corr = float(prof.get('trend_corr', 0.0))  # type: ignore[arg-type]
+                    except Exception:
+                        trend_corr = 0.0
+                    if abs(trend_corr) >= 0.5:
+                        best_by_uid[uid] = 'AutoETS'
+                    else:
+                        best_by_uid[uid] = 'SeasonalWindowAverage'
                     if debug:
                         debug_reason[uid] = {
                             'reason': 'short_or_insufficient_len',
-                            'picked': 'SeasonalWindowAverage',
+                            'picked': best_by_uid[uid],
                             'bucket': bucket,
-                            'n_obs': int(n_obs),
+                            'n_obs': int(n_eff),
                             'min_len': int(min_len),
                             'season_for_models': int(season_for_models),
                             'cv_h_eff': int(cv_h_eff),
@@ -720,14 +806,14 @@ class ClassicalForecasts:
                         }
                     continue
 
-                if is_monthly and int(n_obs) < 12:
+                if is_monthly and int(n_eff) < 12:
                     best_by_uid[uid] = 'HistoricAverage'
                     if debug:
                         debug_reason[uid] = {
                             'reason': 'short_or_insufficient_len',
                             'picked': 'HistoricAverage',
                             'bucket': bucket,
-                            'n_obs': int(n_obs),
+                            'n_obs': int(n_eff),
                             'min_len': int(min_len),
                             'season_for_models': int(season_for_models),
                             'cv_h_eff': int(cv_h_eff),
@@ -765,14 +851,31 @@ class ClassicalForecasts:
 
             buckets.setdefault(bucket, []).append(uid)
 
-        def _candidate_keys_for_bucket(bucket: str, n_obs: int) -> list[str]:
+        def _candidate_keys_for_bucket(
+            bucket: str,
+            n_obs: int,
+            any_event_seasonal: bool,
+            any_strong_trend: bool,
+            any_level_shift: bool,
+        ) -> list[str]:
             # Keep candidate sets small for speed.
             if bucket == 'intermittent':
                 # Intermittent series: prefer intermittent-demand models (+ seasonal naive).
                 # NOTE: We intentionally exclude plain Naive here because it tends to win
                 # error metrics on mostly-zero holdout windows by predicting 0, which is
                 # often not the desired behaviour for replenishment planning.
-                return ['croston_optimized', 'adida', 'seasonal_naive']
+                # For monthly series with at least ~2 seasons of history, always include
+                # at least one seasonal model in the candidate set so strong seasonal
+                # patterns (e.g., Christmas-only items) can be captured.
+                base_keys = ['croston_optimized', 'adida', 'seasonal_naive']
+                if int(season_for_models) >= 2 and int(n_obs) >= 2 * int(season_for_models):
+                    if any_event_seasonal:
+                        # For clearly event-seasonal series, bias towards seasonal models
+                        # but keep one intermittent model as backup.
+                        return ['seasonal_naive', 'auto_ets', 'croston_optimized']
+                    # Otherwise, just add a single seasonal model to the pool.
+                    base_keys.append('auto_ets')
+                return base_keys
             if bucket == 'seasonal':
                 # Seasonal series: bias away from Naive so we actually test seasonal models.
                 return ['seasonal_naive', 'auto_ets', 'theta', 'optimized_theta']
@@ -783,6 +886,14 @@ class ClassicalForecasts:
                 # (common for monthly series with ~13-23 months of history).
                 if int(self.season_length) >= 2 and int(n_obs) >= int(self.season_length) + 1:
                     keys.insert(0, 'seasonal_naive')
+                # For clear level shifts, bias away from plain SeasonalNaive which
+                # tends to extrapolate the pre-shift level indefinitely.
+                if any_level_shift:
+                    keys = [k for k in keys if k != 'seasonal_naive']
+                # For strongly trending series, bias away from plain Naive (which tends to
+                # extrapolate the last value and under-react to clear trends).
+                if any_strong_trend:
+                    keys = [k for k in keys if k != 'naive']
                 if n_obs >= min_arima_len:
                     keys.insert(0, 'auto_arima')
                 return keys
@@ -802,8 +913,11 @@ class ClassicalForecasts:
 
             # Determine max n_obs in bucket to decide if AutoARIMA is allowed.
             max_n = int(counts.loc[uids].max())
+            any_event = any(bool(event_seasonal_uid.get(uid, False)) for uid in uids)
+            any_strong_trend = any(bool(strong_trend_uid.get(uid, False)) for uid in uids)
+            any_level_shift = any(bool(level_shift_uid.get(uid, False)) for uid in uids)
             model_specs = _build_model_factories_for_keys(
-                _candidate_keys_for_bucket(bucket, max_n),
+                _candidate_keys_for_bucket(bucket, max_n, any_event, any_strong_trend, any_level_shift),
                 season_length=int(season_for_models),
             )
             if not model_specs:
