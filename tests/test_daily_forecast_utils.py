@@ -141,6 +141,29 @@ def _make_monthly_history(item_id: int, n_months: int, start: str = '2022-01-01'
     ]
 
 
+def test_generate_daily_response_matches_declared_model():
+    """Response body must validate against ForecastDailyResponse (extra=forbid).
+    Prevents drift: you cannot add/remove response fields without updating the model and vice versa.
+    """
+    from fastapi.testclient import TestClient
+    from main import app
+    from api.models import ForecastDailyResponse
+
+    client = TestClient(app)
+    his = _make_monthly_history(99, 24)
+    resp = client.post('/api/v1/forecast/generate_daily', json={
+        'sim_input_his': his,
+        'forecast_periods': 1,
+        'mode': 'local',
+        'local_model': 'naive',
+        'season_length': 12,
+        'freq': 'M',
+    })
+    assert resp.status_code == 200, resp.text
+    # This fails if response has extra keys (not in model) or missing required keys (in model).
+    ForecastDailyResponse.model_validate(resp.json())
+
+
 def test_generate_daily_endpoint_monthly_returns_daily():
     """POST /generate_daily with monthly freq returns daily forecast_dates, forecast, variance."""
     from fastapi.testclient import TestClient

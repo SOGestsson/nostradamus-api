@@ -19,10 +19,10 @@ import hmac
 import hashlib
 import time
 
-from fastapi import APIRouter, HTTPException, Request, Depends, Header
+from fastapi import APIRouter, HTTPException, Request, Depends, Header, Body
 import logging
 
-from api.models import ForecastRequest
+from api.models import ForecastRequest, ForecastDailyResponse, ForecastDailyItemResponse
 from api.daily_forecast_utils import monthly_to_daily
 from inventory_algorithm.classical_forecasts import ClassicalForecasts
 
@@ -440,8 +440,31 @@ def generate_forecast(request: ForecastRequest):
         raise HTTPException(status_code=500, detail=f"Forecast error: {str(e)}")
 
 
-@router.post("/generate_daily")
-def generate_forecast_daily(request: ForecastRequest):
+@router.post("/generate_daily", response_model=ForecastDailyResponse)
+def generate_forecast_daily(
+    request: ForecastRequest = Body(
+        ...,
+        examples={
+            "monthly_auto_model": {
+                "summary": "Monthly AutoModel → daily output",
+                "description": "Use monthly input (freq='M') and AutoModel selection.",
+                "value": {
+                    "sim_input_his": [
+                        {"item_id": 100, "actual_sale": 120, "day": "2023-01-01"},
+                        {"item_id": 100, "actual_sale": 115, "day": "2023-02-01"},
+                    ],
+                    "forecast_periods": 6,
+                    "mode": "local",
+                    "local_model": "auto_model",
+                    "season_length": 12,
+                    "freq": "M",
+                    "auto_model_metric": "wape_bias",
+                    "auto_model_n_windows": 2,
+                },
+            }
+        },
+    )
+):
     """
     Classical forecast at monthly frequency, returned at daily level.
 
@@ -454,10 +477,18 @@ def generate_forecast_daily(request: ForecastRequest):
       no quantiles. All variance clamped non-negative.
 
     Returns per item: forecast_dates (daily), forecast (daily), variance (daily).
+
     Intended for monthly input (freq M/MS/ME); other frequencies work but expansion
     is one day per period.
+
+    Response is built from ForecastDailyResponse/ForecastDailyItemResponse; when
+    adding or changing response fields, update the model and the results dict together.
     """
     try:
+        # This endpoint is only intended for monthly input.
+        if (request.freq or "").strip().upper() not in ("M", "MS", "ME"):
+            raise HTTPException(status_code=400, detail="generate_daily requires monthly input: freq must be one of 'M', 'MS', 'ME'")
+
         if request.local_model in ('auto_model', 'automodel') and request.mode != 'local':
             raise HTTPException(status_code=400, detail="local_model='auto_model' requires mode='local' (StatsForecast only)")
 
@@ -552,14 +583,15 @@ def generate_forecast_daily(request: ForecastRequest):
                         'variance': [],
                     })
 
-        return {
-            'forecasts': results,
-            'total_items': len(unique_items),
-            'mode': request.mode,
-            'model': request.local_model if request.mode == 'local' else 'timegpt',
-            'periods': request.forecast_periods,
-            'frequency': freq_req,
-        }
+        # Build response from declared model so data and model cannot drift (see ForecastDailyResponse).
+        return ForecastDailyResponse(
+            forecasts=[ForecastDailyItemResponse(**r) for r in results],
+            total_items=len(unique_items),
+            mode=request.mode,
+            model=request.local_model if request.mode == 'local' else 'timegpt',
+            periods=request.forecast_periods,
+            frequency=freq_req,
+        )
     except HTTPException:
         raise
     except Exception as e:

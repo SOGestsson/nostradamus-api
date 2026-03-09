@@ -63,7 +63,9 @@ def test_lightgbm_train_and_batch_forecast_roundtrip():
 
         # We should have forecasts for most items and for each horizon step
         assert not fcst_df.empty
-        assert set(fcst_df.columns) == {'item_id', 'day', 'yhat'}
+        # batch_forecast returns point forecast + upper quantiles (upper_70, upper_90, upper_95)
+        expected_cols = {'item_id', 'day', 'yhat', 'upper_70', 'upper_90', 'upper_95'}
+        assert set(fcst_df.columns) == expected_cols
 
         # Basic sanity: non-negative
         assert (fcst_df['yhat'] >= 0).all()

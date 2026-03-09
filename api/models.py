@@ -1,6 +1,10 @@
 # api/models.py - Fixed version
 """
 Pydantic models for API requests and responses.
+
+When an endpoint has a response_model: update the model and the code that builds
+the response together (build the return by instantiating the model); use
+extra='forbid' on response models so tests can validate the live response.
 """
 from typing import List, Dict, Any, Optional
 
@@ -54,6 +58,33 @@ class ForecastResponse(BaseModel):
     forecast: List[float]
     forecast_dates: List[str]
     model_used: str
+
+
+class ForecastDailyItemResponse(BaseModel):
+    """One item in the response of POST /forecast/generate_daily (daily-level forecast + variance).
+    Rule: when changing this, update the endpoint that builds the response so they stay in sync.
+    """
+    model_config = ConfigDict(extra='forbid')
+    item_id: int | str
+    forecast_dates: List[str]
+    forecast: List[float]
+    variance: List[float]
+    model_used: Optional[str] = None
+    periods_forecasted: Optional[int] = None
+    error: Optional[str] = None
+
+
+class ForecastDailyResponse(BaseModel):
+    """Response model for POST /forecast/generate_daily.
+    Rule: when changing this, update the endpoint that builds the response so they stay in sync.
+    """
+    model_config = ConfigDict(extra='forbid')
+    forecasts: List[ForecastDailyItemResponse]
+    total_items: int
+    mode: str
+    model: str
+    periods: int
+    frequency: str
 
 
 class LightGPTForecastRequest(BaseModel):
