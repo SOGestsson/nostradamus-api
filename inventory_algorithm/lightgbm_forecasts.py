@@ -3092,6 +3092,7 @@ class LightGBMForecast:
         exogenous_columns: list[str] | None = None,
         model_version: str | None = None,
         status: str = "prod",
+        deep_shap: bool = True,
     ) -> tuple[pd.DataFrame, dict[str, Any]]:
         _ = freq
 
@@ -3233,12 +3234,33 @@ class LightGBMForecast:
 
         forecasts: list[dict[str, Any]] = []
 
+        # Deep SHAP guardrails (inference-time TreeSHAP via pred_contrib).
+        # We cap at 12 months because the UI cares most about near horizons and
+        # to prevent extremely large batches from taking too long.
+        deep_shap_requested = bool(deep_shap)
+        deep_shap = bool(deep_shap)
+        DEEP_SHAP_HORIZON_CAP = 12
+        DEEP_SHAP_TOP_K = 20
+        DEEP_SHAP_MAX_ITEMS = 5000
+        DEEP_SHAP_MAX_POINTS = 50000  # points = items * horizons (capped)
+        deep_shap_rows: list[dict[str, Any]] = []
+        deep_shap_capped = False
+        deep_shap_points = 0
+        deep_shap_items = 0
+
         for uid, grp in base.groupby("unique_id", sort=False):
+            if deep_shap and deep_shap_items >= DEEP_SHAP_MAX_ITEMS:
+                deep_shap_capped = True
+                deep_shap = False
+
             grp = grp.sort_values("ds", kind="mergesort")
             y_orig = grp["y"].to_numpy(dtype=float)
             ds_arr = grp["ds"].to_numpy()
             if len(y_orig) < 6:
                 continue
+
+            if deep_shap:
+                deep_shap_items += 1
 
             last_ds = pd.Timestamp(ds_arr[-1])
 
@@ -3455,6 +3477,60 @@ class LightGBMForecast:
                     p_nonzero = float(np.clip(p_nonzero, 0.0, 1.0))
                 else:
                     p_nonzero = 1.0
+
+                # Deep SHAP (TreeSHAP via pred_contrib) per forecast point.
+                # We compute only for horizons <= DEEP_SHAP_HORIZON_CAP and cap total points.
+                if (
+                    deep_shap
+                    and int(h) <= int(DEEP_SHAP_HORIZON_CAP)
+                    and deep_shap_points < int(DEEP_SHAP_MAX_POINTS)
+                ):
+                    try:
+                        contrib = boosters[h].predict(X, pred_contrib=True)
+                        contrib_row = np.asarray(contrib[0], dtype=float)
+                        base_value = float(contrib_row[-1])
+                        feat_names = list(boosters[h].feature_name())
+                        feat_contrib = contrib_row[:-1]
+                        pairs = list(zip(feat_names, feat_contrib))
+                        pairs_sorted = sorted(pairs, key=lambda kv: abs(float(kv[1])), reverse=True)
+
+                        top = [
+                            {"feature": str(n), "contribution": float(v)}
+                            for n, v in pairs_sorted[: int(DEEP_SHAP_TOP_K)]
+                        ]
+
+                        # Keep full contrib map as JSON-ish dict (feature->contribution) for debugging.
+                        shap_map = {str(n): float(v) for n, v in pairs}
+                        feat_vals = {
+                            str(f): float(X[f].iloc[0]) for f in feat_names if f in X.columns
+                        }
+
+                        deep_shap_rows.append(
+                            {
+                                "model_version": str(model_version),
+                                "item_id": str(uid),
+                                "forecast_date": str(pd.Timestamp(forecast_ds).date()),
+                                "horizon": int(h),
+                                "yhat": float(yhat_amount),
+                                "p_nonzero": float(p_nonzero),
+                                "month_rate": float(m_stats.get("nonzero_rate", 0.0)),
+                                "recent_level": float(recent_level),
+                                "croston_floor": None,
+                                "shrink_factor": None,
+                                "classical_override": None,
+                                "base_value": float(base_value),
+                                "shap_json": shap_map,
+                                "top_features": top,
+                                "feature_values": feat_vals,
+                            }
+                        )
+                        deep_shap_points += 1
+                    except Exception:
+                        # Best-effort only; continue forecasting even if SHAP fails.
+                        pass
+                elif deep_shap and deep_shap_points >= int(DEEP_SHAP_MAX_POINTS):
+                    deep_shap_capped = True
+                    deep_shap = False
 
                 month_rate_same = float(m_stats.get("nonzero_rate", 0.0))
 
@@ -3784,6 +3860,18 @@ class LightGBMForecast:
                 "nonzero_threshold": cap_nonzero_threshold,
                 "small_floor": cap_small_floor,
             },
+            "deep_shap": {
+                "enabled": bool(deep_shap_rows) or bool(deep_shap),
+                "requested": bool(deep_shap_requested),
+                "horizon_cap": int(DEEP_SHAP_HORIZON_CAP),
+                "top_k": int(DEEP_SHAP_TOP_K),
+                "max_items": int(DEEP_SHAP_MAX_ITEMS),
+                "max_points": int(DEEP_SHAP_MAX_POINTS),
+                "points_collected": int(deep_shap_points),
+                "items_cap_reached": bool(deep_shap_items >= DEEP_SHAP_MAX_ITEMS),
+                "points_cap_reached": bool(deep_shap_capped),
+            },
+            "deep_shap_rows": deep_shap_rows,
             "_code_version": _LIGHTGBM_FORECASTS_VERSION,  # Debug marker
         }
         return fcst, meta

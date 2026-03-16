@@ -527,6 +527,7 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
             exogenous_columns=request.exogenous_columns,
             model_version=model_version,
             status=request.status,
+            deep_shap=bool(getattr(request, "deep_shap", True)),
         )
 
         # Build naive fallback
@@ -654,6 +655,9 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
             "periods": request.forecast_periods,
             "freq": meta.get("freq"),
             "model_version": meta.get("model_version"),
+            # Deep per-forecast SHAP (inference-time). Potentially large; can be capped server-side.
+            "deep_shap": meta.get("deep_shap"),
+            "deep_shap_rows": meta.get("deep_shap_rows") if bool(getattr(request, "deep_shap", True)) else [],
         }
 
     except ValueError as e:
@@ -721,6 +725,7 @@ def batch_forecast_lightgbm_async(
                 exogenous_columns=request.exogenous_columns,
                 model_version=model_version,
                 status=request.status,
+                deep_shap=bool(getattr(request, "deep_shap", True)),
             )
 
             _update_job(job_id, phase='formatting')
@@ -820,6 +825,8 @@ def batch_forecast_lightgbm_async(
                 "periods": request.forecast_periods,
                 "freq": meta.get("freq"),
                 "model_version": meta.get("model_version"),
+                "deep_shap": meta.get("deep_shap"),
+                "deep_shap_rows": meta.get("deep_shap_rows") if bool(getattr(request, "deep_shap", True)) else [],
             }
 
             _update_job(
