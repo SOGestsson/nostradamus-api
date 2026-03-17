@@ -518,6 +518,8 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
         eligibility = forecaster.store.get_eligibility(model_version=model_version, unique_ids=unique_ids)
 
         # ML batch prediction for all; we'll decide per item whether to use it.
+        # NOTE: Keep sync /batch fast to avoid Cloudflare timeouts.
+        # Deep SHAP should run via /batch_async.
         fcst_df, meta = forecaster.batch_forecast(
             df_hist,
             forecast_periods=request.forecast_periods,
@@ -527,7 +529,7 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
             exogenous_columns=request.exogenous_columns,
             model_version=model_version,
             status=request.status,
-            deep_shap=bool(getattr(request, "deep_shap", True)),
+            deep_shap=False,
         )
 
         # Build naive fallback
@@ -655,9 +657,6 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
             "periods": request.forecast_periods,
             "freq": meta.get("freq"),
             "model_version": meta.get("model_version"),
-            # Deep per-forecast SHAP (inference-time). Potentially large; can be capped server-side.
-            "deep_shap": meta.get("deep_shap"),
-            "deep_shap_rows": meta.get("deep_shap_rows") if bool(getattr(request, "deep_shap", True)) else [],
         }
 
     except ValueError as e:
