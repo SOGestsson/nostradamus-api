@@ -189,6 +189,8 @@ class DuckDBModelStore:
               archetype TEXT NOT NULL,
               horizon INTEGER NOT NULL,
               scale_bucket TEXT,
+              q70_excess DOUBLE,
+              q90_excess DOUBLE,
               q95_excess DOUBLE,
               n INTEGER,
               updated_at TIMESTAMP NOT NULL,
@@ -196,6 +198,13 @@ class DuckDBModelStore:
             );
             """
         )
+
+        # Best-effort schema migration for existing DBs
+        try:
+            con.execute("ALTER TABLE residual_quantiles ADD COLUMN IF NOT EXISTS q70_excess DOUBLE;")
+            con.execute("ALTER TABLE residual_quantiles ADD COLUMN IF NOT EXISTS q90_excess DOUBLE;")
+        except Exception:
+            pass
 
     def create_model_version(self, row: ModelVersionRow) -> None:
         with self.connect() as con:
@@ -357,6 +366,8 @@ class DuckDBModelStore:
                     r["archetype"],
                     int(r["horizon"]),
                     r.get("scale_bucket"),
+                    r.get("q70_excess"),
+                    r.get("q90_excess"),
                     r.get("q95_excess"),
                     int(r.get("n", 0)),
                     now,
@@ -367,9 +378,11 @@ class DuckDBModelStore:
                 """
                 INSERT INTO residual_quantiles (
                   customer_id, model_version, archetype, horizon, scale_bucket,
-                  q95_excess, n, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                  q70_excess, q90_excess, q95_excess, n, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (customer_id, model_version, archetype, horizon, scale_bucket) DO UPDATE SET
+                  q70_excess=excluded.q70_excess,
+                  q90_excess=excluded.q90_excess,
                   q95_excess=excluded.q95_excess,
                   n=excluded.n,
                   updated_at=excluded.updated_at;
@@ -377,21 +390,25 @@ class DuckDBModelStore:
                 values,
             )
 
-    def get_residual_quantiles(self, model_version: str) -> dict[tuple[str, int], float]:
+    def get_residual_quantiles(self, model_version: str) -> dict[tuple[str, int], dict[str, float]]:
         with self.connect() as con:
             res = con.execute(
                 """
-                SELECT archetype, horizon, q95_excess
+                SELECT archetype, horizon, q70_excess, q90_excess, q95_excess
                 FROM residual_quantiles
                 WHERE customer_id=? AND model_version=?;
                 """,
                 [self.customer_id, model_version],
             ).fetchall()
-        out: dict[tuple[str, int], float] = {}
-        for archetype, horizon, q95_excess in res or []:
+        out: dict[tuple[str, int], dict[str, float]] = {}
+        for archetype, horizon, q70_excess, q90_excess, q95_excess in res or []:
             if archetype is None or horizon is None:
                 continue
-            out[(str(archetype), int(horizon))] = float(q95_excess or 0.0)
+            out[(str(archetype), int(horizon))] = {
+                "q70_excess": float(q70_excess or 0.0),
+                "q90_excess": float(q90_excess or 0.0),
+                "q95_excess": float(q95_excess or 0.0),
+            }
         return out
     def upsert_eligibility(self, rows: Iterable[dict[str, Any]]) -> None:
         rows_list = list(rows)

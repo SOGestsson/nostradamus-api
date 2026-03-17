@@ -597,170 +597,282 @@ def _trend_model_value(ds: pd.Timestamp, params: dict[str, Any]) -> float:
     return float(params.get("intercept", 0.0) + params.get("slope", 0.0) * t)
 
 
-def _build_direct_rows_for_item(
+def _points_per_year_from_freq(freq: str) -> int:
+    f = str(freq or "").strip().upper()
+    if f in {"M", "MS", "ME"}:
+        return 12
+    if f.startswith("W"):
+        return 52
+    if f.startswith("D"):
+        return 365
+    if f.startswith("Q"):
+        return 4
+    if f.startswith("Y") or f.startswith("A"):
+        return 1
+    # Default to monthly-like behavior (most common in this service)
+    return 12
+
+
+def _compute_item_month_stats(
+    y_orig: np.ndarray,
+    ds_arr: np.ndarray,
     *,
-    unique_id: str,
-    ds: np.ndarray,
-    y: np.ndarray,
-    y_orig: np.ndarray | None,
-    trend_params: dict[str, Any] | None,
-    exo: dict[str, np.ndarray],
-    static: dict[str, Any],
-    horizon: int,
-    lags: list[int],
-    roll_windows: list[int],
-    static_interaction_cols: list[str] | None = None,
-    global_monthly: dict[int, float] | None = None,
-) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+    freq: str = "M",
+    lookback_years: int = 3,
+) -> dict[int, dict[str, float]]:
+    """Compute per-calendar-month historical stats over ~lookback_years of data.
 
-    n = len(y)
-    max_needed = max(max(roll_windows) - 1, 1) if roll_windows else 1
+    Option A semantics: always group by calendar month-of-year (1..12) even when freq is weekly/daily.
+    The lookback window is chosen as (lookback_years * points_per_year(freq)) and truncated to what exists.
+    """
+    yv = np.asarray(y_orig, dtype=float)
+    if yv.size == 0:
+        return {m: {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0} for m in range(1, 13)}
 
-    # Precompute per-month historical stats for same-month features (last 36 months).
-    same_month_stats: dict[int, dict[str, float]] = {}
-    months = np.array([pd.Timestamp(d).month for d in ds], dtype=int)
-    base_y = y_orig if y_orig is not None else y
-    vals_3y = base_y[-36:] if len(base_y) > 36 else base_y
-    months_3y = months[-36:] if len(months) > 36 else months
+    # Align lengths defensively
+    n = int(min(len(yv), len(ds_arr)))
+    if n <= 0:
+        return {m: {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0} for m in range(1, 13)}
+    yv = yv[:n]
+    ds_use = ds_arr[:n]
+
+    months = np.array([pd.Timestamp(d).month for d in ds_use], dtype=int)
+    lookback_points = int(max(1, int(lookback_years) * _points_per_year_from_freq(freq)))
+    k = int(min(n, lookback_points))
+    vals = yv[-k:]
+    months_k = months[-k:]
+
+    out: dict[int, dict[str, float]] = {}
     for m in range(1, 13):
-        hist_vals = vals_3y[months_3y == m]
+        hist_vals = vals[months_k == m]
         if len(hist_vals) == 0:
-            same_month_stats[m] = {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0}
+            out[m] = {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0}
         else:
-            same_month_stats[m] = {
+            out[m] = {
                 "mean": float(np.mean(hist_vals)),
                 "max": float(np.max(hist_vals)),
                 "nonzero_rate": float(np.mean(hist_vals > 0.0)),
             }
+    return out
 
-    start_ds = pd.Timestamp(ds[0])
-    for t in range(0, n - horizon):
-        if t < max_needed:
-            continue
 
-        forecast_ds = pd.Timestamp(ds[t]) + pd.offsets.MonthBegin(horizon)
-        target = float(y[t + horizon])
-        if y_orig is not None:
-            target_orig = float(y_orig[t + horizon])
+@dataclass(frozen=True)
+class ForecastCandidate:
+    value: float
+    source: str
+    confidence: float
+    priority: int
+    conditions_met: bool
+
+
+def _recent_level_alpha(
+    archetype: str,
+    month_rate_same: float,
+    cv_val: float,
+    ramp_up: bool,
+) -> float:
+    if archetype == "seasonal" and month_rate_same >= 0.25:
+        alpha = 0.95
+    elif archetype == "seasonal":
+        alpha = 0.9
+    elif archetype == "noisy":
+        alpha = 0.5
+    else:
+        alpha = 0.7
+    if ramp_up:
+        alpha = min(0.98, alpha + 0.05)
+    if archetype == "noisy" and cv_val > 1.0:
+        alpha = min(alpha, 0.55)
+    return float(np.clip(alpha, 0.0, 1.0))
+
+
+def _ml_blend_weight(archetype: str, month_rate_same: float) -> float:
+    if archetype == "seasonal" and month_rate_same >= 0.25:
+        return 0.10
+    elif archetype == "stable":
+        return 0.20
+    elif archetype == "intermittent":
+        return 0.15
+    else:  # noisy
+        return 0.15
+
+
+def _compute_candidates(
+    *,
+    archetype: str,
+    p_effective: float,
+    amount_used: float,
+    floor: float,
+    mean_nonzero_12: float,
+    recent_level: float,
+    month_rate_same: float,
+    cv_val: float,
+    ramp_up: bool,
+    m_stats: dict[str, float],
+    last_nonzero_age: float,
+    overall_nonzero_rate: float,
+    nonzero_count_last_12: int,
+    croston_mean: float,
+    adida_mean: float,
+) -> list[ForecastCandidate]:
+    ml_raw = float(p_effective * amount_used + (1.0 - p_effective) * floor)
+    candidates: list[ForecastCandidate] = []
+
+    candidates.append(
+        ForecastCandidate(
+            value=float(ml_raw),
+            source="ml_occurrence_blend",
+            confidence=float(min(float(p_effective) + 0.2, 1.0)),
+            priority=0,
+            conditions_met=True,
+        )
+    )
+
+    nz_ok = bool(p_effective > 0.5 and mean_nonzero_12 > 0.0)
+    candidates.append(
+        ForecastCandidate(
+            value=float(0.6 * float(mean_nonzero_12)),
+            source="nonzero_level_anchor",
+            confidence=0.7,
+            priority=1,
+            conditions_met=nz_ok,
+        )
+    )
+
+    recent_ok = bool(recent_level > 0.0 and last_nonzero_age <= 9 and (archetype != "seasonal" or month_rate_same >= 0.25))
+    alpha = _recent_level_alpha(archetype, month_rate_same, cv_val, ramp_up) if recent_ok else 0.0
+    candidates.append(
+        ForecastCandidate(
+            value=float(alpha * ml_raw + (1.0 - alpha) * float(recent_level)),
+            source="recent_level_anchor",
+            confidence=float(alpha),
+            priority=1,
+            conditions_met=recent_ok,
+        )
+    )
+
+    peak_ok = bool(archetype == "seasonal" and month_rate_same >= 0.25)
+    peak_mean = float(m_stats.get("mean", 0.0))
+    peak_target = float(m_stats.get("max", 0.0))
+    peak_target = min(peak_target, 3.0 * max(peak_mean, 1.0))
+    candidates.append(
+        ForecastCandidate(
+            value=float(0.5 * ml_raw + 0.5 * float(peak_target)),
+            source="seasonal_peak_anchor",
+            confidence=float(np.clip(month_rate_same, 0.0, 1.0)),
+            priority=3,
+            conditions_met=peak_ok,
+        )
+    )
+
+    croston_ok = bool(0.1 < overall_nonzero_rate < 0.5 and last_nonzero_age <= 9 and nonzero_count_last_12 >= 2)
+    candidates.append(
+        ForecastCandidate(
+            value=float(0.4 * float(croston_mean)),
+            source="croston_floor",
+            confidence=0.5,
+            priority=2,
+            conditions_met=croston_ok,
+        )
+    )
+
+    classical_pred = float(np.mean([float(croston_mean), float(adida_mean)]))
+    near_zero = bool(ml_raw <= max(1.0, 0.1 * max(float(recent_level), 1.0)))
+    classical_floor = float(0.4 * float(croston_mean))
+    classical_cap = float(max(5.0, 2.0 * max(float(recent_level), 1.0)))
+    cv_threshold = 0.8 if archetype == "intermittent" else 0.5
+    classical_ok = bool(
+        near_zero
+        and cv_val <= cv_threshold
+        and classical_floor <= classical_pred <= classical_cap
+        and last_nonzero_age <= 9
+        and archetype != "seasonal"
+    )
+    candidates.append(
+        ForecastCandidate(
+            value=float(classical_pred),
+            source="classical_override",
+            confidence=float(max(0.0, 1.0 - float(cv_val))),
+            priority=2,
+            conditions_met=classical_ok,
+        )
+    )
+
+    return candidates
+
+
+def _select_forecast(candidates: list[ForecastCandidate], adjustments: dict[str, Any]) -> tuple[float, int]:
+    applicable = [c for c in candidates if c.conditions_met]
+    if not applicable:
+        adjustments["winning_source"] = "none"
+        adjustments["winning_priority"] = -1
+        adjustments["applicable_candidates"] = []
+        adjustments["candidate_values"] = {}
+        return 0.0, -1
+
+    max_pri = max(int(c.priority) for c in applicable)
+    tier = [c for c in applicable if int(c.priority) == int(max_pri)]
+
+    if len(tier) == 1:
+        selected = float(tier[0].value)
+        winning_source = tier[0].source
+    else:
+        denom = float(sum(max(0.0, float(c.confidence)) for c in tier))
+        if denom <= 0.0:
+            selected = float(np.mean([float(c.value) for c in tier]))
         else:
-            target_orig = target
+            selected = float(sum(float(c.value) * max(0.0, float(c.confidence)) for c in tier) / denom)
+        winning_source = "blend"
 
-        trend_model_at_forecast = 0.0
-        if trend_params is not None:
-            trend_model_at_forecast = _trend_model_value(forecast_ds, trend_params)
+    # Always blend in ML baseline with a small fixed weight.
+    ml_baseline = next((c for c in candidates if c.source == "ml_occurrence_blend"), None)
+    if ml_baseline is not None:
+        archetype = str(adjustments.get("archetype") or "")
+        month_rate_same = float(adjustments.get("month_rate_same") or 0.0)
+        ml_weight = float(_ml_blend_weight(archetype, month_rate_same))
+        selected = float((1.0 - ml_weight) * selected + ml_weight * float(ml_baseline.value))
+        adjustments["ml_blend_weight"] = ml_weight
 
-        row: dict[str, Any] = {
-            "unique_id": unique_id,
-            "decision_ds": pd.Timestamp(ds[t]),
-            "forecast_ds": forecast_ds,
-            "y": target,
-            "y_orig": target_orig,
-            "trend_model": float(trend_model_at_forecast),
-        }
+    adjustments["winning_source"] = winning_source
+    adjustments["winning_priority"] = int(max_pri)
+    adjustments["applicable_candidates"] = [c.source for c in applicable]
+    adjustments["candidate_values"] = {c.source: float(round(float(c.value), 6)) for c in applicable}
+    return float(max(0.0, selected)), int(max_pri)
 
-        m = int(forecast_ds.month)
-        row["month"] = m
-        row["quarter"] = int(((m - 1) // 3) + 1)
-        row["year"] = int(forecast_ds.year)
-        # Extended Fourier features (k=3 harmonics)
-        fourier_feats = _fourier_features(m, k=3)
-        row.update(fourier_feats)
-        # Backward compat aliases for single harmonic
-        row["month_sin"] = fourier_feats["month_sin_1"]
-        row["month_cos"] = fourier_feats["month_cos_1"]
-        qs, qc = _quarter_sin_cos(int(row["quarter"]))
-        row["quarter_sin"] = qs
-        row["quarter_cos"] = qc
-        row["year_idx"] = float(forecast_ds.year - start_ds.year)
 
-        # Easter features for paskavara (Easter items)
-        easter_feats = _easter_features(forecast_ds)
-        row.update(easter_feats)
+def _apply_caps(
+    *,
+    yhat: float,
+    uid: str,
+    forecast_ds: pd.Timestamp,
+    month_caps: dict[tuple[str, int], dict[str, float]],
+    archetype: str,
+    month_rate_same: float,
+    cap_multiplier: float,
+    cap_small_floor: float,
+    cap_nonzero_threshold: float,
+    adjustments: dict[str, Any],
+) -> float:
+    cap_stats = month_caps.get((str(uid), int(forecast_ds.month)))
+    if cap_stats is None:
+        return float(yhat)
 
-        # Note: static interaction columns (e.g., item_type_month_sin) are computed by
-        # _add_static_interactions() which is called after DataFrame construction.
-        # Do not pre-create placeholders here to avoid duplicate columns.
-
-        # Lags are defined as: lag_1 = y[t], lag_2=y[t-1], ...
-        for lag in lags:
-            idx = t - (lag - 1)
-            row[f"lag_{lag}"] = float(y[idx]) if idx >= 0 else 0.0
-
-        if y_orig is not None:
-            row["lag_1_orig"] = float(y_orig[t])
-
-        for w in roll_windows:
-            start = t - (w - 1)
-            window = y[start : t + 1]
-            row[f"roll_mean_{w}"] = float(np.mean(window))
-            if w >= 2:
-                row[f"roll_std_{w}"] = float(np.std(window, ddof=0))
-
-        # Trend-ish
-        row["diff1"] = float(y[t] - y[t - 1])
-        row["diff12"] = float(y[t] - y[t - 12]) if t >= 12 else 0.0
-
-        # Intermittency
-        last12 = y[t - 11 : t + 1]
-        row["zero_ratio_12"] = float(np.mean(last12 == 0.0))
-        row["nonzero_run_length"] = float(_nonzero_run_length(y[: t + 1]))
-
-        # Conditional-on-nonzero level features (use original scale when available)
-        nz_source = y_orig if y_orig is not None else y
-        window_nz = nz_source[t - 11 : t + 1]
-        nz_vals = window_nz[window_nz > 0.0]
-        row["mean_nonzero_12"] = float(np.mean(nz_vals)) if len(nz_vals) else 0.0
-        row["median_nonzero_12"] = float(np.median(nz_vals)) if len(nz_vals) else 0.0
-        nz_full = nz_source[: t + 1]
-        nz_full_vals = nz_full[nz_full > 0.0]
-        last_nz_val = float(nz_full_vals[-1]) if len(nz_full_vals) else 0.0
-        row["last_nonzero_value"] = float(last_nz_val)
-
-        # Same-month historical features (per item)
-        m_stats = same_month_stats.get(m, {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0})
-        row["same_month_mean_3y"] = float(m_stats["mean"])
-        row["same_month_max_3y"] = float(m_stats["max"])
-        row["same_month_nonzero_rate_3y"] = float(m_stats["nonzero_rate"])
-        # Alias: per-item month nonzero rate computed server-side.
-        row["item_month_nonzero_rate"] = float(m_stats["nonzero_rate"])
-
-        mean_last12 = float(np.mean(base_y[t - 11 : t + 1]))
-        row["seasonal_amplitude_ratio"] = float(m_stats["max"]) / max(mean_last12, 1.0)
-
-        # Global seasonal components (cross-item learning)
-        # Add global month-of-year effect and item vs global ratio
-        if global_monthly is not None:
-            global_month_level = global_monthly.get(m, 0.0)
-            row["global_month_level"] = global_month_level
-            # Ratio: how does this item's month pattern compare to global?
-            # Use item's same_month_mean vs global median for that month
-            item_month_mean = float(m_stats.get("mean", 0.0))
-            if global_month_level > 0.0:
-                row["item_vs_global_ratio"] = float(item_month_mean / global_month_level)
-            else:
-                # If global is zero, use item's mean as ratio (or 1.0 if item also zero)
-                row["item_vs_global_ratio"] = 1.0 if item_month_mean == 0.0 else float(item_month_mean)
-        else:
-            # Fallback if global_monthly not provided
-            row["global_month_level"] = 0.0
-            row["item_vs_global_ratio"] = 1.0
-
-        # Simple decay signal: slope of last 12 months
-        row["rolling_12_slope"] = float(_rolling_slope(y[: t + 1]))
-
-        # Exogenous (wide) at time t (known at forecast time)
-        for k, arr in exo.items():
-            if len(arr) == n:
-                row[k] = arr[t]
-
-        # Static
-        for k, v in static.items():
-            row[k] = v
-
-        rows.append(row)
-
-    return rows
+    max_y = float(cap_stats.get("max_y", 0.0))
+    nonzero_rate = float(cap_stats.get("nonzero_rate", 0.0))
+    cap_low = max(max_y, cap_small_floor)
+    out = float(yhat)
+    if nonzero_rate < cap_nonzero_threshold:
+        out = float(min(out, cap_low))
+    cap_mult = float(cap_multiplier)
+    if archetype == "seasonal" and month_rate_same >= 0.25:
+        cap_mult = 4.0
+    if adjustments.get("regime_ramp_up"):
+        cap_mult = cap_mult * 1.5
+    cap = float(max(cap_mult * max_y, cap_small_floor))
+    out = float(min(out, cap))
+    adjustments["cap"] = cap
+    adjustments["cap_mult"] = cap_mult
+    return out
 
 
 def _encode_categories(
@@ -1384,6 +1496,7 @@ def _build_direct_rows_for_item_v2(
     global_monthly: dict[int, float] | None = None,
     global_yoy: dict[str, float] | None = None,
     segment_stats: dict[str, dict[Any, dict[int, dict[str, float]]]] | None = None,
+    freq: str = "M",
 ) -> list[dict[str, Any]]:
     """Build supervised rows with three-mechanism attribute routing."""
     rows: list[dict[str, Any]] = []
@@ -1395,21 +1508,8 @@ def _build_direct_rows_for_item_v2(
     n = len(y)
     max_needed = max(max(roll_windows) - 1, 1) if roll_windows else 1
 
-    months = np.array([pd.Timestamp(d).month for d in ds], dtype=int)
     base_y = y_orig if y_orig is not None else y
-    vals_3y = base_y[-36:] if len(base_y) > 36 else base_y
-    months_3y = months[-36:] if len(months) > 36 else months
-    same_month_stats: dict[int, dict[str, float]] = {}
-    for m in range(1, 13):
-        hist_vals = vals_3y[months_3y == m]
-        if len(hist_vals) == 0:
-            same_month_stats[m] = {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0}
-        else:
-            same_month_stats[m] = {
-                "mean": float(np.mean(hist_vals)),
-                "max": float(np.max(hist_vals)),
-                "nonzero_rate": float(np.mean(hist_vals > 0.0)),
-            }
+    same_month_stats = _compute_item_month_stats(base_y, ds, freq=freq, lookback_years=3)
 
     lifecycle_feats = _detect_lifecycle_phase(base_y if base_y is not None else y)
     start_ds = pd.Timestamp(ds[0])
@@ -1448,6 +1548,8 @@ def _build_direct_rows_for_item_v2(
         row["quarter_sin"] = qs
         row["quarter_cos"] = qc
         row["year_idx"] = float(forecast_ds.year - start_ds.year)
+        row["horizon"] = int(horizon)
+        row["horizon_log"] = float(np.log1p(int(horizon)))
 
         easter_feats = _easter_features(forecast_ds)
         row.update(easter_feats)
@@ -2076,6 +2178,38 @@ class LightGBMForecast:
                 metrics_summary["occurrence_model"] = "shared"
                 metrics_summary["occurrence_threshold"] = 0.2
                 metrics_summary["occurrence_pos_rate_train"] = float(pos / max(1.0, pos + neg))
+                # Per-horizon occurrence diagnostics (precision/recall style), to validate horizon-awareness.
+                if occ_model is not None and len(X_occ_val) > 0:
+                    p_occ_val_all = occ_model.predict(X_occ_val)
+                    horizons_val = (
+                        occ_df.loc[is_val_occ, "horizon"].to_numpy(dtype=int)
+                        if "horizon" in occ_df.columns
+                        else None
+                    )
+                    if horizons_val is not None:
+                        for h_check in range(1, int(horizon) + 1):
+                            h_mask = horizons_val == int(h_check)
+                            if int(h_mask.sum()) < 10:
+                                continue
+                            p_h = p_occ_val_all[h_mask]
+                            y_h = y_occ_val[h_mask]
+                            predicted_pos = (p_h >= 0.2).astype(int)
+
+                            actual_pos = float(np.sum(y_h))
+                            if actual_pos > 0:
+                                recall = float(np.mean(predicted_pos[y_h == 1]))
+                            else:
+                                recall = float("nan")
+
+                            predicted_pos_count = float(np.sum(predicted_pos))
+                            if predicted_pos_count > 0:
+                                precision = float(np.mean(y_h[predicted_pos == 1]))
+                            else:
+                                precision = float("nan")
+
+                            metrics_summary[f"occ_precision_h{h_check}"] = precision
+                            metrics_summary[f"occ_recall_h{h_check}"] = recall
+                            metrics_summary[f"occ_n_val_h{h_check}"] = int(h_mask.sum())
 
         # Optuna hyperparameter tuning (using horizon 1 data)
         tuned_params: dict[str, Any] | None = None
@@ -2224,63 +2358,60 @@ class LightGBMForecast:
 
             models[h] = booster
 
-            # Train quantile model (0.95) for upper bound prediction
-            # Use y_orig (original scale) to learn full distribution including trend
+            # Train quantile models (0.70/0.90/0.95) for upper bound prediction.
+            # Use y_orig (original scale) to learn full distribution including trend.
             if objective == "tweedie" or objective == "regression":
                 # Prepare target: use y_orig if available (original scale), otherwise y
-                y_q95 = df["y_orig"].to_numpy(dtype=float) if "y_orig" in df.columns else df["y"].to_numpy(dtype=float)
-                y_q95_train = y_q95[~is_val]
-                y_q95_val = y_q95[is_val] if len(X_val) > 0 else np.array([])
+                y_q = df["y_orig"].to_numpy(dtype=float) if "y_orig" in df.columns else df["y"].to_numpy(dtype=float)
+                y_q_train = y_q[~is_val]
+                y_q_val = y_q[is_val] if len(X_val) > 0 else np.array([])
 
-                # Use same features and weights, but original-scale target
-                params_q95 = dict(params)
-                params_q95["objective"] = "quantile"
-                params_q95["alpha"] = 0.95
-                params_q95["metric"] = "quantile"
-
-                dtrain_q95 = lgb.Dataset(
+                # Reuse datasets across alphas (same features/weights, different objective alpha).
+                dtrain_q = lgb.Dataset(
                     X_train,
-                    label=y_q95_train,
+                    label=y_q_train,
                     weight=w_train,
                     categorical_feature=[c for c in cat_cols if c in X_train.columns],
                     free_raw_data=False,
                 )
-                valid_sets_q95 = [dtrain_q95]
-                valid_names_q95 = ["train"]
+                valid_sets_q = [dtrain_q]
+                valid_names_q = ["train"]
                 if len(X_val) > 0:
-                    dval_q95 = lgb.Dataset(
+                    dval_q = lgb.Dataset(
                         X_val,
-                        label=y_q95_val,
+                        label=y_q_val,
                         weight=w_val,
                         categorical_feature=[c for c in cat_cols if c in X_val.columns],
                         free_raw_data=False,
                     )
-                    valid_sets_q95.append(dval_q95)
-                    valid_names_q95.append("val")
+                    valid_sets_q.append(dval_q)
+                    valid_names_q.append("val")
 
-                booster_q95 = lgb.train(
-                    params_q95,
-                    dtrain_q95,
-                    num_boost_round=2000,
-                    valid_sets=valid_sets_q95,
-                    valid_names=valid_names_q95,
-                    callbacks=[lgb.early_stopping(100, verbose=False)] if len(X_val) > 0 else None,
-                )
-                # Save to separate file - does NOT overwrite point model
-                booster_q95.save_model(os.path.join(artifact_root, f"lgbm_h{h}_q95.txt"))
+                # Log calibration coverage on original scale
+                y_val_true_orig = df.loc[is_val, "y_orig"].to_numpy(dtype=float) if ("y_orig" in df.columns and len(X_val) > 0) else y_val
 
-                # Log validation metrics for quantile model calibration
-                if len(X_val) > 0:
-                    # Predict quantile on validation set
-                    q95_val_pred = booster_q95.predict(X_val)
+                for alpha in (0.70, 0.90, 0.95):
+                    params_q = dict(params)
+                    params_q["objective"] = "quantile"
+                    params_q["alpha"] = float(alpha)
+                    params_q["metric"] = "quantile"
 
-                    # Get true values on original scale (same as quantile model target)
-                    y_val_true_orig = df.loc[is_val, "y_orig"].to_numpy(dtype=float) if "y_orig" in df.columns else y_val
+                    booster_q = lgb.train(
+                        params_q,
+                        dtrain_q,
+                        num_boost_round=2000,
+                        valid_sets=valid_sets_q,
+                        valid_names=valid_names_q,
+                        callbacks=[lgb.early_stopping(100, verbose=False)] if len(X_val) > 0 else None,
+                    )
+                    # Save to separate file - does NOT overwrite point model
+                    tag = str(int(round(alpha * 100)))
+                    booster_q.save_model(os.path.join(artifact_root, f"lgbm_h{h}_q{tag}.txt"))
 
-                    # Calculate coverage: fraction of validation samples where true value <= predicted quantile
-                    # For a well-calibrated 95th percentile model, coverage should be close to 0.95
-                    coverage_95 = float(np.mean(y_val_true_orig <= q95_val_pred))
-                    metrics_summary[f"q95_coverage_val_h{h}"] = coverage_95
+                    if len(X_val) > 0 and y_val_true_orig is not None and len(y_val_true_orig) > 0:
+                        q_val_pred = booster_q.predict(X_val)
+                        coverage = float(np.mean(y_val_true_orig <= q_val_pred))
+                        metrics_summary[f"q{tag}_coverage_val_h{h}"] = coverage
 
             # Train magnitude model on nonzero rows only (E[y | y > 0])
             nz_mask = pd.to_numeric(df.get("y_orig", df["y"]), errors="coerce").fillna(0.0) > 0.0
@@ -2463,6 +2594,8 @@ class LightGBMForecast:
                     vals = vals[np.isfinite(vals)]
                     if len(vals) == 0:
                         continue
+                    q70 = float(np.quantile(vals, 0.70))
+                    q90 = float(np.quantile(vals, 0.90))
                     q95 = float(np.quantile(vals, 0.95))
                     residual_quantile_rows.append(
                         {
@@ -2470,6 +2603,8 @@ class LightGBMForecast:
                             "archetype": str(arch) if arch is not None else "unknown",
                             "horizon": _coerce_h(h),
                             "scale_bucket": None,
+                            "q70_excess": q70,
+                            "q90_excess": q90,
                             "q95_excess": q95,
                             "n": int(len(vals)),
                         }
@@ -2480,6 +2615,8 @@ class LightGBMForecast:
                     vals = vals[np.isfinite(vals)]
                     if len(vals) == 0:
                         continue
+                    q70 = float(np.quantile(vals, 0.70))
+                    q90 = float(np.quantile(vals, 0.90))
                     q95 = float(np.quantile(vals, 0.95))
                     residual_quantile_rows.append(
                         {
@@ -2487,6 +2624,8 @@ class LightGBMForecast:
                             "archetype": "__global__",
                             "horizon": _coerce_h(h),
                             "scale_bucket": None,
+                            "q70_excess": q70,
+                            "q90_excess": q90,
                             "q95_excess": q95,
                             "n": int(len(vals)),
                         }
@@ -2526,7 +2665,7 @@ class LightGBMForecast:
             "name_cluster_k": name_cluster_k,
             "residual_quantiles": residual_quantile_rows,
             "quantile_models": True,
-            "quantile_alpha": 0.95,
+            "quantile_alphas": [0.70, 0.90, 0.95],
             "hyperparameter_tuning": tune_hyperparameters,
             "tuned_hyperparameters": tuned_params if tuned_params else None,
             "attribute_routing": {
@@ -2849,6 +2988,8 @@ class LightGBMForecast:
                 r["quarter_sin"] = qs
                 r["quarter_cos"] = qc
                 r["year_idx"] = float(forecast_ds.year - pd.Timestamp(ds_arr[0]).year)
+                r["horizon"] = int(1)
+                r["horizon_log"] = float(np.log1p(1))
 
                 # Easter features for paskavara (Easter items)
                 easter_feats = _easter_features(forecast_ds)
@@ -2888,20 +3029,12 @@ class LightGBMForecast:
                     r["last_nonzero_value"] = last_nz_val
 
                     # Same-month historical features (per item) - last 36 months
-                    months = np.array([pd.Timestamp(d).month for d in ds_arr], dtype=int)
-                    vals_3y = y_orig[-36:] if len(y_orig) > 36 else y_orig
-                    months_3y = months[-36:] if len(months) > 36 else months
-                    same_month_stats_local: dict[int, dict[str, float]] = {}
-                    for month_i in range(1, 13):
-                        hist_vals = vals_3y[months_3y == month_i]
-                        if len(hist_vals) == 0:
-                            same_month_stats_local[month_i] = {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0}
-                        else:
-                            same_month_stats_local[month_i] = {
-                                "mean": float(np.mean(hist_vals)),
-                                "max": float(np.max(hist_vals)),
-                                "nonzero_rate": float(np.mean(hist_vals > 0.0)),
-                            }
+                    same_month_stats_local = _compute_item_month_stats(
+                        y_orig,
+                        ds_arr,
+                        freq="M",
+                        lookback_years=3,
+                    )
                     m_stats = same_month_stats_local.get(m, {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0})
                     r["same_month_mean_3y"] = float(m_stats["mean"])
                     r["same_month_max_3y"] = float(m_stats["max"])
@@ -3211,9 +3344,17 @@ class LightGBMForecast:
         if os.path.exists(occ_path):
             occ_model = lgb.Booster(model_file=occ_path)
 
-        # Load quantile models (0.95) for upper bound prediction
+        # Load quantile models (0.70/0.90/0.95) for upper bound prediction
+        q70_boosters: dict[int, Any] = {}
+        q90_boosters: dict[int, Any] = {}
         q95_boosters: dict[int, Any] = {}
         for h in horizons:
+            q70_path = os.path.join(artifact_root, f"lgbm_h{h}_q70.txt")
+            if os.path.exists(q70_path):
+                q70_boosters[h] = lgb.Booster(model_file=q70_path)
+            q90_path = os.path.join(artifact_root, f"lgbm_h{h}_q90.txt")
+            if os.path.exists(q90_path):
+                q90_boosters[h] = lgb.Booster(model_file=q90_path)
             q95_path = os.path.join(artifact_root, f"lgbm_h{h}_q95.txt")
             if os.path.exists(q95_path):
                 q95_boosters[h] = lgb.Booster(model_file=q95_path)
@@ -3224,10 +3365,14 @@ class LightGBMForecast:
             for r in spec_q:
                 arch = r.get("archetype")
                 h = r.get("horizon")
-                q = r.get("q95_excess")
-                if arch is None or h is None or q is None:
+                q95 = r.get("q95_excess")
+                if arch is None or h is None or q95 is None:
                      continue
-                residual_quantiles[(str(arch), int(h))] = float(q)
+                residual_quantiles[(str(arch), int(h))] = {
+                    "q70_excess": float(r.get("q70_excess") or 0.0),
+                    "q90_excess": float(r.get("q90_excess") or 0.0),
+                    "q95_excess": float(q95 or 0.0),
+                }
 
         if not boosters:
             raise ValueError(f"No horizon models found under {artifact_root}")
@@ -3281,23 +3426,12 @@ class LightGBMForecast:
             for c in static_cols:
                 static[c] = grp[c].iloc[-1] if c in grp.columns else None
 
-            # Precompute same-month stats for inference (last 36 months) on original scale.
-            months = np.array([pd.Timestamp(d).month for d in ds_arr], dtype=int)
-            base_y = y_orig
-            vals_3y = base_y[-36:] if len(base_y) > 36 else base_y
-            months_3y = months[-36:] if len(months) > 36 else months
-            same_month_stats: dict[int, dict[str, float]] = {}
-            for m in range(1, 13):
-                hist_vals = vals_3y[months_3y == m]
-                if len(hist_vals) == 0:
-                    same_month_stats[m] = {"mean": 0.0, "max": 0.0, "nonzero_rate": 0.0}
-                else:
-                    same_month_stats[m] = {
-                        "mean": float(np.mean(hist_vals)),
-                        "max": float(np.max(hist_vals)),
-                        "nonzero_rate": float(np.mean(hist_vals > 0.0)),
-                    }
+            # Precompute same-month stats for inference (≈3 years, freq-aware) on original scale.
+            same_month_stats = _compute_item_month_stats(y_orig, ds_arr, freq=freq, lookback_years=3)
 
+            base_y = y_orig
+            lookback_points = int(max(1, 3 * _points_per_year_from_freq(freq)))
+            vals_3y = base_y[-lookback_points:] if len(base_y) > lookback_points else base_y
             overall_nonzero_rate = float(np.mean((vals_3y > 0.0))) if len(vals_3y) else 0.0
             seasonal_strength = float(max([v["nonzero_rate"] for v in same_month_stats.values()] or [0.0]))
             cv_val = _cv(vals_3y if len(vals_3y) else y)
@@ -3349,6 +3483,8 @@ class LightGBMForecast:
                 r["quarter_cos"] = qc
                 # Year index from start of history
                 r["year_idx"] = float(forecast_ds.year - pd.Timestamp(ds_arr[0]).year) if len(ds_arr) else 0.0
+                r["horizon"] = int(h)
+                r["horizon_log"] = float(np.log1p(int(h)))
 
                 # Easter features for paskavara (Easter items)
                 easter_feats = _easter_features(forecast_ds)
@@ -3534,8 +3670,7 @@ class LightGBMForecast:
 
                 month_rate_same = float(m_stats.get("nonzero_rate", 0.0))
 
-                adjustments: dict[str, Any] = {"archetype": archetype}
-                anchor_priority = 0
+                adjustments: dict[str, Any] = {"archetype": archetype, "month_rate_same": month_rate_same}
 
                 # Couple occurrence to month history + recent run-length.
                 cap_stats = month_caps.get((str(uid), int(forecast_ds.month)))
@@ -3556,112 +3691,52 @@ class LightGBMForecast:
                 beta = 0.7 if p_effective > 0.7 else 0.6
                 floor = beta * floor_raw
                 amount_used = yhat_amount_nz if yhat_amount_nz is not None else yhat_amount
-                yhat = float(p_effective * amount_used + (1.0 - p_effective) * floor)
-                if p_effective < max(occurrence_threshold, p_min):
-                    if archetype == "seasonal" and month_rate_caps >= 0.3:
-                        yhat = max(yhat, 0.3 * floor)
-                        adjustments["soft_zero_floor"] = float(0.3 * floor)
-                    else:
-                        yhat = 0.0
                 adjustments["amount_model"] = "nonzero" if yhat_amount_nz is not None else "full"
                 adjustments["occurrence_floor"] = floor
-
-                # Conditional-on-nonzero level anchor
-                if p_effective > 0.5 and mean_nonzero_12 > 0.0:
-                    anchor = 0.6 * float(mean_nonzero_12)
-                    if yhat < anchor:
-                        yhat = float(anchor)
-                        adjustments["nonzero_level_anchor"] = anchor
-                        anchor_priority = max(anchor_priority, 1)
                 adjustments["mean_nonzero_12"] = mean_nonzero_12
                 adjustments["median_nonzero_12"] = median_nonzero_12
                 adjustments["last_nonzero_value"] = last_nz_val
 
-                # Improvement #1: recent-level anchor (skip in seasonal-off months)
-                if (
-                    recent_level > 0.0
-                    and (archetype != "seasonal" or month_rate_same >= 0.25)
-                    and (last_nonzero_age <= 9)
-                    and not (
-                        archetype == "seasonal"
-                        and month_rate_same >= 0.25
-                        and float(m_stats.get("max", 0.0)) > 1.5 * float(recent_level)
-                    )
-                    and anchor_priority < 3
-                ):
-                    ramp_up = False
-                    nz_full_vals = y_orig[y_orig > 0.0]
-                    if len(nz_full_vals) >= 3:
-                        last3 = nz_full_vals[-3:]
-                        ramp_up = bool(last3[0] < last3[1] < last3[2])
-                    slope_thresh = 0.05 * max(recent_level, 1.0)
-                    regime_active = bool(recent_slope > slope_thresh and ramp_up and int(h) <= 6)
-                    if archetype == "seasonal" and month_rate_same >= 0.25:
-                        alpha = 0.95
-                    elif archetype == "seasonal":
-                        alpha = 0.9
-                    elif archetype == "noisy":
-                        alpha = 0.5
-                    else:
-                        alpha = 0.7
-                    if regime_active:
-                        alpha = min(0.98, alpha + 0.05)
-                        adjustments["regime_ramp_up"] = True
-                    yhat = float(alpha * yhat + (1.0 - alpha) * recent_level)
-                    adjustments["recent_level"] = recent_level
-                    adjustments["alpha"] = alpha
-                    anchor_priority = max(anchor_priority, 1)
+                # Phase 1: compute candidates independently
+                ramp_up = False
+                nz_full_vals = y_orig[y_orig > 0.0]
+                if len(nz_full_vals) >= 3:
+                    last3 = nz_full_vals[-3:]
+                    ramp_up = bool(last3[0] < last3[1] < last3[2])
+                slope_thresh = 0.05 * max(recent_level, 1.0)
+                regime_ramp_up = bool(recent_slope > slope_thresh and ramp_up and int(h) <= 6)
+                if regime_ramp_up:
+                    adjustments["regime_ramp_up"] = True
 
-                # Seasonal peak anchor: lift in-season peaks toward historical max
-                if archetype == "seasonal" and month_rate_same >= 0.25:
-                    peak_alpha = 0.5
-                    peak_target = float(m_stats.get("max", 0.0))
-                    peak_mean = float(m_stats.get("mean", 0.0))
-                    if peak_mean > 0.0 and peak_target > 3.0 * peak_mean:
-                        peak_target = 3.0 * peak_mean
-                    yhat = float((1.0 - peak_alpha) * yhat + peak_alpha * peak_target)
-                    if peak_mean > 0.0 and yhat < 0.8 * peak_mean:
-                        yhat = float(0.8 * peak_mean)
-                        adjustments["seasonal_mean_floor"] = float(0.8 * peak_mean)
-                    adjustments["peak_alpha"] = peak_alpha
-                    adjustments["peak_target"] = peak_target
-                    anchor_priority = max(anchor_priority, 3)
+                candidates = _compute_candidates(
+                    archetype=archetype,
+                    p_effective=p_effective,
+                    amount_used=float(amount_used),
+                    floor=float(floor),
+                    mean_nonzero_12=float(mean_nonzero_12),
+                    recent_level=float(recent_level),
+                    month_rate_same=float(month_rate_same),
+                    cv_val=float(cv_val),
+                    ramp_up=bool(regime_ramp_up),
+                    m_stats={k: float(v) for k, v in (m_stats or {}).items()},
+                    last_nonzero_age=float(last_nonzero_age),
+                    overall_nonzero_rate=float(overall_nonzero_rate),
+                    nonzero_count_last_12=int(nonzero_count_last_12),
+                    croston_mean=float(croston_mean),
+                    adida_mean=float(adida_mean),
+                )
 
-                # Seasonal amplitude memory: lift in high-amplitude months
-                seasonal_amp_ratio = float(m_stats.get("max", 0.0)) / max(mean_last12_item, 1.0)
-                if month_rate_same >= 0.3 and seasonal_amp_ratio > 1.5:
-                    amp_target = 0.6 * float(m_stats.get("max", 0.0))
-                    if yhat < amp_target:
-                        yhat = float(amp_target)
-                        adjustments["seasonal_amp_anchor"] = amp_target
-                        anchor_priority = max(anchor_priority, 3)
-                adjustments["seasonal_amplitude_ratio"] = seasonal_amp_ratio
+                # Phase 2: select from candidates (with ML baseline blend)
+                yhat, winning_priority = _select_forecast(candidates, adjustments)
 
-                # Improvement #2: Croston-style floor for intermittent alive items
-                if (
-                    0.1 < overall_nonzero_rate < 0.5
-                    and last_nonzero_age <= 9
-                    and nonzero_count_last_12 >= 2
-                    and anchor_priority < 3
-                ):
-                    floor = 0.4 * float(croston_mean)
-                    if yhat < floor:
-                        yhat = float(floor)
-                        adjustments["croston_floor"] = floor
-                        anchor_priority = max(anchor_priority, 2)
-
-                # Improvement #3: horizon shrinkage (stable/noisy only)
+                # Phase 3: post-selection corrections
                 if archetype in {"stable", "noisy"} and not adjustments.get("regime_ramp_up"):
-                    if archetype == "noisy":
-                        beta = 0.05
-                    else:
-                        beta = 0.02
-                    shrink = max(0.0, 1.0 - beta * math.log1p(float(h)))
+                    beta_shrink = 0.05 if archetype == "noisy" else 0.02
+                    shrink = max(0.0, 1.0 - beta_shrink * math.log1p(float(h)))
                     if yhat > recent_level:
                         yhat = float(yhat * shrink)
                         adjustments["shrink"] = shrink
 
-                # Trend memory for stable/nonseasonal items (small nudge)
                 if archetype == "stable":
                     trend_weight = 0.2
                     trend_adjust = float(trend_weight * recent_slope * min(float(h), 6.0))
@@ -3669,72 +3744,59 @@ class LightGBMForecast:
                         yhat = float(yhat + trend_adjust)
                         adjustments["trend_adjust"] = trend_adjust
 
-                # Level floor for stable items with low CV and flat trend
-                if archetype == "stable" and cv_val <= 0.6:
+                # Level floor for stable low-CV items (only when winning tier was below 2)
+                if archetype == "stable" and cv_val <= 0.6 and int(winning_priority) < 2:
                     flat_thresh = 0.05 * max(recent_level, 1.0)
                     if abs(recent_slope) <= flat_thresh:
                         level_floor = 0.7 * float(recent_level)
                         if yhat < level_floor:
-                            if anchor_priority < 2:
-                                yhat = float(level_floor)
-                                adjustments["level_floor"] = level_floor
-                                anchor_priority = max(anchor_priority, 1)
-                adjustments["anchor_priority"] = anchor_priority
+                            yhat = float(level_floor)
+                            adjustments["level_floor"] = level_floor
 
-                # Improvement #4: classical override in narrow cases
-                classical_pred = float(np.mean([croston_mean, adida_mean]))
-                near_zero = yhat <= max(1.0, 0.1 * max(recent_level, 1.0))
-                classical_floor = 0.4 * float(croston_mean)
-                classical_cap = max(5.0, 2.0 * max(recent_level, 1.0))
-                cv_threshold = 0.8 if archetype == "intermittent" else 0.5
-                if (
-                    near_zero
-                    and cv_val <= cv_threshold
-                    and classical_floor <= classical_pred <= classical_cap
-                    and last_nonzero_age <= 9
-                    and archetype != "seasonal"
-                ):
-                    yhat = float(classical_pred)
-                    adjustments["classical_override"] = classical_pred
+                # Apply caps exactly once at the end
+                yhat = _apply_caps(
+                    yhat=float(yhat),
+                    uid=str(uid),
+                    forecast_ds=pd.Timestamp(forecast_ds),
+                    month_caps=month_caps,
+                    archetype=str(archetype),
+                    month_rate_same=float(month_rate_same),
+                    cap_multiplier=float(cap_multiplier),
+                    cap_small_floor=float(cap_small_floor),
+                    cap_nonzero_threshold=float(cap_nonzero_threshold),
+                    adjustments=adjustments,
+                )
 
-                cap_stats = month_caps.get((str(uid), int(forecast_ds.month)))
-                if cap_stats is not None:
-                    max_y = float(cap_stats.get("max_y", 0.0))
-                    nonzero_rate = float(cap_stats.get("nonzero_rate", 0.0))
-                    cap_low = max(max_y, cap_small_floor)
-                    if nonzero_rate < cap_nonzero_threshold:
-                        yhat = min(yhat, cap_low)
-                    cap_mult = cap_multiplier
-                    if archetype == "seasonal" and month_rate_same >= 0.25:
-                        cap_mult = 4.0
-                    if adjustments.get("regime_ramp_up"):
-                        cap_mult = cap_mult * 1.5
-                    cap = max(cap_mult * max_y, cap_small_floor)
-                    yhat = min(yhat, cap)
-                    adjustments["cap"] = cap
-                    adjustments["cap_mult"] = cap_mult
+                yhat = float(max(0.0, yhat))
 
-                # Final non-negative clamp
-                if yhat < 0.0:
-                    yhat = 0.0
-                    adjustments["clamped_nonneg"] = True
-
-                # Upper 95% bound: use quantile model if available, otherwise fallback to residual-based
-                if h in q95_boosters:
-                    # Predict quantile directly using same X as point forecast
-                    # Quantile model was trained on y_orig, so prediction is already on original scale
-                    q95_model_pred = float(q95_boosters[h].predict(X)[0])
-                    q95_pred = float(np.maximum(0.0, q95_model_pred))  # Non-negative clamp
+                # Upper bounds: use quantile models when available, otherwise fallback to residual-based.
+                has_q70 = h in q70_boosters
+                has_q90 = h in q90_boosters
+                has_q95 = h in q95_boosters
+                if has_q70 or has_q90 or has_q95:
+                    q70_pred = float(np.maximum(0.0, float(q70_boosters[h].predict(X)[0]))) if has_q70 else float("nan")
+                    q90_pred = float(np.maximum(0.0, float(q90_boosters[h].predict(X)[0]))) if has_q90 else float("nan")
+                    q95_pred = float(np.maximum(0.0, float(q95_boosters[h].predict(X)[0]))) if has_q95 else float("nan")
 
                     # MEDIUM PRIORITY: Add trend adjustment for consistency with point forecast
                     # Even though quantile model trains on y_orig, we add trend in inference
                     # to match the point forecast's trend adjustment logic
                     if detrend_method == "linear" and params:
                         trend_future = _trend_model_value(forecast_ds, params)
-                        q95_pred = float(np.maximum(0.0, q95_pred + trend_future))
+                        if np.isfinite(q70_pred):
+                            q70_pred = float(np.maximum(0.0, q70_pred + trend_future))
+                        if np.isfinite(q90_pred):
+                            q90_pred = float(np.maximum(0.0, q90_pred + trend_future))
+                        if np.isfinite(q95_pred):
+                            q95_pred = float(np.maximum(0.0, q95_pred + trend_future))
                     elif detrend_method == "log1p_linear" and params:
                         trend_future = _trend_model_value(forecast_ds, params)
-                        q95_pred = float(np.maximum(0.0, np.expm1(q95_pred + trend_future)))
+                        if np.isfinite(q70_pred):
+                            q70_pred = float(np.maximum(0.0, np.expm1(q70_pred + trend_future)))
+                        if np.isfinite(q90_pred):
+                            q90_pred = float(np.maximum(0.0, np.expm1(q90_pred + trend_future)))
+                        if np.isfinite(q95_pred):
+                            q95_pred = float(np.maximum(0.0, np.expm1(q95_pred + trend_future)))
                     # If detrend_method == "none", no trend adjustment needed
 
                     # HIGH PRIORITY: Apply occurrence model adjustment to upper bound
@@ -3744,32 +3806,35 @@ class LightGBMForecast:
                     # Apply conservative floor (0.2) to ensure upper bound reflects some uncertainty even for sparse items
                     p_effective_upper = float(np.clip(p_effective, 0.2, 1.0))  # Conservative floor at 0.2
                     
-                    # Scale quantile prediction to be more reasonable relative to point forecast
+                    # Scale quantile predictions to be more reasonable relative to point forecast
                     # Quantile model learns full distribution (including zeros), but point forecast is occurrence-adjusted
                     # The quantile model predicts the 95th percentile of the raw distribution, which can be much higher
                     # than the occurrence-adjusted point forecast. We need to scale it down to match the point forecast scale.
-                    if yhat > 0 and q95_pred > 0:
+                    amount_used = yhat_amount_nz if yhat_amount_nz is not None else yhat_amount
+                    if yhat > 0 and amount_used > 0:
                         # Calculate how much the occurrence adjustment reduced the forecast
                         # Point forecast: yhat = p_effective * amount_used + (1-p_effective) * floor
                         # Raw amount (before occurrence): amount_used
                         # Scale factor: yhat / amount_used (how much smaller is yhat vs raw amount)
-                        amount_used = yhat_amount_nz if yhat_amount_nz is not None else yhat_amount
-                        if amount_used > 0:
-                            # How much smaller is the final forecast vs the raw amount?
-                            occurrence_scale = yhat / amount_used
-                        else:
-                            occurrence_scale = 1.0
+                        # How much smaller is the final forecast vs the raw amount?
+                        occurrence_scale = yhat / amount_used
                         
                         # Apply similar scaling to quantile prediction
                         # But be conservative - don't scale below 60% to maintain uncertainty
                         quantile_scale = max(occurrence_scale, 0.6)  # Don't scale below 60% of original
-                        q95_pred_scaled = q95_pred * quantile_scale
+                        q70_pred_scaled = q70_pred * quantile_scale if np.isfinite(q70_pred) else float("nan")
+                        q90_pred_scaled = q90_pred * quantile_scale if np.isfinite(q90_pred) else float("nan")
+                        q95_pred_scaled = q95_pred * quantile_scale if np.isfinite(q95_pred) else float("nan")
                         
                         # Apply occurrence adjustment to scaled quantile
-                        upper_95_raw = p_effective_upper * q95_pred_scaled + (1.0 - p_effective_upper) * floor
+                        upper_70_raw = (p_effective_upper * q70_pred_scaled + (1.0 - p_effective_upper) * floor) if np.isfinite(q70_pred_scaled) else float("nan")
+                        upper_90_raw = (p_effective_upper * q90_pred_scaled + (1.0 - p_effective_upper) * floor) if np.isfinite(q90_pred_scaled) else float("nan")
+                        upper_95_raw = (p_effective_upper * q95_pred_scaled + (1.0 - p_effective_upper) * floor) if np.isfinite(q95_pred_scaled) else float("nan")
                     else:
                         # If yhat is zero or very small, use conservative floor-based upper bound
-                        upper_95_raw = max(floor, q95_pred * 0.4)  # More conservative scaling for zero forecasts
+                        upper_70_raw = max(floor, q70_pred * 0.4) if np.isfinite(q70_pred) else float("nan")
+                        upper_90_raw = max(floor, q90_pred * 0.4) if np.isfinite(q90_pred) else float("nan")
+                        upper_95_raw = max(floor, q95_pred * 0.4) if np.isfinite(q95_pred) else float("nan")
 
                     # MEDIUM PRIORITY: Fix cap order - apply monotonicity BEFORE cap
                     # First ensure upper_95 >= yhat (monotonicity constraint)
@@ -3778,34 +3843,103 @@ class LightGBMForecast:
                     # This prevents the upper bound from being 3x+ the point forecast
                     if yhat > 0:
                         max_reasonable = max(yhat * 2.5, floor * 2.0)  # Max 2.5x yhat (more conservative)
-                        upper_95_raw = min(upper_95_raw, max_reasonable)
+                        if np.isfinite(upper_70_raw):
+                            upper_70_raw = min(upper_70_raw, max_reasonable)
+                        if np.isfinite(upper_90_raw):
+                            upper_90_raw = min(upper_90_raw, max_reasonable)
+                        if np.isfinite(upper_95_raw):
+                            upper_95_raw = min(upper_95_raw, max_reasonable)
                     
-                    upper_95 = float(max(yhat, upper_95_raw, floor))  # Monotonicity: upper_95 >= yhat
+                    # Per-quantile fallback: if any quantile model is missing/invalid, use residual calibration for that quantile.
+                    q_row = residual_quantiles.get((archetype, int(h))) or residual_quantiles.get(("__global__", int(h)))
+                    if not isinstance(q_row, dict):
+                        q_row = None
+                    fallback_base = max(1.0, 0.3 * max(recent_level, 0.0), 0.2 * float(croston_mean))
+
+                    if (not np.isfinite(upper_70_raw)) or upper_70_raw <= 0.0:
+                        q70_excess = float(q_row.get("q70_excess") or 0.0) if q_row is not None else 0.0
+                        if (not np.isfinite(q70_excess)) or q70_excess <= 0.0:
+                            q70_excess = float(max(0.6, 0.60 * fallback_base))
+                            adjustments["q70_fallback"] = True
+                        upper_70_raw = yhat + q70_excess
+                        adjustments["upper_70_fallback"] = True
+
+                    if (not np.isfinite(upper_90_raw)) or upper_90_raw <= 0.0:
+                        q90_excess = float(q_row.get("q90_excess") or 0.0) if q_row is not None else 0.0
+                        if (not np.isfinite(q90_excess)) or q90_excess <= 0.0:
+                            q90_excess = float(max(0.8, 0.85 * fallback_base))
+                            adjustments["q90_fallback"] = True
+                        upper_90_raw = yhat + q90_excess
+                        adjustments["upper_90_fallback"] = True
+
+                    if (not np.isfinite(upper_95_raw)) or upper_95_raw <= 0.0:
+                        q95_excess = float(q_row.get("q95_excess") or 0.0) if q_row is not None else 0.0
+                        if (not np.isfinite(q95_excess)) or q95_excess <= 0.0:
+                            q95_excess = float(fallback_base)
+                            adjustments["q95_fallback"] = True
+                        upper_95_raw = yhat + q95_excess
+                        adjustments["upper_95_fallback"] = True
+
+                    upper_70 = float(max(yhat, upper_70_raw, floor))
+                    upper_90 = float(max(yhat, upper_90_raw, floor))
+                    upper_95 = float(max(yhat, upper_95_raw, floor))
+                    upper_90 = float(max(upper_90, upper_70))
+                    upper_95 = float(max(upper_95, upper_90))
                     if "cap" in adjustments:
-                        upper_95 = float(min(upper_95, float(adjustments["cap"])))  # Then apply cap
+                        cap_v = float(adjustments["cap"])
+                        upper_70 = float(min(upper_70, cap_v))
+                        upper_90 = float(min(upper_90, cap_v))
+                        upper_95 = float(min(upper_95, cap_v))  # Then apply cap
 
                     # Final non-negative clamp
+                    if upper_70 < 0.0:
+                        upper_70 = 0.0
+                    if upper_90 < 0.0:
+                        upper_90 = 0.0
                     if upper_95 < 0.0:
                         upper_95 = 0.0
                     # Ensure upper_95 is always set (not None) - use yhat as minimum with reasonable multiplier
                     if upper_95 is None or (upper_95 == 0.0 and yhat > 0.0):
                         upper_95 = float(max(yhat * 1.5, floor * 1.5, 1.0))  # Conservative fallback
-                    adjustments["upper_95_method"] = "quantile_model"
+                    adjustments["upper_method"] = "quantile_models_with_fallbacks"
                     adjustments["p_effective_upper"] = p_effective_upper
                 else:
                     # Fallback to existing residual-based calculation
-                    q = residual_quantiles.get((archetype, int(h)))
-                    if q is None:
-                        q = residual_quantiles.get(("__global__", int(h)))
-                    if q is None:
-                        # fallback: small uplift when calibration missing
-                        fallback_base = max(1.0, 0.3 * max(recent_level, 0.0), 0.2 * float(croston_mean))
+                    q_row = residual_quantiles.get((archetype, int(h)))
+                    if q_row is None:
+                        q_row = residual_quantiles.get(("__global__", int(h)))
+                    if not isinstance(q_row, dict):
+                        q_row = None
+
+                    # fallback: small uplift when calibration missing
+                    fallback_base = max(1.0, 0.3 * max(recent_level, 0.0), 0.2 * float(croston_mean))
+                    if q_row is None:
+                        q70_excess = float(max(0.6, 0.60 * fallback_base))
+                        q90_excess = float(max(0.8, 0.85 * fallback_base))
                         q95_excess = float(fallback_base)
+                        adjustments["q70_fallback"] = True
+                        adjustments["q90_fallback"] = True
                         adjustments["q95_fallback"] = True
                     else:
-                        q95_excess = float(q)
+                        q70_excess = float(q_row.get("q70_excess") or 0.0)
+                        q90_excess = float(q_row.get("q90_excess") or 0.0)
+                        q95_excess = float(q_row.get("q95_excess") or 0.0)
+                        if (not np.isfinite(q70_excess)) or q70_excess <= 0.0:
+                            q70_excess = float(max(0.6, 0.60 * fallback_base))
+                            adjustments["q70_fallback"] = True
+                        if (not np.isfinite(q90_excess)) or q90_excess <= 0.0:
+                            q90_excess = float(max(0.8, 0.85 * fallback_base))
+                            adjustments["q90_fallback"] = True
+                        if (not np.isfinite(q95_excess)) or q95_excess <= 0.0:
+                            q95_excess = float(fallback_base)
+                            adjustments["q95_fallback"] = True
 
+                    upper_70 = float(max(yhat, yhat + q70_excess))
+                    upper_90 = float(max(yhat, yhat + q90_excess))
                     upper_95 = float(max(yhat, yhat + q95_excess))
+                    # Enforce monotonicity among quantiles.
+                    upper_90 = float(max(upper_90, upper_70))
+                    upper_95 = float(max(upper_95, upper_90))
 
                     if "cap" in adjustments:
                         upper_95 = float(min(upper_95, float(adjustments["cap"])))
@@ -3822,10 +3956,10 @@ class LightGBMForecast:
                         "ds": forecast_ds,
                         "yhat": yhat,
                         # Provide a small set of aligned upper-quantiles for downstream inventory logic.
-                        # upper_70/upper_90 are derived deterministically from upper_95 to avoid retraining
-                        # additional quantile models. (Inventory layer can refine later.)
-                        "upper_70": float(max(yhat, yhat + 0.4 * max(0.0, float(upper_95) - yhat), 0.0)),
-                        "upper_90": float(max(yhat, yhat + 0.8 * max(0.0, float(upper_95) - yhat), 0.0)),
+                        # upper_70/upper_90/upper_95 are calibrated independently from pooled CV residual quantiles
+                        # (not derived from upper_95 scaling).
+                        "upper_70": float(locals().get("upper_70", yhat)),
+                        "upper_90": float(locals().get("upper_90", yhat)),
                         "upper_95": upper_95,
                         "adjustments": adjustments,
                     }
