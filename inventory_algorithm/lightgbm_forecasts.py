@@ -656,6 +656,88 @@ def _compute_item_month_stats(
     return out
 
 
+def _precompute_inter_demand_features(y: np.ndarray) -> dict[str, float]:
+    y = np.asarray(y, dtype=float)
+    nonzero_indices = np.where(y > 0.0)[0]
+    if len(nonzero_indices) < 2:
+        return {
+            "mean_inter_demand_interval": float(max(len(y), 1)),
+            "cv_inter_demand_interval": 0.0,
+            "demand_regularity": 0.0,
+        }
+    intervals = np.diff(nonzero_indices).astype(float)
+    mean_interval = float(np.mean(intervals))
+    std_interval = float(np.std(intervals, ddof=0))
+    cv_interval = float(std_interval / max(mean_interval, 1.0))
+    demand_regularity = float(np.exp(-cv_interval))
+    return {
+        "mean_inter_demand_interval": float(mean_interval),
+        "cv_inter_demand_interval": float(np.clip(cv_interval, 0.0, 5.0)),
+        "demand_regularity": float(demand_regularity),
+    }
+
+
+def _precompute_demand_size_features(y: np.ndarray) -> dict[str, float]:
+    y = np.asarray(y, dtype=float)
+    nz_vals = y[y > 0.0]
+    if len(nz_vals) < 2:
+        return {
+            "cv_demand_size": 0.0,
+            "demand_size_skew": 0.0,
+            "demand_size_iqr_ratio": 0.0,
+            "p_large_demand": 0.0,
+        }
+    mean_size = float(np.mean(nz_vals))
+    std_size = float(np.std(nz_vals, ddof=0))
+    median_size = float(np.median(nz_vals))
+    cv_size = float(std_size / max(mean_size, 1.0))
+    skew = float(3.0 * (mean_size - median_size) / max(std_size, 1.0))
+    if len(nz_vals) >= 4:
+        q75 = float(np.percentile(nz_vals, 75))
+        q25 = float(np.percentile(nz_vals, 25))
+        iqr_ratio = float((q75 - q25) / max(median_size, 1.0))
+    else:
+        iqr_ratio = 0.0
+    p_large = float(np.mean(nz_vals > 2.0 * max(median_size, 1.0)))
+    return {
+        "cv_demand_size": float(np.clip(cv_size, 0.0, 5.0)),
+        "demand_size_skew": float(np.clip(skew, -3.0, 3.0)),
+        "demand_size_iqr_ratio": float(np.clip(iqr_ratio, 0.0, 5.0)),
+        "p_large_demand": float(p_large),
+    }
+
+
+def _compute_ets_state_at_end(y: np.ndarray) -> dict[str, float]:
+    y = np.asarray(y, dtype=float)
+    if len(y) == 0:
+        return {
+            "ets_level_alpha_1": 0.0,
+            "ets_level_alpha_3": 0.0,
+            "ets_level_alpha_5": 0.0,
+            "ets_trend_alpha_3": 0.0,
+            "ets_level_ratio_alpha_3": 1.0,
+        }
+    l1 = l3 = l5 = float(y[0])
+    dl = float(y[0])
+    dt = float(y[1] - y[0]) if len(y) > 1 else 0.0
+    for val in y[1:]:
+        v = float(val)
+        prev_dl = dl
+        l1 = 0.1 * v + 0.9 * l1
+        l3 = 0.3 * v + 0.7 * l3
+        l5 = 0.5 * v + 0.5 * l5
+        dl = 0.3 * v + 0.7 * (dl + dt)
+        dt = 0.1 * (dl - prev_dl) + 0.9 * dt
+    last_val = float(y[-1])
+    return {
+        "ets_level_alpha_1": float(np.clip(l1, 0.0, 1e6)),
+        "ets_level_alpha_3": float(np.clip(l3, 0.0, 1e6)),
+        "ets_level_alpha_5": float(np.clip(l5, 0.0, 1e6)),
+        "ets_trend_alpha_3": float(np.clip(dt, -1e4, 1e4)),
+        "ets_level_ratio_alpha_3": float(np.clip(last_val / max(l3, 1.0), 0.0, 10.0)),
+    }
+
+
 @dataclass(frozen=True)
 class ForecastCandidate:
     value: float
@@ -1511,12 +1593,50 @@ def _build_direct_rows_for_item_v2(
     base_y = y_orig if y_orig is not None else y
     same_month_stats = _compute_item_month_stats(base_y, ds, freq=freq, lookback_years=3)
 
+    # Classical demand-process features (precomputed per item, reused across timesteps)
+    idi_feats_static = _precompute_inter_demand_features(base_y)
+    ds_feats_static = _precompute_demand_size_features(base_y)
+
     lifecycle_feats = _detect_lifecycle_phase(base_y if base_y is not None else y)
     start_ds = pd.Timestamp(ds[0])
+
+    # Incremental ETS state (updated O(1) per step)
+    b0 = float(base_y[0]) if len(base_y) > 0 else 0.0
+    ets_state = {
+        "level_01": b0,
+        "level_03": b0,
+        "level_05": b0,
+        "des_level": b0,
+        "des_trend": (float(base_y[1]) - float(base_y[0])) if len(base_y) > 1 else 0.0,
+    }
+    # Track last nonzero index for O(1) months_since_last
+    last_nonzero_idx = -1
+    # Warm up ETS + last_nonzero through t=0..max_needed-1 so the first loop iteration has correct state
+    for tw in range(int(min(max_needed, len(base_y)))):
+        v = float(base_y[tw])
+        if v > 0.0:
+            last_nonzero_idx = int(tw)
+        prev_dl = float(ets_state["des_level"])
+        ets_state["level_01"] = 0.1 * v + 0.9 * float(ets_state["level_01"])
+        ets_state["level_03"] = 0.3 * v + 0.7 * float(ets_state["level_03"])
+        ets_state["level_05"] = 0.5 * v + 0.5 * float(ets_state["level_05"])
+        ets_state["des_level"] = 0.3 * v + 0.7 * (float(ets_state["des_level"]) + float(ets_state["des_trend"]))
+        ets_state["des_trend"] = 0.1 * (float(ets_state["des_level"]) - prev_dl) + 0.9 * float(ets_state["des_trend"])
 
     for t in range(0, n - horizon):
         if t < max_needed:
             continue
+
+        # Update ETS + last_nonzero incrementally for this decision point t
+        v_now = float(base_y[t])
+        if v_now > 0.0:
+            last_nonzero_idx = int(t)
+        prev_dl = float(ets_state["des_level"])
+        ets_state["level_01"] = 0.1 * v_now + 0.9 * float(ets_state["level_01"])
+        ets_state["level_03"] = 0.3 * v_now + 0.7 * float(ets_state["level_03"])
+        ets_state["level_05"] = 0.5 * v_now + 0.5 * float(ets_state["level_05"])
+        ets_state["des_level"] = 0.3 * v_now + 0.7 * (float(ets_state["des_level"]) + float(ets_state["des_trend"]))
+        ets_state["des_trend"] = 0.1 * (float(ets_state["des_level"]) - prev_dl) + 0.9 * float(ets_state["des_trend"])
 
         forecast_ds = pd.Timestamp(ds[t]) + pd.offsets.MonthBegin(horizon)
         target = float(y[t + horizon])
@@ -1607,6 +1727,25 @@ def _build_direct_rows_for_item_v2(
         last12 = y[t - 11 : t + 1]
         row["zero_ratio_12"] = float(np.mean(last12 == 0.0))
         row["nonzero_run_length"] = float(_nonzero_run_length(y[: t + 1]))
+
+        # Add classical demand-process features (static per item)
+        row.update(idi_feats_static)
+        row.update(ds_feats_static)
+
+        # Time-varying ETS features (from incremental state)
+        row["ets_level_alpha_1"] = float(np.clip(float(ets_state["level_01"]), 0.0, 1e6))
+        row["ets_level_alpha_3"] = float(np.clip(float(ets_state["level_03"]), 0.0, 1e6))
+        row["ets_level_alpha_5"] = float(np.clip(float(ets_state["level_05"]), 0.0, 1e6))
+        row["ets_trend_alpha_3"] = float(np.clip(float(ets_state["des_trend"]), -1e4, 1e4))
+        row["ets_level_ratio_alpha_3"] = float(
+            np.clip(v_now / max(float(ets_state["level_03"]), 1.0), 0.0, 10.0)
+        )
+
+        # Months since last demand event vs mean interval (O(1))
+        mean_interval = float(idi_feats_static.get("mean_inter_demand_interval", float(t + 1)))
+        months_since_last = float((t - last_nonzero_idx) if last_nonzero_idx >= 0 else (t + 1))
+        months_since_vs_mean = months_since_last / max(mean_interval, 1.0)
+        row["months_since_last_vs_mean_interval"] = float(np.clip(months_since_vs_mean, 0.0, 10.0))
 
         nz_source = y_orig if y_orig is not None else y
         window_nz = nz_source[t - 11 : t + 1]
@@ -3017,6 +3156,22 @@ class LightGBMForecast:
 
                 # Additional features for SHAP accuracy (wrapped in try/except to prevent crashes)
                 try:
+                    # Classical demand-process features (computed on original scale, full history)
+                    idi_shap = _precompute_inter_demand_features(y_orig)
+                    dsf_shap = _precompute_demand_size_features(y_orig)
+                    ets_shap = _compute_ets_state_at_end(y_orig)
+                    r.update(idi_shap)
+                    r.update(dsf_shap)
+                    r.update(ets_shap)
+                    mean_interval = float(idi_shap.get("mean_inter_demand_interval", float(len(y_orig) or 1)))
+                    # last_nonzero_idx from full history (single row, O(n) once)
+                    nz_idx = np.where(np.asarray(y_orig, dtype=float) > 0.0)[0]
+                    last_nz = int(nz_idx[-1]) if len(nz_idx) else -1
+                    months_since_last = float((t - last_nz) if last_nz >= 0 else (t + 1))
+                    r["months_since_last_vs_mean_interval"] = float(
+                        np.clip(months_since_last / max(mean_interval, 1.0), 0.0, 10.0)
+                    )
+
                     # Conditional-on-nonzero level features (use original scale)
                     window_nz = y_orig[t - 11 : t + 1] if t >= 11 else y_orig[:t + 1]
                     nz_vals = window_nz[window_nz > 0.0]
@@ -3429,6 +3584,15 @@ class LightGBMForecast:
             # Precompute same-month stats for inference (≈3 years, freq-aware) on original scale.
             same_month_stats = _compute_item_month_stats(y_orig, ds_arr, freq=freq, lookback_years=3)
 
+            # Classical demand-process features (computed once per item at inference time)
+            idi_inf = _precompute_inter_demand_features(y_orig)
+            dsf_inf = _precompute_demand_size_features(y_orig)
+            ets_inf = _compute_ets_state_at_end(y_orig)
+            mean_interval_inf = float(idi_inf.get("mean_inter_demand_interval", float(len(y_orig) or 1)))
+            nz_idx_inf = np.where(np.asarray(y_orig, dtype=float) > 0.0)[0]
+            last_nz_inf = int(nz_idx_inf[-1]) if len(nz_idx_inf) else -1
+            months_since_last_inf = float(((len(y_orig) - 1) - last_nz_inf) if last_nz_inf >= 0 else float(len(y_orig)))
+
             base_y = y_orig
             lookback_points = int(max(1, 3 * _points_per_year_from_freq(freq)))
             vals_3y = base_y[-lookback_points:] if len(base_y) > lookback_points else base_y
@@ -3489,6 +3653,14 @@ class LightGBMForecast:
                 # Easter features for paskavara (Easter items)
                 easter_feats = _easter_features(forecast_ds)
                 r.update(easter_feats)
+
+                # Classical demand-process features (static per item at inference)
+                r.update(idi_inf)
+                r.update(dsf_inf)
+                r.update(ets_inf)
+                r["months_since_last_vs_mean_interval"] = float(
+                    np.clip(months_since_last_inf / max(mean_interval_inf, 1.0), 0.0, 10.0)
+                )
 
                 for lag in lags:
                     idx = t - (lag - 1)
