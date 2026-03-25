@@ -197,8 +197,4 @@ class LightGBMBatchForecastRequest(BaseModel):
         model_version: Optional[str] = None
         status: str = 'prod'
 
-        # Deep per-forecast SHAP (TreeSHAP pred_contrib) at inference time.
-        # Default ON; may be capped server-side for performance.
-        deep_shap: bool = True
-
 

@@ -148,6 +148,125 @@ def _default_store_root() -> str:
     return os.getenv("NOSTRADAMUS_STORE_ROOT", "./nostradamus_store")
 
 
+def _future_month_starts(last_day: Any, periods: int) -> list[str]:
+    if pd.isna(last_day):
+        return []
+    start = pd.to_datetime(last_day).to_period("M").to_timestamp(how="start")
+    future = pd.date_range(start=start + pd.offsets.MonthBegin(1), periods=int(periods), freq="MS")
+    return [d.strftime("%Y-%m-%d") for d in future]
+
+
+def _build_non_ml_fallback(
+    *,
+    df_hist: pd.DataFrame,
+    item_id: str,
+    forecast_periods: int,
+    reason: str,
+    confidence: Any,
+) -> dict[str, Any]:
+    """Seasonal+level fallback when ML prediction is unavailable."""
+    h = df_hist[df_hist["item_id"].astype(str) == str(item_id)].copy()
+    h["day"] = pd.to_datetime(h["day"], errors="coerce")
+    h["actual_sale"] = pd.to_numeric(h["actual_sale"], errors="coerce")
+    h = h.dropna(subset=["day", "actual_sale"]).sort_values("day", kind="mergesort")
+    last_day = h["day"].max() if not h.empty else pd.NaT
+    days = _future_month_starts(last_day, int(forecast_periods))
+
+    if h.empty:
+        return {
+            "item_id": item_id,
+            "forecast": [0.0] * int(forecast_periods),
+            "upper_70": [0.0] * int(forecast_periods),
+            "upper_90": [0.0] * int(forecast_periods),
+            "upper_95": [0.0] * int(forecast_periods),
+            "forecast_dates": days,
+            "model_used": "fallback_seasonal_level",
+            "reason_code": reason,
+            "confidence": confidence,
+            "skipped": True,
+            "adjustments": [{"fallback": "empty_history"} for _ in range(int(forecast_periods))],
+        }
+
+    y = h["actual_sale"].astype(float).to_numpy()
+    months = h["day"].dt.month.to_numpy()
+    nz = y[y > 0.0]
+    overall_nonzero_rate = float((y > 0.0).mean()) if len(y) else 0.0
+    recent_nz = nz[-12:] if len(nz) else nz
+    recent_nz_mean = float(recent_nz.mean()) if len(recent_nz) else 0.0
+    last_nz = float(nz[-1]) if len(nz) else 0.0
+
+    month_rates: dict[int, float] = {}
+    month_nonzero_means: dict[int, float] = {}
+    for m in range(1, 13):
+        ym = y[months == m]
+        if len(ym) == 0:
+            month_rates[m] = 0.0
+            month_nonzero_means[m] = 0.0
+            continue
+        nzm = ym[ym > 0.0]
+        month_rates[m] = float(len(nzm) / len(ym))
+        month_nonzero_means[m] = float(nzm.mean()) if len(nzm) else 0.0
+    seasonal_strength = float(max(month_rates.values())) if month_rates else 0.0
+    strict_seasonal = bool(seasonal_strength >= 0.50 and overall_nonzero_rate <= 0.30)
+
+    croston_proxy = float(overall_nonzero_rate * recent_nz_mean) if recent_nz_mean > 0.0 else 0.0
+    spread_base = max(1.0, 0.35 * max(recent_nz_mean, last_nz, croston_proxy))
+
+    fcst: list[float] = []
+    u70: list[float] = []
+    u90: list[float] = []
+    u95: list[float] = []
+    adj: list[dict[str, Any]] = []
+
+    for d in days:
+        m = int(pd.to_datetime(d).month)
+        m_rate = float(month_rates.get(m, 0.0))
+        m_mean = float(month_nonzero_means.get(m, 0.0))
+        yhat = float(0.55 * m_mean + 0.30 * recent_nz_mean + 0.15 * croston_proxy)
+        if m_mean <= 0.0 and recent_nz_mean > 0.0 and overall_nonzero_rate >= 0.5:
+            yhat = max(yhat, 0.60 * recent_nz_mean)
+        off_season_zeroed = bool(strict_seasonal and m_rate <= 0.10)
+        if off_season_zeroed:
+            yhat = 0.0
+        yhat = float(max(0.0, yhat))
+        spread = float(max(spread_base, 0.30 * max(m_mean, recent_nz_mean, 0.0)))
+        if yhat <= 0.0 and recent_nz_mean <= 0.0:
+            q70 = q90 = q95 = 0.0
+        else:
+            q70 = float(max(yhat, yhat + 0.30 * spread))
+            q90 = float(max(q70, yhat + 0.60 * spread))
+            q95 = float(max(q90, yhat + 0.90 * spread))
+        fcst.append(yhat)
+        u70.append(q70)
+        u90.append(q90)
+        u95.append(q95)
+        adj.append(
+            {
+                "fallback": "seasonal_level",
+                "reason_code": str(reason),
+                "month_rate_same": float(m_rate),
+                "month_nonzero_mean": float(m_mean),
+                "recent_nonzero_mean": float(recent_nz_mean),
+                "overall_nonzero_rate": float(overall_nonzero_rate),
+                "strict_seasonal_offseason_zeroed": bool(off_season_zeroed),
+            }
+        )
+
+    return {
+        "item_id": item_id,
+        "forecast": fcst,
+        "upper_70": u70,
+        "upper_90": u90,
+        "upper_95": u95,
+        "forecast_dates": days,
+        "model_used": "fallback_seasonal_level",
+        "reason_code": reason,
+        "confidence": confidence,
+        "skipped": True,
+        "adjustments": adj,
+    }
+
+
 @router.post("/train")
 def train_lightgbm(request: LightGBMTrainRequest):
     try:
@@ -518,8 +637,6 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
         eligibility = forecaster.store.get_eligibility(model_version=model_version, unique_ids=unique_ids)
 
         # ML batch prediction for all; we'll decide per item whether to use it.
-        # NOTE: Keep sync /batch fast to avoid Cloudflare timeouts.
-        # Deep SHAP should run via /batch_async.
         fcst_df, meta = forecaster.batch_forecast(
             df_hist,
             forecast_periods=request.forecast_periods,
@@ -529,19 +646,12 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
             exogenous_columns=request.exogenous_columns,
             model_version=model_version,
             status=request.status,
-            deep_shap=False,
         )
 
-        # Build naive fallback
+        # Build fallback inputs
         df_hist["day"] = pd.to_datetime(df_hist["day"], errors="coerce")
         df_hist = df_hist.dropna(subset=["item_id", "day", "actual_sale"])
         df_hist["item_id"] = df_hist["item_id"].astype(str)
-        last_vals = (
-            df_hist.sort_values(["item_id", "day"], kind="mergesort")
-            .groupby("item_id", sort=False)
-            .tail(1)
-            .set_index("item_id")["actual_sale"]
-        )
 
         # Convert ML results to per-item format
         out: list[dict[str, Any]] = []
@@ -601,53 +711,25 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
                 # If ML is allowed but we don't have predictions (e.g. not enough history
                 # for that item), fall back to naive but keep an explicit reason.
                 reason = "ML_NO_PREDICTION"
-
-                last = float(last_vals.get(str(item_id), 0.0)) if len(last_vals) else 0.0
-                # naive dates: just increment by freq offset from max day
-                last_day = df_hist[df_hist["item_id"].astype(str) == str(item_id)]["day"].max()
-                if pd.isna(last_day):
-                    days = []
-                else:
-                    start = pd.to_datetime(last_day).to_period('M').to_timestamp(how='start')
-                    future = pd.date_range(start=start + pd.offsets.MonthBegin(1), periods=request.forecast_periods, freq='MS')
-                    days = [d.strftime("%Y-%m-%d") for d in future]
-
                 out.append(
-                    {
-                        "item_id": item_id,
-                        "forecast": [last] * int(request.forecast_periods),
-                        "forecast_dates": days,
-                        "model_used": "naive",
-                        "reason_code": reason,
-                        "confidence": confidence,
-                        "skipped": True,
-                    }
+                    _build_non_ml_fallback(
+                        df_hist=df_hist,
+                        item_id=str(item_id),
+                        forecast_periods=int(request.forecast_periods),
+                        reason=reason,
+                        confidence=confidence,
+                    )
                 )
                 continue
             if not ml_allowed:
-                last = float(last_vals.get(str(item_id), 0.0)) if len(last_vals) else 0.0
-                last_day = df_hist[df_hist["item_id"].astype(str) == str(item_id)]["day"].max()
-                if pd.isna(last_day):
-                    days = []
-                else:
-                    start = pd.to_datetime(last_day).to_period('M').to_timestamp(how='start')
-                    future = pd.date_range(
-                        start=start + pd.offsets.MonthBegin(1),
-                        periods=request.forecast_periods,
-                        freq='MS',
-                    )
-                    days = [d.strftime("%Y-%m-%d") for d in future]
-
                 out.append(
-                    {
-                        "item_id": item_id,
-                        "forecast": [last] * int(request.forecast_periods),
-                        "forecast_dates": days,
-                        "model_used": "naive",
-                        "reason_code": reason,
-                        "confidence": confidence,
-                        "skipped": True,
-                    }
+                    _build_non_ml_fallback(
+                        df_hist=df_hist,
+                        item_id=str(item_id),
+                        forecast_periods=int(request.forecast_periods),
+                        reason=str(reason),
+                        confidence=confidence,
+                    )
                 )
 
         return {
@@ -657,6 +739,7 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
             "periods": request.forecast_periods,
             "freq": meta.get("freq"),
             "model_version": meta.get("model_version"),
+            "meta": meta,
         }
 
     except ValueError as e:
@@ -724,21 +807,14 @@ def batch_forecast_lightgbm_async(
                 exogenous_columns=request.exogenous_columns,
                 model_version=model_version,
                 status=request.status,
-                deep_shap=bool(getattr(request, "deep_shap", True)),
             )
 
             _update_job(job_id, phase='formatting')
 
-            # Build naive fallback
+            # Build fallback inputs
             df_hist["day"] = pd.to_datetime(df_hist["day"], errors="coerce")
             df_hist = df_hist.dropna(subset=["item_id", "day", "actual_sale"])
             df_hist["item_id"] = df_hist["item_id"].astype(str)
-            last_vals = (
-                df_hist.sort_values(["item_id", "day"], kind="mergesort")
-                .groupby("item_id", sort=False)
-                .tail(1)
-                .set_index("item_id")["actual_sale"]
-            )
 
             # Convert ML results to per-item format
             out: list[dict[str, Any]] = []
@@ -795,26 +871,14 @@ def batch_forecast_lightgbm_async(
                         continue
 
                     reason = "ML_NO_PREDICTION"
-
-                last = float(last_vals.get(str(item_id), 0.0)) if len(last_vals) else 0.0
-                last_day = df_hist[df_hist["item_id"].astype(str) == str(item_id)]["day"].max()
-                if pd.isna(last_day):
-                    days = []
-                else:
-                    start = pd.to_datetime(last_day).to_period('M').to_timestamp(how='start')
-                    future = pd.date_range(start=start + pd.offsets.MonthBegin(1), periods=request.forecast_periods, freq='MS')
-                    days = [d.strftime("%Y-%m-%d") for d in future]
-
                 out.append(
-                    {
-                        "item_id": item_id,
-                        "forecast": [last] * int(request.forecast_periods),
-                        "forecast_dates": days,
-                        "model_used": "naive",
-                        "reason_code": reason,
-                        "confidence": confidence,
-                        "skipped": True,
-                    }
+                    _build_non_ml_fallback(
+                        df_hist=df_hist,
+                        item_id=str(item_id),
+                        forecast_periods=int(request.forecast_periods),
+                        reason=str(reason),
+                        confidence=confidence,
+                    )
                 )
 
             result = {
@@ -824,8 +888,7 @@ def batch_forecast_lightgbm_async(
                 "periods": request.forecast_periods,
                 "freq": meta.get("freq"),
                 "model_version": meta.get("model_version"),
-                "deep_shap": meta.get("deep_shap"),
-                "deep_shap_rows": meta.get("deep_shap_rows") if bool(getattr(request, "deep_shap", True)) else [],
+                "meta": meta,
             }
 
             _update_job(
