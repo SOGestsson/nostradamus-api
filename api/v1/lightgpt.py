@@ -42,7 +42,7 @@ def batch_forecast_with_drivers(
     
     **freq**: Input/output frequency
     - 'D' for daily
-    - 'MS'/'M'/'monthly' for monthly (handled as month-start internally)
+    - 'MS'/'M'/'ME'/'monthly' for monthly (always first day of month internally)
 
     **exogenous_columns**: Which driver columns to use
     - Example: ['price', 'promotion', 'seasonality_index']

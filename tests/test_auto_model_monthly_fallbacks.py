@@ -2,8 +2,9 @@ import pandas as pd
 
 
 def _make_monthly_series(uid: str, n_months: int) -> pd.DataFrame:
-    # Month-start convention
-    ds = pd.date_range('2020-01-01', periods=n_months, freq='MS')
+    # End at current month so panel regularization does not add years of synthetic zeros.
+    end = pd.Timestamp.now(tz=None).to_period('M').to_timestamp(how='start')
+    ds = pd.date_range(end=end, periods=n_months, freq='MS')
     # Simple seasonal-ish + trend signal; doesn't matter much because these tests
     # exercise the short/insufficient fallback path.
     y = (pd.Series(range(n_months)) * 0.2 + (pd.Series(range(n_months)) % 12) * 0.5).astype(float)
@@ -12,6 +13,8 @@ def _make_monthly_series(uid: str, n_months: int) -> pd.DataFrame:
 
 def test_auto_model_monthly_12_to_23_months_fallback_is_seasonal_window_average():
     df = _make_monthly_series('item_15', 15)
+    # Flat demand keeps trend_corr low so the 12–23m branch prefers SWA over AutoETS.
+    df['y'] = 1.0
 
     # Force the short/insufficient-length branch by asking for more CV windows than possible.
     from inventory_algorithm.classical_forecasts import ClassicalForecasts

@@ -49,8 +49,8 @@ def test_wape_bias_penalty_prefers_adaptive_over_seasonal_naive_when_close():
 def test_wape_bias_penalty_keeps_seasonal_naive_when_materially_better():
     from inventory_algorithm.classical_forecasts import _pick_model_wape_bias_penalty
 
-    # SeasonalNaive is materially better by > 1.5 WAPE points.
-    wape = pd.Series({"SeasonalNaive": 0.080, "Theta": 0.101})
+    # SeasonalNaive is materially better (advantage > seasonal_naive_min_wape_advantage, default 0.06).
+    wape = pd.Series({"SeasonalNaive": 0.080, "Theta": 0.150})
     bias_pct = pd.Series({"SeasonalNaive": 0.0, "Theta": 0.0})
 
     picked = _pick_model_wape_bias_penalty(wape, bias_pct)

@@ -26,7 +26,7 @@ def _canonicalize_freq(freq: str | None) -> str:
         return 'D'
     if f in {'MONTH', 'MONTHLY'}:
         return 'MS'
-    if f in {'M', 'MS'}:
+    if f in {'M', 'MS', 'ME'}:
         return 'MS'
     if f in {'DAY', 'DAILY'}:
         return 'D'
@@ -56,7 +56,7 @@ def _freq_label(freq: str | None) -> str:
     f = (freq or '').strip().upper()
     if not f:
         return 'D'
-    if f in {'MONTH', 'MONTHLY', 'M', 'MS'}:
+    if f in {'MONTH', 'MONTHLY', 'M', 'MS', 'ME'}:
         return 'M'
     if f in {'DAY', 'DAILY'}:
         return 'D'
@@ -115,7 +115,7 @@ def _season_length_for_freq(freq: str) -> int:
         return 7
     if f.startswith('W'):
         return 52
-    if f in ('M', 'MS'):
+    if f in ('M', 'MS', 'ME'):
         return 12
     if f in ('Q', 'QS'):
         return 4

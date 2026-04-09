@@ -145,20 +145,14 @@ def _normalize_and_aggregate_history(df_his: pd.DataFrame, freq: str) -> tuple[p
     """
     freq_req = (freq or 'D').strip().upper()
 
-    # Monthly:
-    # - Our API treats 'M' as "monthly" and (by convention) expects month-start timestamps.
-    # - Use 'MS' (month begin) for 'M'/'MS', and 'ME' (month end) when explicitly requested.
+    # Monthly: every period is the first day of the month (YYYY-MM-01). 'ME' is a legacy
+    # alias and is normalized the same way as 'M' / 'MS'.
     if freq_req in ('M', 'MS', 'ME'):
-        month_start = freq_req in ('M', 'MS')
         out = df_his.copy()
         p = out['day'].dt.to_period('M')
-        if month_start:
-            out['day'] = p.dt.to_timestamp(how='start')
-        else:
-            # Month-end at midnight (not end-of-day nanoseconds).
-            out['day'] = p.dt.to_timestamp('M')
+        out['day'] = p.dt.to_timestamp(how='start')
         out = out.groupby(['item_id', 'day'], as_index=False, sort=True)['actual_sale'].sum()
-        return out, ('MS' if month_start else 'ME')
+        return out, 'MS'
 
     # Weekly: aggregate to weekly sums. Default 'W' is week ending Sunday.
     if freq_req in ('W', 'W-SUN', 'W-MON', 'W-TUE', 'W-WED', 'W-THU', 'W-FRI', 'W-SAT'):
@@ -233,9 +227,7 @@ def generate_forecast(request: ForecastRequest):
     
     **freq** (default: 'D'): Frequency/interval of time series data
     - 'D': Daily
-    - 'M': Monthly (month start; use YYYY-MM-01)
-    - 'ME': Monthly (month end)
-    - 'MS': Monthly (month start)
+    - 'M' / 'MS' / 'ME': Monthly; all use the first day of each month (YYYY-MM-01). 'ME' is a legacy alias.
     - 'W': Weekly
     - 'H': Hourly
     - 'Q': Quarterly
@@ -478,7 +470,7 @@ def generate_forecast_daily(
 
     Returns per item: forecast_dates (daily), forecast (daily), variance (daily).
 
-    Intended for monthly input (freq M/MS/ME); other frequencies work but expansion
+    Intended for monthly input (freq M/MS/ME, all month-start periods); other frequencies work but expansion
     is one day per period.
 
     Response is built from ForecastDailyResponse/ForecastDailyItemResponse; when

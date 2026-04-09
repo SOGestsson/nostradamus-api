@@ -184,7 +184,7 @@ def test_generate_daily_endpoint_monthly_returns_daily():
     data = resp.json()
     assert 'forecasts' in data
     assert data['total_items'] == 1
-    assert data['frequency'] in ('M', 'MS', 'ME')
+    assert data['frequency'] == 'MS'
     fc = data['forecasts'][0]
     assert 'item_id' in fc
     assert 'forecast_dates' in fc
