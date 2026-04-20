@@ -140,17 +140,27 @@ def _safe_wape_and_bias(y: np.ndarray, yhat: np.ndarray) -> tuple[float, float]:
     return wape, bias_pct
 
 
+# Lag-family models forecast some weighted reuse of historical same-season values
+# (SeasonalNaive: y[t-s]; SeasonalWindowAverage: mean of last k same-season values).
+# Both share the failure mode where the historical lag values are no longer
+# representative of the current level (e.g. post step-down). Treat them as a unit
+# in anti-lag guards.
+_LAG_FAMILY_MODELS: tuple[str, ...] = ('SeasonalNaive', 'SeasonalWindowAverage')
+
+
 def _pick_model_wape_bias_penalty(
     wape_vals: pd.Series,
     bias_pct_vals: pd.Series,
     *,
     rel_eps: float = 0.02,
     abs_eps: float = 0.005,
-    seasonal_naive_min_wape_advantage: float = 0.06,
+    seasonal_naive_min_wape_advantage: float = 0.08,
     bias_ok_pct: float = 10.0,
     bias_scale_pct: float = 20.0,
     weight: float = 0.25,
     prefer_seasonal_naive: bool = False,
+    wape_std_by_model: Optional[pd.Series] = None,
+    unstable_std_threshold: float = 0.15,
 ) -> str:
     """Pick a model using WAPE primary with a symmetric |bias| penalty.
 
@@ -167,6 +177,14 @@ def _pick_model_wape_bias_penalty(
 
     Edge case: if wape values are on an absolute-error scale (all-zero denom
     fallback), then bias_pct is not a percentage; disable the bias penalty.
+
+    Lag-family demotion (``_LAG_FAMILY_MODELS``):
+      When a lag-family model would win, require it to beat the best non-lag
+      alternative by at least ``seasonal_naive_min_wape_advantage`` (in WAPE
+      points). When ``wape_std_by_model`` is supplied and the lag pick's
+      per-window WAPE std exceeds ``unstable_std_threshold``, the required
+      advantage doubles — addressing the "lag won because one CV window
+      happened to align" failure mode.
     """
     if wape_vals.empty:
         return 'Naive'
@@ -203,43 +221,172 @@ def _pick_model_wape_bias_penalty(
     w_pct = 100.0 * w_close
     score = w_pct + penalty
 
-    # Policy: avoid picking SeasonalNaive when an adaptive model is essentially tied.
-    # Rationale: SeasonalNaive is a strong baseline but can be brittle under level shifts.
-    # Keep it only when it is materially better on WAPE.
-    # Exception: event-seasonal items (prefer_seasonal_naive=True) — SN is the natural
-    # model and should not be penalized.
-    seasonal_name = 'SeasonalNaive'
-    if seasonal_name in w_close.index and not prefer_seasonal_naive:
-        alternatives = [
-            m for m in [
-                'AutoETS', 'Theta', 'OptimizedTheta', 'AutoARIMA',
-                'HistoricAverage', 'SeasonalWindowAverage',
-            ]
-            if m in w_close.index
+    # Bias-penalty pick within the close band.
+    pre_pick = (
+        pd.DataFrame({'score': score, 'wape': w_close, 'abs_bias': b_close})
+        .sort_values(['score', 'wape', 'abs_bias'], ascending=True)
+        .index[0]
+    )
+
+    # Lag-family demotion (post bias-penalty). Applies to BOTH SeasonalNaive
+    # and SeasonalWindowAverage — they share the "stale historical values"
+    # failure mode. Skip for event-seasonal items (the lag IS the signal).
+    #
+    # Compare against the best non-lag alternative across the FULL candidate
+    # set (not the close band) so the threshold actually bites: the close band
+    # is typically <1pp wide, but the threshold is intended to fire on
+    # 6–10pp leads.
+    if pre_pick in _LAG_FAMILY_MODELS and not prefer_seasonal_naive:
+        fixed_non_lag = [
+            'AutoETS', 'Theta', 'OptimizedTheta', 'AutoARIMA',
+            'HistoricAverage', 'WindowAverage',
         ]
-        if alternatives:
-            best_alt = float(w_close.loc[alternatives].min())
-            seasonal_wape = float(w_close.loc[seasonal_name])
-            advantage = best_alt - seasonal_wape
-            if advantage < float(seasonal_naive_min_wape_advantage):
-                score_alt = score.loc[alternatives]
+        # Only longer MA aliases (≥6) count as non-lag alternatives — MA3 is
+        # too reactive / noisy to trust as a level anchor demoting SN/SWA.
+        ma_aliases = [
+            m for m in wape_vals.index
+            if (_ma_window_from_alias(str(m)) or 0) >= 6
+        ]
+        non_lag_full = [m for m in fixed_non_lag if m in wape_vals.index] + ma_aliases
+        if non_lag_full:
+            best_lag_wape = float(wape_vals.loc[pre_pick])
+            best_alt_wape = float(wape_vals.loc[non_lag_full].min())
+            advantage_required = float(seasonal_naive_min_wape_advantage)
+            # Stability scaling: if the lag pick's per-window WAPE std is high,
+            # require a larger advantage. Directly addresses "lag won because
+            # one CV window happened to align" — the SN/SWA over-selection
+            # failure mode.
+            if wape_std_by_model is not None:
+                try:
+                    lag_std = float(wape_std_by_model.get(pre_pick, 0.0))
+                except Exception:
+                    lag_std = 0.0
+                if np.isfinite(lag_std) and lag_std > float(unstable_std_threshold):
+                    advantage_required *= 2.0
+            advantage = best_alt_wape - best_lag_wape
+            if advantage < advantage_required:
+                # Demote: pick the best non-lag alternative by score (bias-aware).
+                score_alt_full = pd.Series(
+                    {m: 100.0 * float(wape_vals.loc[m]) for m in non_lag_full}
+                )
+                bias_alt_full = pd.Series(
+                    {m: float(bias_pct_vals.loc[m]) for m in non_lag_full}
+                ).abs()
+                excess_alt = (bias_alt_full - float(bias_ok_pct)).clip(lower=0.0)
+                score_alt_full = score_alt_full + (
+                    float(weight) * (excess_alt * excess_alt) / denom
+                )
                 picked_alt = (
-                    pd.DataFrame({'score': score_alt, 'wape': w_close.loc[alternatives], 'abs_bias': b_close.loc[alternatives]})
+                    pd.DataFrame(
+                        {
+                            'score': score_alt_full,
+                            'wape': wape_vals.loc[non_lag_full],
+                            'abs_bias': bias_alt_full,
+                        }
+                    )
                     .sort_values(['score', 'wape', 'abs_bias'], ascending=True)
                     .index[0]
                 )
                 return str(picked_alt)
 
-    picked = (
-        pd.DataFrame({'score': score, 'wape': w_close, 'abs_bias': b_close})
-        .sort_values(['score', 'wape', 'abs_bias'], ascending=True)
-        .index[0]
-    )
-    return str(picked)
+    return str(pre_pick)
+
+
+# Default window sizes for the lag/level model factories. Centralized so CV-time
+# minimum-observation gating and forecast-time factories use the same numbers.
+SWA_WINDOW_SIZE: int = 3  # SeasonalWindowAverage: average last N same-season values.
+WA_WINDOW_SIZE: int = 12  # WindowAverage: trailing-N level (≈ "recent run rate").
+
+# Moving-average (MA) family: a small set of trailing WindowAverage variants with
+# distinct aliases so CV can compare them as separate candidates. MA12 is the
+# primary "recent level" model on monthly data — on a non-stationary series
+# (level shifts, regime changes) it is categorically different from
+# HistoricAverage because it ignores history outside the last year. MA6 is a
+# shorter-window level proxy; MA3 is reserved for narrow short-history cases
+# only. No upper gate on MA12: the earlier rationale (MA12 ≈ HA on stable
+# long histories) is wrong precisely on the items where MA12 matters —
+# level-shifted series whose old regime dominates HA's average.
+MA_ALL_WINDOWS: tuple[int, ...] = (3, 6, 12)
+
+
+def _ma_windows_for_history(n_obs: int) -> list[int]:
+    """Return the MA windows that make sense given a history length.
+
+    Only gate: the lower bound ``1.5 * w``. Below that, the window "average"
+    has too little data to stabilise (and typically matches HA within a few
+    percent), so the alias adds no information. No upper gate — MA12 ≠ HA on
+    non-stationary series regardless of how much history is available.
+    """
+    return [w for w in MA_ALL_WINDOWS if int(n_obs) >= int(1.5 * w)]
+
+
+def _build_ma_factories(windows: list[int]) -> list[tuple[str, Callable[[], object]]]:
+    """Build WindowAverage factories with distinct aliases (``MA3``, ``MA6``, ``MA12``).
+
+    StatsForecast dedupes by alias, so two WindowAverage factories with
+    different ``window_size`` but the same class-name alias will overwrite each
+    other in the CV output frame. Using ``MA{w}`` aliases keeps them distinct.
+    """
+    from statsforecast.models import WindowAverage
+    specs: list[tuple[str, Callable[[], object]]] = []
+    for w in windows:
+        alias = f"MA{int(w)}"
+        specs.append(
+            (alias, lambda w=int(w), a=alias: WindowAverage(window_size=w, alias=a))
+        )
+    return specs
+
+
+def _ma_window_from_alias(alias: str) -> Optional[int]:
+    """Parse ``"MA<k>"`` → ``k``. Returns None if the alias is not an MA alias."""
+    if not isinstance(alias, str) or not alias.startswith('MA'):
+        return None
+    tail = alias[2:]
+    if not tail.isdigit():
+        return None
+    return int(tail)
+
+
+def _min_obs_for_model_cv(
+    model_name: str,
+    *,
+    season_length: int,
+    cv_h: int,
+    n_windows: int,
+) -> int:
+    """Conservative minimum obs needed for ``model_name`` to fit *every* CV training window.
+
+    StatsForecast's ``cross_validation`` produces ``n_windows`` cutoffs; the
+    earliest training window has length ``n_obs - cv_h * n_windows``. A model
+    that can't fit that window will raise and (because we wrap the whole bucket
+    in try/except) wipe out scores for the whole bucket. Filtering uids per
+    model up front avoids that.
+    """
+    base = int(cv_h) * max(1, int(n_windows)) + 2
+    if model_name == 'SeasonalWindowAverage':
+        # Needs ``window_size`` complete seasonal cycles in the smallest train window.
+        return base + SWA_WINDOW_SIZE * int(season_length)
+    if model_name == 'WindowAverage':
+        return base + WA_WINDOW_SIZE
+    ma_w = _ma_window_from_alias(model_name)
+    if ma_w is not None:
+        return base + ma_w
+    if model_name == 'SeasonalNaive':
+        return base + int(season_length)
+    if model_name == 'AutoARIMA':
+        return max(base, 36)
+    return base
 
 
 def _build_candidate_model_factories(season_length: int) -> list[tuple[str, Callable[[], object]]]:
-    """Candidate StatsForecast model factories (explicitly excludes TimeGPT/LightGPT)."""
+    """Candidate StatsForecast model factories (explicitly excludes TimeGPT/LightGPT).
+
+    Used by the forecast step to look up factories by model-name / alias for
+    already-selected uids, so every alias that can appear as a CV winner must
+    have a factory here. That includes the ``WindowAverage`` class name (for
+    back-compat with callers that may pass stored 'WindowAverage' picks) and
+    the MA{3,6,12} aliases used by the MA family.
+    """
     models_dict = _lazy_import_nixtla_models()
     # NOTE: AutoCES is intentionally excluded from the auto-model candidate set
     # because it can fail to fit for some series and would otherwise abort the
@@ -255,6 +402,7 @@ def _build_candidate_model_factories(season_length: int) -> list[tuple[str, Call
     keys = [
         'naive',
         'historic_average',
+        'window_average',
         'seasonal_naive',
         'seasonal_window_average',
         'auto_arima',
@@ -269,25 +417,37 @@ def _build_candidate_model_factories(season_length: int) -> list[tuple[str, Call
         ModelClass = models_dict[key]
         if key in seasonal:
             if key == 'seasonal_window_average':
-                # window_size=1 means "use last season"; alias must match class name
-                # because downstream expects the forecast column to be that name.
+                # window_size=SWA_WINDOW_SIZE makes SWA a smoothed seasonal model
+                # (average of the last N same-season values), distinct from
+                # SeasonalNaive which is window_size=1.
                 specs.append((
                     ModelClass.__name__,
-                    lambda cls=ModelClass: cls(season_length=season_length, window_size=1, alias=cls.__name__),
+                    lambda cls=ModelClass: cls(season_length=season_length, window_size=SWA_WINDOW_SIZE, alias=cls.__name__),
                 ))
             else:
                 specs.append((ModelClass.__name__, lambda cls=ModelClass: cls(season_length=season_length)))
         else:
             if key == 'window_average':
-                # Not used as default fallback (we use HistoricAverage for variable windows),
-                # but keep a small window available for selection.
-                specs.append((ModelClass.__name__, lambda cls=ModelClass: cls(window_size=3, alias=cls.__name__)))
+                # Back-compat: legacy single WindowAverage(window_size=12) under its
+                # class-name alias. New runs select from the MA family below; this
+                # entry is only reached if a caller passes 'WindowAverage' as a
+                # stored model name.
+                specs.append((ModelClass.__name__, lambda cls=ModelClass: cls(window_size=WA_WINDOW_SIZE, alias=cls.__name__)))
             else:
                 specs.append((ModelClass.__name__, lambda cls=ModelClass: cls()))
+
+    # MA family: always registered under all windows so the forecast-time lookup
+    # finds a factory for any MA{k} alias, even if CV only selects a subset.
+    specs.extend(_build_ma_factories(list(MA_ALL_WINDOWS)))
     return specs
 
 
 def _build_model_factories_for_keys(keys: list[str], season_length: int) -> list[tuple[str, Callable[[], object]]]:
+    """Build factories for the subset of candidate keys active in a given bucket.
+
+    Supports pseudo-keys ``ma3``/``ma6``/``ma12`` that map to WindowAverage
+    with distinct aliases, so CV can score them as independent candidates.
+    """
     models_dict = _lazy_import_nixtla_models()
     seasonal = {
         'auto_arima',
@@ -299,6 +459,10 @@ def _build_model_factories_for_keys(keys: list[str], season_length: int) -> list
     }
     specs: list[tuple[str, Callable[[], object]]] = []
     for key in keys:
+        if key.startswith('ma') and key[2:].isdigit():
+            w = int(key[2:])
+            specs.extend(_build_ma_factories([w]))
+            continue
         if key not in models_dict:
             continue
         ModelClass = models_dict[key]
@@ -306,13 +470,13 @@ def _build_model_factories_for_keys(keys: list[str], season_length: int) -> list
             if key == 'seasonal_window_average':
                 specs.append((
                     ModelClass.__name__,
-                    lambda cls=ModelClass: cls(season_length=season_length, window_size=1, alias=cls.__name__),
+                    lambda cls=ModelClass: cls(season_length=season_length, window_size=SWA_WINDOW_SIZE, alias=cls.__name__),
                 ))
             else:
                 specs.append((ModelClass.__name__, lambda cls=ModelClass: cls(season_length=season_length)))
         else:
             if key == 'window_average':
-                specs.append((ModelClass.__name__, lambda cls=ModelClass: cls(window_size=3, alias=cls.__name__)))
+                specs.append((ModelClass.__name__, lambda cls=ModelClass: cls(window_size=WA_WINDOW_SIZE, alias=cls.__name__)))
             else:
                 specs.append((ModelClass.__name__, lambda cls=ModelClass: cls()))
     return specs
@@ -603,26 +767,124 @@ def _auto_model_force_naive_long_silence_after_last_sale(
     return int(silent_m) >= int(min_silent_months)
 
 
+def _auto_model_detect_sparse_noise(
+    y_eff: np.ndarray,
+    ds_eff: pd.Series,
+    *,
+    min_nonzero_months: int = 6,
+    max_nonzero_fraction: float = 0.15,
+    trend_corr_threshold: float = 0.5,
+    recurring_month_min_years: int = 2,
+) -> bool:
+    """True when history has too few non-zero points to justify a structured model.
+
+    Catches items like "3 random sales in 3 different months across 3 years"
+    where CV on classical forecasters can pick seasonal/trend/ETS models that
+    invent patterns out of noise. When this fires, the caller should route the
+    series to ``HistoricAverage`` (flat mean-of-all level) rather than run CV.
+
+    All four conditions must hold:
+      - fewer than ``min_nonzero_months`` non-zero observations in total
+      - non-zero fraction < ``max_nonzero_fraction`` (implicitly requires long
+        history — e.g. with defaults, series must have >= 40 periods before
+        this gate can fire)
+      - no strong monotone trend (|trend_corr| < ``trend_corr_threshold``)
+      - no recurring calendar month (no single month with non-zero sales in
+        ``recurring_month_min_years`` or more distinct years)
+
+    The trend and recurrence checks are safety nets: if a short-history item
+    genuinely shows a pattern, let CV run on it. Only flat-ish random sparse
+    data gets short-circuited.
+    """
+    y = np.asarray(y_eff, dtype=float)
+    y = y[np.isfinite(y)]
+    if y.size == 0:
+        return False  # handled by the no-positive-history path upstream
+
+    nz_count = int(np.sum(y > 0))
+    if nz_count == 0:
+        # All-zero history is silence, not sparse noise. Upstream already
+        # routes these to the dead-SKU path via long-silence; returning False
+        # here keeps the helper's contract defensive if that upstream gate
+        # ever changes.
+        return False
+    if nz_count >= int(min_nonzero_months):
+        return False
+
+    nz_frac = float(nz_count) / float(y.size)
+    if nz_frac >= float(max_nonzero_fraction):
+        return False
+
+    # Trend safety net: if the few non-zero points themselves line up as a
+    # trend against their positions in time, don't short-circuit — CV / trend
+    # models may still produce a useful forecast.
+    #
+    # Correlation is computed on the non-zero *subset* (positions vs values),
+    # not the full zero-padded series. On sparse data the zero mass dilutes
+    # the full-series Pearson r well below 0.5 even for a cleanly trending
+    # tail, so a full-series check would be effectively inert here.
+    #
+    # Require >= 4 non-zero points: Pearson on only 3 points is unstable (a
+    # single outlier can tip |r| above 0.5 spuriously). Items with exactly
+    # 3 sparse sales fall through to the short-circuit regardless of shape.
+    if nz_count >= 4:
+        nz_mask_tmp = y > 0
+        nz_positions = np.flatnonzero(nz_mask_tmp).astype(float)
+        nz_values = y[nz_mask_tmp]
+        if float(np.std(nz_values)) > 0:
+            r = float(np.corrcoef(nz_positions, nz_values)[0, 1])
+            if np.isfinite(r) and abs(r) >= float(trend_corr_threshold):
+                return False
+
+    # Recurrence safety net: if a calendar month shows non-zero sales in
+    # multiple distinct years, there IS a seasonal signal — keep CV eligible.
+    try:
+        ds_pd = pd.to_datetime(ds_eff, errors='coerce').reset_index(drop=True)
+    except Exception:
+        ds_pd = None
+    if ds_pd is not None and len(ds_pd) == y.size:
+        nz_mask = y > 0
+        if int(np.sum(nz_mask)) >= 2:
+            months = ds_pd[nz_mask].dt.month
+            years = ds_pd[nz_mask].dt.year
+            per_month_years = (
+                pd.DataFrame({'m': months.values, 'y': years.values})
+                .groupby('m')['y']
+                .nunique()
+            )
+            if int(per_month_years.max()) >= int(recurring_month_min_years):
+                return False
+
+    return True
+
+
 def _auto_model_exclude_seasonal_naive(
     y_full: np.ndarray,
     *,
     season_length: int,
     event_seasonal: bool = False,
-    stable_recent_level: bool = False,
+    stable_recent_level: bool = False,  # noqa: ARG001 (kept for backward compat)
 ) -> bool:
     """True when SeasonalNaive (y[t]=y[t-s]) is likely misleading.
 
     - Recent all-zero tail: same month last year may show a peak while the item
       is effectively discontinued for the last several months.
     - Year-over-year collapse: prior seasonal year had real volume, last year
-      near zero — repeating the old seasonal profile is usually wrong.
-      **Skipped** when ``stable_recent_level``: demand stepped down but the last
-      months sit at a stable positive level (not discontinuation).
+      <35% of that — repeating the old seasonal profile is usually wrong.
+      A *stable* recent level after the collapse is the strongest evidence the
+      old seasonal values are no longer representative; SN is excluded in that
+      case too. The level-prefer reranker then steers selection to a level
+      model (HistoricAverage / WindowAverage) for the new run rate.
 
     Event-seasonal SKUs (e.g. Christmas-heavy) often have long off-season zero
     runs and volatile recent years; those patterns are *not* discontinuation.
     For them we skip these exclusions and let CV pick (``long_trailing_zero_run``
     / ``long_silence_after_last_sale`` still force Naive when appropriate).
+
+    The ``stable_recent_level`` argument is retained for backward compatibility
+    but no longer changes the result: previously it short-circuited the YoY
+    collapse exclusion, which kept SN eligible in exactly the post-step-down
+    cohort where its absolute-lag forecasts are most wrong.
     """
     if event_seasonal:
         return False
@@ -638,8 +900,6 @@ def _auto_model_exclude_seasonal_naive(
     prev = float(np.mean(y[-2 * int(season_length) : -int(season_length)]))
     curr = float(np.mean(y[-int(season_length) :]))
     if prev > 1.0 and curr < 0.35 * prev:
-        if stable_recent_level:
-            return False
         return True
     return False
 
@@ -653,23 +913,95 @@ def _auto_model_maybe_prefer_level_under_stable_tail(
     rmse_scores_map: dict[str, dict[str, float]],
     mae_scores_map: dict[str, dict[str, float]],
     metric_name: str,
+    event_seasonal_uid: Optional[dict[str, bool]] = None,
+    strong_trend_uid: Optional[dict[str, bool]] = None,
 ) -> None:
-    """When the recent tail is a stable positive level, prefer HA/SWA if CV scores are competitive.
+    """When the recent tail is a stable positive level, prefer a level model.
 
-    Reduces AutoETS/Theta/ARIMA extrapolating a past decline down to ~0 while demand
-    has already settled at a lower but stable run rate.
+    Reduces two failure modes for items that have settled at a new (often lower)
+    stable run rate:
+
+      * AutoETS/Theta/ARIMA extrapolating a past decline down to ~0.
+      * SeasonalNaive/SeasonalWindowAverage repeating last year's *absolute*
+        seasonal values (which are no longer representative).
+
+    The target pool is ``HistoricAverage``, ``MA6``, ``MA12`` and legacy
+    ``WindowAverage`` — *excluding* ``MA3`` which is too reactive to serve as a
+    level anchor. On WAPE ties, prefer LONGER windows (more stable) — the
+    reranker's job is to replace a jittery adaptive pick, so reactivity is
+    anti-goal here.
+
+    In the ``seasonal`` bucket a CV margin of 1 pp WAPE is required before
+    demoting — enough to filter CV noise (typically 1–2 pp between candidates)
+    without blocking legitimate level-model wins. A 3 pp margin was tried
+    initially and was too strict; it blocked ~20 MA12 wins in A/B testing.
+
+    Event-seasonal items: lag-family picks are kept (the lag IS the signal).
+    Strong-trend items: skipped entirely — a flat level can't follow a trend.
     """
-    adaptive = {'AutoETS', 'Theta', 'OptimizedTheta', 'AutoARIMA'}
-    level_models = ('HistoricAverage', 'SeasonalWindowAverage')
-    # Never override adaptive picks for trending series — level models can't follow trends.
-    buckets_ok = {'seasonal', 'smooth'}
+    demote_from = {
+        'AutoETS', 'Theta', 'OptimizedTheta', 'AutoARIMA',
+        'SeasonalNaive', 'SeasonalWindowAverage',
+    }
+    # Ordering hint used on exact WAPE ties / equal-score ranks. The reranker's
+    # job is to replace a jittery adaptive pick with a STABLE level estimate,
+    # so on ties prefer LONGER windows (more stable). MA3 is intentionally
+    # excluded from the target pool entirely — 3 months is too reactive/noisy
+    # to function as a level anchor on monthly data (v3 evidence: MA3 bias
+    # median −28%, multiple full collapses on confectionery items).
+    _level_order_hint: dict[str, int] = {
+        'MA12': 0, 'WindowAverage': 1, 'MA6': 2, 'HistoricAverage': 3,
+    }
+
+    def _level_candidates_for_uid(uid: str) -> list[str]:
+        """Collect level-model aliases that were actually scored for ``uid``.
+
+        Excludes MA3 — too noisy for demote-to use. Includes MA6, MA12, legacy
+        WindowAverage, and HistoricAverage.
+        """
+        if metric_name in ('wape', 'wape_bias'):
+            scored = set(wape_scores_map.get(uid, {}).keys())
+        else:
+            scored = set(rmse_scores_map.get(uid, {}).keys()) & set(mae_scores_map.get(uid, {}).keys())
+        candidates: list[str] = []
+        for name in ('MA12', 'WindowAverage', 'MA6', 'HistoricAverage'):
+            if name in scored:
+                candidates.append(name)
+        return candidates
+
+    # Open to 'trend' bucket too — a strong-trend guard below prevents us from
+    # demoting picks on genuinely trending series, but mild-trend series that
+    # have settled into a stable tail should behave like smooth/seasonal.
+    buckets_ok = {'seasonal', 'smooth', 'trend'}
+    event_uid = event_seasonal_uid or {}
+    trend_uid = strong_trend_uid or {}
     for uid, pick in list(best_by_uid.items()):
         if not stable_tail_uid.get(uid, False):
             continue
-        if bucket_by_uid.get(uid) not in buckets_ok:
+        bucket = bucket_by_uid.get(uid)
+        if bucket not in buckets_ok:
             continue
-        if pick not in adaptive:
+        if pick not in demote_from:
             continue
+        # Never demote on a strong-trend series — a flat level forecast is worse
+        # than the trend-aware model the picker chose.
+        if bool(trend_uid.get(uid, False)):
+            continue
+        # Don't demote lag-family picks for event-seasonal items: the lag IS the
+        # forecast signal there (Christmas-only, etc.).
+        if pick in _LAG_FAMILY_MODELS and bool(event_uid.get(uid, False)):
+            continue
+
+        level_models = _level_candidates_for_uid(uid)
+        if not level_models:
+            continue
+
+        # Seasonal bucket: require a small CV margin before demoting. CV noise
+        # between candidates on monthly seasonal series is typically 1–2 pp;
+        # 1 pp filters the noise without blocking legitimate MA12 wins. The
+        # earlier 3 pp margin was too tight and blocked ~20 MA12 wins over
+        # AutoETS where MA12 was genuinely better by 1–3 pp (v4 A/B).
+        margin_required = 0.01 if bucket == 'seasonal' else 0.0
 
         if metric_name in ('wape', 'wape_bias'):
             pw = wape_scores_map.get(uid, {}).get(pick)
@@ -680,11 +1012,15 @@ def _auto_model_maybe_prefer_level_under_stable_tail(
                 aw = wape_scores_map.get(uid, {}).get(alt)
                 if aw is None or not np.isfinite(float(aw)):
                     continue
-                # Level model must actually beat the adaptive model on WAPE.
-                if float(aw) <= float(pw):
+                # Level model must beat the current pick by at least margin_required.
+                if float(aw) + margin_required <= float(pw):
                     pool.append(alt)
             if len(pool) > 1:
-                best_by_uid[uid] = min(pool, key=lambda m: float(wape_scores_map[uid][m]))
+                # Sort by WAPE, then ordering hint (longer MA wins on ties).
+                best_by_uid[uid] = min(
+                    pool,
+                    key=lambda m: (float(wape_scores_map[uid][m]), _level_order_hint.get(m, 9)),
+                )
         elif metric_name == 'robust':
             pr = rmse_scores_map.get(uid, {}).get(pick)
             pm = mae_scores_map.get(uid, {}).get(pick)
@@ -700,17 +1036,23 @@ def _auto_model_maybe_prefer_level_under_stable_tail(
                     continue
                 if not np.isfinite(float(ar)) or not np.isfinite(float(am)):
                     continue
-                # Level model must beat or match on both RMSE and MAE.
-                if float(ar) <= float(pr) and float(am) <= float(pm):
+                # Level model must beat or match on both RMSE and MAE. Apply the
+                # seasonal margin on RMSE (scale-aware) by requiring strict
+                # improvement of at least margin_required * |pr|.
+                rmse_margin = margin_required * abs(float(pr))
+                if float(ar) + rmse_margin <= float(pr) and float(am) <= float(pm):
                     pool_r.append(alt)
             if len(pool_r) > 1:
                 best_by_uid[uid] = min(
                     pool_r,
-                    key=lambda m: float(rmse_scores_map[uid].get(m, np.inf)) + float(mae_scores_map[uid].get(m, np.inf)),
+                    key=lambda m: (
+                        float(rmse_scores_map[uid].get(m, np.inf)) + float(mae_scores_map[uid].get(m, np.inf)),
+                        _level_order_hint.get(m, 9),
+                    ),
                 )
 
 
-def _rerank_pick_excluding_seasonal_naive(
+def _rerank_pick_excluding_lag_family(
     *,
     uid: str,
     metric_name: str,
@@ -721,12 +1063,19 @@ def _rerank_pick_excluding_seasonal_naive(
     bias_scores_map: dict[str, dict[str, float]],
     metric_scores: dict[str, dict[str, float]],
 ) -> None:
-    """If selection is SeasonalNaive but that model is disallowed, pick the next best in-place."""
-    if best_by_uid.get(uid) != 'SeasonalNaive':
+    """If selection is in the lag family but disallowed, pick the next best in-place.
+
+    "Lag family" = ``_LAG_FAMILY_MODELS`` (SeasonalNaive + SeasonalWindowAverage).
+    Both forecast some weighted reuse of historical same-season values and share
+    the failure mode where those historical values no longer represent current
+    demand (post step-down, dead tails).
+    """
+    if best_by_uid.get(uid) not in _LAG_FAMILY_MODELS:
         return
+    excluded = set(_LAG_FAMILY_MODELS)
     if metric_name == 'robust':
-        rm = {m: v for m, v in rmse_scores_map.get(uid, {}).items() if m != 'SeasonalNaive'}
-        ma = {m: v for m, v in mae_scores_map.get(uid, {}).items() if m != 'SeasonalNaive'}
+        rm = {m: v for m, v in rmse_scores_map.get(uid, {}).items() if m not in excluded}
+        ma = {m: v for m, v in mae_scores_map.get(uid, {}).items() if m not in excluded}
         models = sorted(set(rm.keys()) & set(ma.keys()))
         if not models:
             best_by_uid[uid] = 'Naive'
@@ -741,7 +1090,9 @@ def _rerank_pick_excluding_seasonal_naive(
             best_by_uid[uid] = 'Naive'
         return
     if metric_name in ('wape', 'wape_bias'):
-        wape_vals = pd.Series({m: v for m, v in wape_scores_map.get(uid, {}).items() if m != 'SeasonalNaive'})
+        wape_vals = pd.Series(
+            {m: v for m, v in wape_scores_map.get(uid, {}).items() if m not in excluded}
+        )
         if wape_vals.empty:
             best_by_uid[uid] = 'Naive'
             return
@@ -767,7 +1118,7 @@ def _rerank_pick_excluding_seasonal_naive(
         else:
             best_by_uid[uid] = 'Naive'
         return
-    ms = {m: v for m, v in metric_scores.get(uid, {}).items() if m != 'SeasonalNaive'}
+    ms = {m: v for m, v in metric_scores.get(uid, {}).items() if m not in excluded}
     if not ms:
         best_by_uid[uid] = 'Naive'
         return
@@ -1058,8 +1409,17 @@ class ClassicalForecasts:
         event_seasonal_uid: dict[str, bool] = {}
         # Track uids with a strong monotone trend, where naive forecasts are often too flat.
         strong_trend_uid: dict[str, bool] = {}
+        # Three stability tiers, increasingly permissive:
+        #   stable_tail_uid       max_cv=0.55 — strict; gates short-history Naive fallback.
+        #   stable_tail_loose_uid max_cv=0.62 — middling; gates the level-prefer reranker
+        #                                       so noisier-but-real level shifts get caught
+        #                                       at selection (cleaner uncertainty bands).
+        #   floor_eligible_uid    max_cv=0.70 — loose; only used by the post-forecast floor.
         stable_tail_uid: dict[str, bool] = {}
+        stable_tail_loose_uid: dict[str, bool] = {}
         stable_tail_mean_uid: dict[str, float] = {}
+        floor_eligible_uid: dict[str, bool] = {}
+        floor_eligible_mean_uid: dict[str, float] = {}
         bucket_by_uid: dict[str, str] = {}
         exclude_seasonal_naive_uid: dict[str, bool] = {}
         dead_sku_uid: set[str] = set()
@@ -1069,6 +1429,13 @@ class ClassicalForecasts:
 
             Uses demand *volume* share (sum of y per month / total y), not occurrence
             count, so a December spike of 2500 correctly dominates over small Oct/Nov sales.
+
+            Requires a recurrence check: the top-volume month must appear in at
+            least 2 distinct calendar years. Without this, a series with only
+            a handful of sparse sales (e.g. 3 sales in 3 different years) trips
+            the concentration gate by accident — the top month's "share" is
+            simply 1/3, which beats the 45% threshold on occurrence alone, but
+            there's no actual repeating pattern for SeasonalNaive to exploit.
             """
             if season_length < 2:
                 return False
@@ -1077,7 +1444,8 @@ class ClassicalForecasts:
             nz = g[g['y'] > 0.0].copy()
             if nz.empty:
                 return False
-            nz['month'] = pd.to_datetime(nz['ds']).dt.month
+            nz_ds = pd.to_datetime(nz['ds'])
+            nz['month'] = nz_ds.dt.month
             vol_by_month = nz.groupby('month')['y'].sum()
             total = float(vol_by_month.sum())
             if total <= 0.0:
@@ -1085,14 +1453,29 @@ class ClassicalForecasts:
             share = (vol_by_month / total).sort_values(ascending=False)
             top1 = float(share.iloc[0])
             top2 = float(share.iloc[:2].sum()) if len(share) >= 2 else top1
-            return top1 >= 0.50 or top2 >= 0.65
+            top3 = float(share.iloc[:3].sum()) if len(share) >= 3 else top2
+            passes_concentration = (top1 >= 0.45 or top2 >= 0.60 or top3 >= 0.75)
+            if not passes_concentration:
+                return False
+
+            # Recurrence: the peak month must show non-zero sales in ≥ 2 years.
+            # This distinguishes genuine event-seasonality (same month, multiple
+            # years) from sparse sales that concentrate by volume only because
+            # there are few of them.
+            peak_month = int(share.index[0])
+            peak_years = int(nz_ds[nz['month'] == peak_month].dt.year.nunique())
+            return peak_years >= 2
 
         for uid, n_obs in counts.items():
             g_uid = df.loc[df['unique_id'] == uid, ['unique_id', 'ds', 'y']].copy()
             y_full = g_uid['y'].to_numpy(dtype=float)
 
-            # Long trailing zero run: avoid ETS / seasonal methods that keep a small
-            # positive level; Naive repeats last value (0 on regularized months).
+            # Event-seasonal detection runs first so that seasonal items with
+            # expected off-season silence aren't misclassified as dead SKUs.
+            event_seasonal_uid[uid] = _looks_event_seasonal(g_uid, int(season_for_models))
+
+            # Long trailing zero run: 24+ months of actual zeros in the data is
+            # strong evidence of death even for seasonal items.
             if _auto_model_force_naive_trailing_zeros(y_full, min_months=24):
                 best_by_uid[uid] = 'Naive'
                 exclude_seasonal_naive_uid[uid] = True
@@ -1105,8 +1488,13 @@ class ClassicalForecasts:
                     }
                 continue
 
-            if _auto_model_force_naive_long_silence_after_last_sale(
-                y_full, g_uid['ds'], min_silent_months=18
+            # Long calendar-time silence since last sale. Skip for event-seasonal
+            # items where multi-month off-season gaps are normal, not discontinuation.
+            if (
+                not event_seasonal_uid.get(uid, False)
+                and _auto_model_force_naive_long_silence_after_last_sale(
+                    y_full, g_uid['ds'], min_silent_months=24
+                )
             ):
                 best_by_uid[uid] = 'Naive'
                 exclude_seasonal_naive_uid[uid] = True
@@ -1119,10 +1507,6 @@ class ClassicalForecasts:
                     }
                 continue
 
-            # Event-seasonal must be known before SeasonalNaive exclusions: long zero
-            # tails are normal off-season for those SKUs, not discontinuation.
-            event_seasonal_uid[uid] = _looks_event_seasonal(g_uid, int(season_for_models))
-
             # Trim leading zeros for profiling/bucketing so launch-phase zeros don't
             # dominate n, zero_frac, or trend detection. Keep zeros after the first
             # positive month (true stockouts/off-season).
@@ -1130,14 +1514,58 @@ class ClassicalForecasts:
             if mask_pos.any():
                 first_pos = int(np.argmax(mask_pos))
                 y_eff = y_full[first_pos:]
+                ds_eff = g_uid['ds'].iloc[first_pos:]
             else:
                 y_eff = y_full
+                ds_eff = g_uid['ds']
+
+            # Sparse-noise items: rarely sold, no trend, no recurring calendar
+            # month. CV on these tends to pick spurious ETS / seasonal patterns
+            # (or Croston-family models that collapse to ~0). Short-circuit to
+            # HistoricAverage — mean-of-all is the honest flat level for
+            # genuinely random sparse demand. Conservative minimum: no yhat
+            # override, no new model label; if HA proves to under-forecast on
+            # real data, a mean-of-positives override can be added as a
+            # follow-up with before/after numbers.
+            if _auto_model_detect_sparse_noise(y_eff, ds_eff):
+                best_by_uid[uid] = 'HistoricAverage'
+                exclude_seasonal_naive_uid[uid] = True
+                if debug:
+                    debug_reason[uid] = {
+                        'reason': 'sparse_noise',
+                        'picked': 'HistoricAverage',
+                        'nonzero_count': int(np.sum(y_eff > 0)),
+                        'n_obs': int(n_obs),
+                    }
+                continue
 
             # Stable-tail on y_eff (not y_full) so padded trailing zeros from
             # panel extension don't mask a real stable demand level.
             stable_recent, stable_tail_mean = _recent_tail_stable_level(y_eff)
             stable_tail_uid[uid] = bool(stable_recent)
             stable_tail_mean_uid[uid] = float(stable_tail_mean)
+
+            # Middling stability tier (max_cv=0.62) for the level-prefer reranker.
+            # Wider than the strict 0.55 so noisier-but-real level shifts get caught
+            # at *selection* (the chosen model's uncertainty bands are then honest);
+            # tighter than the floor's 0.70 so we don't over-demote AutoETS/Theta on
+            # genuinely volatile series.
+            if stable_recent:
+                stable_tail_loose_uid[uid] = True
+            else:
+                lo_ok, _lo_mean = _recent_tail_stable_level(y_eff, max_cv=0.62)
+                stable_tail_loose_uid[uid] = bool(lo_ok)
+
+            # Looser stability check for the post-forecast sanity floor. The floor
+            # only needs a rough demand level, not a tight estimate, so allow higher
+            # CV (0.70) to catch more collapsing items.
+            if stable_recent:
+                floor_eligible_uid[uid] = True
+                floor_eligible_mean_uid[uid] = float(stable_tail_mean)
+            else:
+                fl_ok, fl_mean = _recent_tail_stable_level(y_eff, max_cv=0.70)
+                floor_eligible_uid[uid] = bool(fl_ok)
+                floor_eligible_mean_uid[uid] = float(fl_mean)
 
             ex_sn = _auto_model_exclude_seasonal_naive(
                 y_full,
@@ -1150,6 +1578,10 @@ class ClassicalForecasts:
                 and _seasonal_naive_lag_regime_mismatch(y_full, int(season_for_models))
             ):
                 ex_sn = True
+            # Same lag-family failure mode applies to SeasonalWindowAverage:
+            # both reuse historical same-season values. Track jointly under the
+            # legacy ``exclude_seasonal_naive_uid`` flag (the rerank function
+            # strips the whole _LAG_FAMILY_MODELS set when this is True).
             exclude_seasonal_naive_uid[uid] = ex_sn
             prof = _series_profile(y_eff)
             bucket = _bucket_series(prof, season_length=season_for_models, min_arima_len=min_arima_len)
@@ -1162,11 +1594,15 @@ class ClassicalForecasts:
                 ):
                     bucket = 'seasonal'
             # Strong trend: high absolute correlation with time index.
+            # 0.55 (was 0.7) aligns with the bucket classifier (line 557, abs>=0.5)
+            # and the 12-23m fallback (line 1221, abs>=0.5). 0.7 was so strict that
+            # genuinely trending items with seasonal noise (|r|≈0.55-0.65) bypassed
+            # the trend-bucket lag-family demotion entirely.
             try:
                 trend_corr = float(prof.get('trend_corr', 0.0))  # type: ignore[arg-type]
             except Exception:
                 trend_corr = 0.0
-            strong_trend_uid[uid] = bool(abs(trend_corr) >= 0.7)
+            strong_trend_uid[uid] = bool(abs(trend_corr) >= 0.55)
 
             # Heuristic selections for very short series (skip CV entirely)
             if bucket == 'short' or int(n_eff) < min_len:
@@ -1194,15 +1630,26 @@ class ClassicalForecasts:
                 #   simple seasonal ETS for clearly trending ones.
                 # - Otherwise: simple moving average over all available months -> HistoricAverage.
                 if is_monthly and 12 <= int(n_eff) <= 23:
-                    # Reuse trend_corr from prof; strong trend -> AutoETS, otherwise SWA.
+                    # Reuse trend_corr from prof.
+                    # - Strong trend → AutoETS (level + slope on a single year of data).
+                    # - Stable recent tail → Naive (repeats the current run rate).
+                    # - Otherwise → HistoricAverage. MA6 was tried here but
+                    #   regressed on items with latent monthly seasonality (too
+                    #   short to detect at <24m), where a forecast origin in
+                    #   off-season projected low into the next peak.
+                    # NOTE: We deliberately do NOT pick SeasonalWindowAverage here.
+                    # With ``SWA_WINDOW_SIZE`` ≥ 2, SWA needs at least two complete
+                    # seasonal cycles, so it can't fit on 12–23 monthly observations.
                     try:
                         trend_corr = float(prof.get('trend_corr', 0.0))  # type: ignore[arg-type]
                     except Exception:
                         trend_corr = 0.0
                     if abs(trend_corr) >= 0.5:
                         best_by_uid[uid] = 'AutoETS'
+                    elif stable_tail_uid.get(uid, False):
+                        best_by_uid[uid] = 'Naive'
                     else:
-                        best_by_uid[uid] = 'SeasonalWindowAverage'
+                        best_by_uid[uid] = 'HistoricAverage'
                     if debug:
                         debug_reason[uid] = {
                             'reason': 'short_or_insufficient_len',
@@ -1217,11 +1664,18 @@ class ClassicalForecasts:
                     continue
 
                 if is_monthly and int(n_eff) < 12:
-                    best_by_uid[uid] = 'HistoricAverage'
+                    # HistoricAverage operates on the full regularized panel
+                    # (including zero-filled months before the first sale),
+                    # which dilutes the forecast. Naive repeats the last value
+                    # and is better when the recent tail is at a stable level.
+                    if stable_tail_uid.get(uid, False):
+                        best_by_uid[uid] = 'Naive'
+                    else:
+                        best_by_uid[uid] = 'HistoricAverage'
                     if debug:
                         debug_reason[uid] = {
                             'reason': 'short_or_insufficient_len',
-                            'picked': 'HistoricAverage',
+                            'picked': best_by_uid[uid],
                             'bucket': bucket,
                             'n_obs': int(n_eff),
                             'min_len': int(min_len),
@@ -1291,16 +1745,24 @@ class ClassicalForecasts:
                             'seasonal_naive',
                             'seasonal_window_average',
                             'historic_average',
+                            'window_average',
                             'auto_ets',
                             'croston_optimized',
                         ]
                     # Otherwise, just add a single seasonal model to the pool.
                     base_keys.append('auto_ets')
-                    base_keys.extend(['historic_average', 'seasonal_window_average'])
+                    base_keys.extend(['historic_average', 'window_average', 'seasonal_window_average'])
                 return base_keys
+            # MA family available for this history length. MA3 is excluded from
+            # CV candidate pools — on monthly data 3 months is too short to
+            # function as a stable level estimate, and the v3 A/B showed MA3
+            # winning CV on noise patterns (bias median −28%, multiple full
+            # collapses). MA3 is retained only as a registered factory for
+            # back-compat; it is never selected fresh.
+            ma_windows = _ma_windows_for_history(int(n_obs))
+            ma_keys_long = [f'ma{w}' for w in ma_windows if w in (6, 12)]
             if bucket == 'seasonal':
-                # Level baselines compete when demand has stepped to a new stable run rate.
-                return [
+                keys = [
                     'seasonal_naive',
                     'seasonal_window_average',
                     'historic_average',
@@ -1308,22 +1770,61 @@ class ClassicalForecasts:
                     'theta',
                     'optimized_theta',
                 ]
+                # Event-seasonal items (e.g., Christmas-only): MA-of-zero through
+                # the off-season would forecast 0 post-peak. Keep the bucket
+                # lag-heavy and drop the MA level family and both Thetas.
+                if any_event_seasonal:
+                    keys = [k for k in keys if k not in ('theta', 'optimized_theta')]
+                else:
+                    # Seasonal bucket: MA6 is half a cycle and mechanically
+                    # broken when the forecast origin sits in the off-season
+                    # (averages low months, projects low into a peak). Only MA12
+                    # belongs here — it averages a full cycle so the forecast is
+                    # independent of which season the origin falls in.
+                    keys.extend([k for k in ma_keys_long if k == 'ma12'])
+                return keys
             if bucket == 'trend':
-                keys = ['historic_average', 'seasonal_window_average', 'auto_ets', 'theta', 'optimized_theta', 'naive']
+                keys = [
+                    'historic_average',
+                    'seasonal_window_average',
+                    'auto_ets',
+                    'theta',
+                    'optimized_theta',
+                    'naive',
+                ]
+                # MA6/MA12 serve as level baselines for mild trends / level shifts.
+                keys.extend(ma_keys_long)
                 # If we have at least one full season, allow SeasonalNaive even if the
                 # seasonal detector didn't put the series into the seasonal bucket yet
-                # (common for monthly series with ~13-23 months of history).
-                if int(self.season_length) >= 2 and int(n_obs) >= int(self.season_length) + 1:
+                # (common for monthly series with ~13–23 months of history).
+                # IMPORTANT: gate on ``season_for_models`` (12 for monthly) rather than
+                # ``self.season_length`` so non-monthly panels with a different stored
+                # season_length don't accidentally diverge from the actual frequency.
+                if int(season_for_models) >= 2 and int(n_obs) >= int(season_for_models) + 1:
                     keys.insert(0, 'seasonal_naive')
-                # For strongly trending series, bias away from plain Naive (which tends to
-                # extrapolate the last value and under-react to clear trends).
+                # Strongly trending series: lag-family models can't follow trend, and
+                # plain Naive systematically under-reacts. Drop all three — and also
+                # drop MA6/MA12 (flat level is a poor substitute for a true trend
+                # model), leaving AutoETS / Theta / AutoARIMA to compete.
                 if any_strong_trend:
-                    keys = [k for k in keys if k != 'naive']
+                    keys = [
+                        k for k in keys
+                        if k not in ('naive', 'seasonal_naive', 'seasonal_window_average', 'ma6', 'ma12')
+                    ]
                 if n_obs >= min_arima_len:
                     keys.insert(0, 'auto_arima')
                 return keys
-            # smooth: weak seasonality; keep level baselines so stable run rates can win CV.
-            keys = ['historic_average', 'seasonal_window_average', 'auto_ets', 'theta', 'optimized_theta', 'naive']
+            # smooth: weak seasonality; MA family is the natural level baseline here
+            # because "recent stable run rate" is exactly what smooth series look like.
+            keys = [
+                'historic_average',
+                'seasonal_window_average',
+                'auto_ets',
+                'theta',
+                'optimized_theta',
+                'naive',
+            ]
+            keys.extend(ma_keys_long)
             if n_obs >= min_arima_len:
                 keys.insert(0, 'auto_arima')
             return keys
@@ -1333,6 +1834,9 @@ class ClassicalForecasts:
         mae_scores_map: dict[str, dict[str, float]] = {uid: {} for uid in counts.index}
         wape_scores_map: dict[str, dict[str, float]] = {uid: {} for uid in counts.index}
         bias_scores_map: dict[str, dict[str, float]] = {uid: {} for uid in counts.index}
+        # Per-window WAPE for stability scaling in the lag-family advantage check.
+        # {uid: {model_name: [wape_window_0, wape_window_1, ...]}}.
+        wape_per_window_map: dict[str, dict[str, list[float]]] = {uid: {} for uid in counts.index}
         metric_scores: dict[str, dict[str, float]] = {uid: {} for uid in counts.index}
 
         # Score each bucket with per-model CV (robust to individual model failures).
@@ -1349,6 +1853,15 @@ class ClassicalForecasts:
                 bucket_cv_h = cv_h_eff
             bucket_cv_h = max(1, bucket_cv_h)
 
+            # Adaptive n_windows: with default n_windows=2 and cv_h_eff=6, monthly
+            # series with 30+ months can support 3+ windows, which materially
+            # de-noises the ranking. Cap at 4 to bound CV cost. Use the bucket's
+            # MIN n_obs so CV runs successfully for every uid in the bucket.
+            min_n_bucket = int(counts.loc[uids].min())
+            head_room = max(0, (min_n_bucket - bucket_cv_h) // max(1, bucket_cv_h))
+            bucket_n_windows = int(min(4, max(int(n_windows), head_room)))
+            bucket_n_windows = max(1, bucket_n_windows)
+
             # Determine max n_obs in bucket to decide if AutoARIMA is allowed.
             max_n = int(counts.loc[uids].max())
             any_event = any(bool(event_seasonal_uid.get(uid, False)) for uid in uids)
@@ -1360,14 +1873,34 @@ class ClassicalForecasts:
             if not model_specs:
                 continue
 
+            uid_n_obs = counts.loc[uids]
             for model_name, factory in model_specs:
+                # Per-uid filter: only run this model on series with enough history
+                # to fit every CV training window. Avoids one short series taking
+                # down the entire model for a bucket via raised exceptions.
+                min_obs_needed = _min_obs_for_model_cv(
+                    model_name,
+                    season_length=int(season_for_models),
+                    cv_h=int(bucket_cv_h),
+                    n_windows=int(bucket_n_windows),
+                )
+                qualified_uids = [
+                    str(u) for u in uid_n_obs.index
+                    if int(uid_n_obs.loc[u]) >= int(min_obs_needed)
+                ]
+                if not qualified_uids:
+                    continue
+                df_model = df_bucket[df_bucket['unique_id'].isin(qualified_uids)]
+                if df_model.empty:
+                    continue
+
                 try:
                     sf_one = StatsForecast(models=[factory()], freq=self.freq, n_jobs=1)
                     cv = sf_one.cross_validation(
-                        df=df_bucket,
+                        df=df_model,
                         h=bucket_cv_h,
                         step_size=bucket_cv_h,
-                        n_windows=max(1, int(n_windows)),
+                        n_windows=bucket_n_windows,
                     )
 
                     if metric_name == 'robust':
@@ -1376,25 +1909,37 @@ class ClassicalForecasts:
                         # Mean across cutoffs
                         rmse_mean = scores[scores['metric'] == 'rmse'].groupby('unique_id', as_index=True)[model_name].mean()
                         mae_mean = scores[scores['metric'] == 'mae'].groupby('unique_id', as_index=True)[model_name].mean()
-                        for uid in uids:
+                        for uid in qualified_uids:
                             v1 = float(rmse_mean.get(uid, np.inf))
                             v2 = float(mae_mean.get(uid, np.inf))
                             rmse_scores_map[uid][model_name] = v1
                             mae_scores_map[uid][model_name] = v2
                     elif metric_name in ('wape', 'wape_bias'):
                         # Compute per-series WAPE and bias% directly from CV paths.
+                        # Also track per-cutoff (per-window) WAPE for stability scaling.
                         if model_name not in cv.columns:
                             continue
+                        cutoff_col = 'cutoff' if 'cutoff' in cv.columns else None
                         for uid, g in cv.groupby('unique_id', sort=False):
                             y = g['y'].to_numpy(dtype=float)
                             yhat = g[model_name].to_numpy(dtype=float)
                             wape_v, bias_v = _safe_wape_and_bias(y, yhat)
                             wape_scores_map[str(uid)][model_name] = wape_v
                             bias_scores_map[str(uid)][model_name] = bias_v
+                            if cutoff_col is not None:
+                                per_window: list[float] = []
+                                for _co, gw in g.groupby(cutoff_col, sort=False):
+                                    yw = gw['y'].to_numpy(dtype=float)
+                                    yhw = gw[model_name].to_numpy(dtype=float)
+                                    w_w, _ = _safe_wape_and_bias(yw, yhw)
+                                    if np.isfinite(w_w):
+                                        per_window.append(float(w_w))
+                                if per_window:
+                                    wape_per_window_map[str(uid)][model_name] = per_window
                     else:
                         scores = evaluate(cv, metrics=[metric_fn])
                         m = scores[scores['metric'] == metric_name].groupby('unique_id', as_index=True)[model_name].mean()
-                        for uid in uids:
+                        for uid in qualified_uids:
                             metric_scores[uid][model_name] = float(m.get(uid, np.inf))
 
                 except Exception:
@@ -1428,6 +1973,13 @@ class ClassicalForecasts:
                     bias_vals = pd.Series({m: float(bias_scores_map[uid].get(m, np.inf)) for m in models})
 
                     if metric_name == 'wape_bias':
+                        # Per-window WAPE std for stability scaling of the lag-family
+                        # advantage requirement.
+                        per_window = wape_per_window_map.get(uid, {})
+                        wape_std = pd.Series({
+                            m: float(np.std(vs, ddof=1)) if len(vs) >= 2 else 0.0
+                            for m, vs in per_window.items()
+                        })
                         picked = _pick_model_wape_bias_penalty(
                             wape_vals,
                             bias_vals,
@@ -1437,6 +1989,7 @@ class ClassicalForecasts:
                             bias_scale_pct=20.0,
                             weight=0.25,
                             prefer_seasonal_naive=bool(event_seasonal_uid.get(uid, False)),
+                            wape_std_by_model=wape_std if not wape_std.empty else None,
                         )
                     else:
                         # Plain 'wape': pick best WAPE; deterministic tie-break by |bias|.
@@ -1458,12 +2011,30 @@ class ClassicalForecasts:
                         continue
                     best_by_uid[uid] = str(min(metric_scores[uid].items(), key=lambda kv: kv[1])[0])
 
-        # SeasonalNaive repeats y[t-season]; drop it when recent history shows a dead tail
-        # or YoY collapse (handled per-uid; CV runs on full bucket candidate sets).
+        # Post-CV sanity: if the selected model has CV WAPE > 200%, it's unstable
+        # for this series. Fall back to the best alternative with finite WAPE.
+        if metric_name in ('wape', 'wape_bias'):
+            for uid in list(best_by_uid.keys()):
+                pick = best_by_uid[uid]
+                pick_wape = wape_scores_map.get(uid, {}).get(pick)
+                if pick_wape is None or not np.isfinite(float(pick_wape)):
+                    continue
+                if float(pick_wape) <= 2.0:
+                    continue
+                alts = {
+                    m: v for m, v in wape_scores_map.get(uid, {}).items()
+                    if m != pick and np.isfinite(v) and v < float(pick_wape)
+                }
+                if alts:
+                    best_by_uid[uid] = min(alts, key=alts.get)
+
+        # Lag-family models (SeasonalNaive / SeasonalWindowAverage) repeat
+        # historical same-season values; drop them when recent history shows a
+        # dead tail, YoY collapse, or lag-vs-recent regime mismatch.
         for uid in list(best_by_uid.keys()):
             if not exclude_seasonal_naive_uid.get(uid, False):
                 continue
-            _rerank_pick_excluding_seasonal_naive(
+            _rerank_pick_excluding_lag_family(
                 uid=str(uid),
                 metric_name=metric_name,
                 best_by_uid=best_by_uid,
@@ -1474,14 +2045,19 @@ class ClassicalForecasts:
                 metric_scores=metric_scores,
             )
 
+        # Use the *looser* stability tier for the reranker so noisier-but-real
+        # level shifts are caught at selection (not only at the post-forecast
+        # floor). Skip lag-family demotion for event-seasonal items.
         _auto_model_maybe_prefer_level_under_stable_tail(
             best_by_uid=best_by_uid,
-            stable_tail_uid=stable_tail_uid,
+            stable_tail_uid=stable_tail_loose_uid,
             bucket_by_uid=bucket_by_uid,
             wape_scores_map=wape_scores_map,
             rmse_scores_map=rmse_scores_map,
             mae_scores_map=mae_scores_map,
             metric_name=metric_name,
+            event_seasonal_uid=event_seasonal_uid,
+            strong_trend_uid=strong_trend_uid,
         )
 
         if debug:
@@ -1583,16 +2159,15 @@ class ClassicalForecasts:
         out['upper_90'] = out['upper_90'].clip(lower=out['yhat'], upper=out['upper_95'])
         out['upper_70'] = out['upper_70'].clip(lower=out['yhat'], upper=out['upper_90'])
 
-        # Post-forecast sanity floor: only for UIDs whose recent tail was genuinely
-        # stable (low CV). Seasonal items have volatile tails by design — their
-        # median forecast *should* be low (off-season zeros), so the floor must
-        # never fire on them.
+        # Post-forecast sanity floor: uses a looser stability criterion
+        # (max_cv=0.70) than the level-prefer reranking (0.55). The floor only
+        # needs a rough demand level, so we accept noisier tails here.
         floor_ratio = 0.15
         floor_min_tail = 5.0
         for uid in out['unique_id'].unique():
-            if not stable_tail_uid.get(uid, False):
+            if not floor_eligible_uid.get(uid, False):
                 continue
-            tm = float(stable_tail_mean_uid.get(uid, 0.0))
+            tm = float(floor_eligible_mean_uid.get(uid, 0.0))
             if tm < floor_min_tail:
                 continue
             mask_uid = out['unique_id'] == uid

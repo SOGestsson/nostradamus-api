@@ -49,9 +49,68 @@ def test_wape_bias_penalty_prefers_adaptive_over_seasonal_naive_when_close():
 def test_wape_bias_penalty_keeps_seasonal_naive_when_materially_better():
     from inventory_algorithm.classical_forecasts import _pick_model_wape_bias_penalty
 
-    # SeasonalNaive is materially better (advantage > seasonal_naive_min_wape_advantage, default 0.06).
-    wape = pd.Series({"SeasonalNaive": 0.080, "Theta": 0.150})
+    # SeasonalNaive is materially better than every non-lag alternative
+    # (advantage > seasonal_naive_min_wape_advantage, default 0.08).
+    wape = pd.Series({"SeasonalNaive": 0.05, "Theta": 0.20})
     bias_pct = pd.Series({"SeasonalNaive": 0.0, "Theta": 0.0})
 
     picked = _pick_model_wape_bias_penalty(wape, bias_pct)
+    assert picked == "SeasonalNaive"
+
+
+def test_wape_bias_penalty_demotes_seasonal_naive_when_advantage_below_threshold():
+    """SN's lead must clear the threshold even when no other model is in close band."""
+    from inventory_algorithm.classical_forecasts import _pick_model_wape_bias_penalty
+
+    # 5pp lead is below the default 8pp threshold → demote to best non-lag.
+    wape = pd.Series({"SeasonalNaive": 0.10, "AutoETS": 0.15, "HistoricAverage": 0.18})
+    bias_pct = pd.Series({"SeasonalNaive": 0.0, "AutoETS": 0.0, "HistoricAverage": 0.0})
+
+    picked = _pick_model_wape_bias_penalty(wape, bias_pct)
+    assert picked == "AutoETS"
+
+
+def test_wape_bias_penalty_demotes_seasonal_window_average_too():
+    """SWA shares SN's lag-family failure mode and is subject to the same guard."""
+    from inventory_algorithm.classical_forecasts import _pick_model_wape_bias_penalty
+
+    wape = pd.Series({"SeasonalWindowAverage": 0.10, "WindowAverage": 0.14})
+    bias_pct = pd.Series({"SeasonalWindowAverage": 0.0, "WindowAverage": 0.0})
+
+    picked = _pick_model_wape_bias_penalty(wape, bias_pct)
+    assert picked == "WindowAverage"
+
+
+def test_wape_bias_penalty_doubles_advantage_required_for_unstable_lag():
+    """If the lag pick's per-window WAPE varies a lot, demand a bigger advantage."""
+    from inventory_algorithm.classical_forecasts import _pick_model_wape_bias_penalty
+
+    wape = pd.Series({"SeasonalNaive": 0.05, "AutoETS": 0.18})
+    bias_pct = pd.Series({"SeasonalNaive": 0.0, "AutoETS": 0.0})
+
+    # 13pp lead: above default 8pp, below doubled 16pp threshold.
+    wape_std = pd.Series({"SeasonalNaive": 0.30, "AutoETS": 0.05})
+    picked = _pick_model_wape_bias_penalty(
+        wape, bias_pct, wape_std_by_model=wape_std,
+    )
+    assert picked == "AutoETS"
+
+    # Same WAPE values but stable SN → advantage above threshold → keep SN.
+    wape_std_stable = pd.Series({"SeasonalNaive": 0.02, "AutoETS": 0.05})
+    picked2 = _pick_model_wape_bias_penalty(
+        wape, bias_pct, wape_std_by_model=wape_std_stable,
+    )
+    assert picked2 == "SeasonalNaive"
+
+
+def test_wape_bias_penalty_event_seasonal_keeps_lag_family():
+    """``prefer_seasonal_naive=True`` (event-seasonal) skips the demotion guard."""
+    from inventory_algorithm.classical_forecasts import _pick_model_wape_bias_penalty
+
+    wape = pd.Series({"SeasonalNaive": 0.10, "AutoETS": 0.11})
+    bias_pct = pd.Series({"SeasonalNaive": 0.0, "AutoETS": 0.0})
+
+    picked = _pick_model_wape_bias_penalty(
+        wape, bias_pct, prefer_seasonal_naive=True,
+    )
     assert picked == "SeasonalNaive"

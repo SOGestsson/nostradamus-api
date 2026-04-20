@@ -24,8 +24,16 @@ def test_recent_tail_stable_level_rejects_volatile_tail():
     assert ok is False
 
 
-def test_exclude_seasonal_naive_yoy_bypass_when_stable_tail():
-    # Full last-12 mean << prior-12 mean, but last 8 months flat ~100 → YoY rule must not exclude SN
+def test_exclude_seasonal_naive_yoy_collapse_excludes_even_with_stable_tail():
+    """A YoY collapse + stable new level is the *strongest* signal that SN is wrong.
+
+    SN reproduces absolute past values (y[t-s]); after a 60%+ level shift down to
+    a stable floor it would still forecast last year's old peaks. Demand has
+    settled at a new run rate, and the old seasonal values are no longer
+    representative — the level-prefer reranker should then steer to a level
+    model. Previously this branch incorrectly *kept* SN eligible when the tail
+    was stable; that bug was the Mjúkís/Jarðarberja failure mode.
+    """
     s = 12
     y = np.concatenate([np.full(12, 1500.0), np.full(4, 200.0), np.full(8, 100.0)])
     assert len(y) == 24
@@ -35,7 +43,7 @@ def test_exclude_seasonal_naive_yoy_bypass_when_stable_tail():
     ) is True
     assert _auto_model_exclude_seasonal_naive(
         y, season_length=s, event_seasonal=False, stable_recent_level=True
-    ) is False
+    ) is True
 
 
 def _empty_scores():
@@ -43,17 +51,73 @@ def _empty_scores():
 
 
 def test_maybe_prefer_level_swaps_adaptive_for_competitive_historic_average():
+    """Reranker demotes adaptive picks to a level model that beats them on WAPE.
+
+    In ``smooth`` / ``trend`` buckets the demote threshold is zero margin.
+    Level-model targets are HA, MA6, MA12 and legacy WindowAverage —
+    SeasonalWindowAverage is in the demote-FROM set, not a target.
+    """
     best_by_uid = {'a': 'AutoETS'}
     _auto_model_maybe_prefer_level_under_stable_tail(
         best_by_uid=best_by_uid,
         stable_tail_uid={'a': True},
-        bucket_by_uid={'a': 'seasonal'},
-        wape_scores_map={'a': {'AutoETS': 0.20, 'HistoricAverage': 0.21, 'SeasonalWindowAverage': 0.19}},
+        bucket_by_uid={'a': 'smooth'},
+        wape_scores_map={'a': {
+            'AutoETS': 0.20,
+            'HistoricAverage': 0.18,
+            'WindowAverage': 0.19,
+            'SeasonalWindowAverage': 0.17,
+        }},
         rmse_scores_map=_empty_scores(),
         mae_scores_map=_empty_scores(),
         metric_name='wape_bias',
     )
-    assert best_by_uid['a'] == 'SeasonalWindowAverage'
+    assert best_by_uid['a'] == 'HistoricAverage'
+
+
+def test_maybe_prefer_level_demotes_seasonal_window_average_under_stable_tail():
+    """SWA is in the demote-FROM set; a beating WindowAverage takes over."""
+    from inventory_algorithm.classical_forecasts import (
+        _auto_model_maybe_prefer_level_under_stable_tail,
+    )
+    best_by_uid = {'a': 'SeasonalWindowAverage'}
+    _auto_model_maybe_prefer_level_under_stable_tail(
+        best_by_uid=best_by_uid,
+        stable_tail_uid={'a': True},
+        bucket_by_uid={'a': 'smooth'},
+        wape_scores_map={'a': {
+            'SeasonalWindowAverage': 0.20,
+            'HistoricAverage': 0.22,
+            'WindowAverage': 0.18,
+        }},
+        rmse_scores_map=_empty_scores(),
+        mae_scores_map=_empty_scores(),
+        metric_name='wape_bias',
+    )
+    assert best_by_uid['a'] == 'WindowAverage'
+
+
+def test_maybe_prefer_level_skips_lag_family_for_event_seasonal():
+    """Event-seasonal items keep SN/SWA — the lag IS the forecast signal there."""
+    from inventory_algorithm.classical_forecasts import (
+        _auto_model_maybe_prefer_level_under_stable_tail,
+    )
+    best_by_uid = {'a': 'SeasonalNaive'}
+    _auto_model_maybe_prefer_level_under_stable_tail(
+        best_by_uid=best_by_uid,
+        stable_tail_uid={'a': True},
+        bucket_by_uid={'a': 'seasonal'},
+        wape_scores_map={'a': {
+            'SeasonalNaive': 0.20,
+            'HistoricAverage': 0.10,
+            'WindowAverage': 0.10,
+        }},
+        rmse_scores_map=_empty_scores(),
+        mae_scores_map=_empty_scores(),
+        metric_name='wape_bias',
+        event_seasonal_uid={'a': True},
+    )
+    assert best_by_uid['a'] == 'SeasonalNaive'
 
 
 def test_maybe_prefer_level_works_for_robust_metric():
