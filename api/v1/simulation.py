@@ -206,6 +206,159 @@ def run_histogram_buy_freq(request: SimulationRequest):
         raise HTTPException(status_code=500, detail=f"Histogram buy error: {str(e)}")
 
 
+@router.post("/histo_lead")
+def run_histogram_lead_freq(request: SimulationRequest):
+    """
+    Run simulation and return histogram_lead frequency data.
+
+    Executes inventory simulation and returns the lead time frequency histogram,
+    which shows the distribution of lead times observed over the simulation period.
+
+    Args:
+        request: SimulationRequest with data and simulation parameters
+
+    Returns:
+        Dictionary containing histogram_lead data in serializable format
+
+    Raises:
+        HTTPException: If simulation fails
+    """
+    try:
+        print("Starting histogram_lead simulation...")
+
+        dfs = build_dataframes(SimInput(
+            sim_input_his=request.sim_input_his,
+            sim_rio_items=request.sim_rio_items,
+            sim_rio_item_details=request.sim_rio_item_details,
+            sim_rio_on_order=request.sim_rio_on_order
+        ))
+
+        print("DataFrames built successfully")
+
+        sim_input_his = dfs["sim_input_his"]
+        sim_rio_items = dfs["sim_rio_items"]
+        sim_rio_item_details = dfs["sim_rio_item_details"]
+        sim_rio_on_order = dfs["sim_rio_on_order"]
+
+        print("Running simulation...")
+
+        inv_sim = inv.inventory_simulator_with_input_prep(
+            sim_input_his,
+            sim_rio_items,
+            sim_rio_on_order,
+            sim_rio_item_details,
+            request.number_of_days,
+            request.number_of_simulations,
+            request.service_level
+        )
+
+        print("Simulation completed")
+
+        result = inv_sim.histogram_lead
+
+        print(f"histogram_lead type: {type(result)}")
+        print(f"histogram_lead value: {result}")
+
+        if hasattr(result, 'to_dict'):
+            return {"histogram_lead": result.to_dict(orient="records")}
+        elif hasattr(result, 'tolist'):
+            return {"histogram_lead": result.tolist()}
+        elif isinstance(result, dict):
+            serializable_result = {}
+            for key, value in result.items():
+                if hasattr(value, 'tolist'):
+                    serializable_result[key] = value.tolist()
+                elif hasattr(value, 'to_dict'):
+                    serializable_result[key] = value.to_dict(orient="records")
+                else:
+                    serializable_result[key] = str(value)
+            return {"histogram_lead": serializable_result}
+        elif isinstance(result, (list, int, float, str, bool, type(None))):
+            return {"histogram_lead": result}
+        else:
+            return {"histogram_lead": str(result)}
+
+    except Exception as e:
+        error_details = traceback.format_exc()
+        print(f"Full error traceback:\n{error_details}")
+        raise HTTPException(status_code=500, detail=f"Histogram lead error: {str(e)}")
+
+
+@router.post("/sim_prep")
+def run_sim_prep(request: SimulationRequest):
+    """
+    Run simulation setup and return initial Monte Carlo parameters and prepared simulator input.
+
+    Executes the input preparation steps without running the full simulation, returning:
+    - serv_level_value_lead: Monte Carlo service-level forecast for lead time
+    - serv_level_value_buy: Monte Carlo service-level forecast for buy frequency
+    - histo_with_cum_lead: lead time histogram with cumulative distribution
+    - histo_with_cum_buy: buy frequency histogram with cumulative distribution
+    - simulator_input_his: the prepared input DataFrame fed into the simulator
+
+    Args:
+        request: SimulationRequest with data and simulation parameters
+
+    Returns:
+        Dictionary containing the initial parameters in serializable format
+
+    Raises:
+        HTTPException: If preparation fails
+    """
+    try:
+        print("Starting sim_prep...")
+
+        dfs = build_dataframes(SimInput(
+            sim_input_his=request.sim_input_his,
+            sim_rio_items=request.sim_rio_items,
+            sim_rio_item_details=request.sim_rio_item_details,
+            sim_rio_on_order=request.sim_rio_on_order
+        ))
+
+        sim_input_his = dfs["sim_input_his"]
+        sim_rio_items = dfs["sim_rio_items"]
+        sim_rio_item_details = dfs["sim_rio_item_details"]
+        sim_rio_on_order = dfs["sim_rio_on_order"]
+
+        inv_sim = inv.inventory_simulator_with_input_prep(
+            sim_input_his,
+            sim_rio_items,
+            sim_rio_on_order,
+            sim_rio_item_details,
+            request.number_of_days,
+            request.number_of_simulations,
+            request.service_level
+        )
+
+        def to_serializable(val):
+            if hasattr(val, 'to_dict'):
+                return val.to_dict(orient="records")
+            elif hasattr(val, 'tolist'):
+                return val.tolist()
+            elif hasattr(val, 'item'):
+                return val.item()
+            elif isinstance(val, (list, int, float, str, bool, type(None))):
+                return val
+            else:
+                return str(val)
+
+        return {
+            "histogram_lead": to_serializable(inv_sim.histogram_lead),
+            "serv_level_value_lead": to_serializable(inv_sim.serv_level_value_lead),
+            "histo_with_cum_lead": to_serializable(inv_sim.histo_with_cum_lead),
+            "histogram_buy": to_serializable(inv_sim.histogram_buy),
+            "serv_level_value_buy": to_serializable(inv_sim.serv_level_value_buy),
+            "histo_with_cum_buy": to_serializable(inv_sim.histo_with_cum_buy),
+            "simulator_input_his": to_serializable(inv_sim.simulator_input_his),
+            "sim_result": to_serializable(inv_sim.sim_result),
+        }
+
+    except Exception as e:
+        error_details = traceback.format_exc()
+        print(f"Full error traceback:\n{error_details}")
+        raise HTTPException(status_code=500, detail=f"Sim prep error: {str(e)}")
+
+
 @router.post("/raw_simulate")
 def run_raw_simulation(request: CoreSimInput):
     """Run inventory simulation directly from a prepared simulator input DataFrame.
