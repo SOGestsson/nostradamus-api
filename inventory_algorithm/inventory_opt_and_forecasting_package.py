@@ -196,12 +196,16 @@ class inventory_simulator_with_input_prep(forecasts, sim.inventory_simulator):
 
     # In this method we add on order to data frame
     def step_2_add_on_order_to_sim_input(self, sim_rio_on_order, sim_input_his):
-        del_dates = sim_rio_on_order['est_deliv_date'].values.tolist()
-        del_qty = sim_rio_on_order['est_deliv_qty'].values.tolist()
-
         input_with_on_order = sim_input_his
         input_with_on_order['delivery'] = 0
-        input_with_on_order.loc[input_with_on_order.day.isin(del_dates), 'delivery'] = del_qty
+
+        if sim_rio_on_order.empty:
+            return input_with_on_order
+
+        # Sum quantities by date to handle multiple deliveries on the same day
+        delivery_by_date = sim_rio_on_order.groupby('est_deliv_date')['est_deliv_qty'].sum()
+        for date, qty in delivery_by_date.items():
+            input_with_on_order.loc[input_with_on_order['day'] == date, 'delivery'] = qty
 
         return input_with_on_order
 

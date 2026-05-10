@@ -3,6 +3,7 @@ Inventory simulation endpoints.
 """
 import json
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List
 
@@ -379,17 +380,15 @@ def run_multi_sim(requests: List[SimulationRequest]):
     Raises:
         HTTPException: If any simulation fails
     """
-    try:
-        final_res = pd.DataFrame()
-
-        for request in requests:
+    def _run_single(request: SimulationRequest):
+        item_id = request.sim_rio_items[0].get("pn") if request.sim_rio_items else "unknown"
+        try:
             dfs = build_dataframes(SimInput(
                 sim_input_his=request.sim_input_his,
                 sim_rio_items=request.sim_rio_items,
                 sim_rio_item_details=request.sim_rio_item_details,
                 sim_rio_on_order=request.sim_rio_on_order,
             ))
-
             inv_sim = inv.inventory_simulator_with_input_prep(
                 dfs["sim_input_his"],
                 dfs["sim_rio_items"],
@@ -399,30 +398,42 @@ def run_multi_sim(requests: List[SimulationRequest]):
                 request.number_of_simulations,
                 request.service_level,
             )
+            return item_id, inv_sim.sim_result, None
+        except Exception as e:
+            print(f"Error on item_id {item_id}:\n{traceback.format_exc()}")
+            return item_id, None, str(e)
 
-            if not final_res.empty:
-                final_res = pd.concat([final_res, inv_sim.sim_result], ignore_index=True)
+    results = []
+    errors = []
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(_run_single, req): req for req in requests}
+        for future in as_completed(futures):
+            item_id, sim_result, error = future.result()
+            if error:
+                errors.append({"item_id": item_id, "error": error})
             else:
-                final_res = inv_sim.sim_result
+                results.append(sim_result)
 
-        if final_res.empty:
-            return {"sim_result": [], "purchase_suggestions": []}
+    if not results:
+        return {"sim_result": [], "purchase_suggestions": [], "errors": errors}
 
-        purchase_suggestions = pd.DataFrame()
-        if "item_id" in final_res.columns and "sim_date" in final_res.columns and "purchase_qty" in final_res.columns:
-            oldest = final_res.loc[final_res.groupby("item_id")["sim_date"].idxmin()]
-            purchase_suggestions = oldest[["item_id", "purchase_qty"]].copy()
-            purchase_suggestions["current_datetime"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    final_res = pd.concat(results, ignore_index=True)
 
-        return {
-            "sim_result": final_res.to_dict(orient="records"),
-            "purchase_suggestions": purchase_suggestions.to_dict(orient="records"),
-        }
+    if final_res.empty:
+        return {"sim_result": [], "purchase_suggestions": [], "errors": errors}
 
-    except Exception as e:
-        error_details = traceback.format_exc()
-        print(f"Full error traceback:\n{error_details}")
-        raise HTTPException(status_code=500, detail=f"Multi-sim error: {str(e)}")
+    purchase_suggestions = pd.DataFrame()
+    if "item_id" in final_res.columns and "sim_date" in final_res.columns and "purchase_qty" in final_res.columns:
+        oldest = final_res.loc[final_res.groupby("item_id")["sim_date"].idxmin()]
+        purchase_suggestions = oldest[["item_id", "purchase_qty"]].copy()
+        purchase_suggestions["current_datetime"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    return {
+        "sim_result": final_res.to_dict(orient="records"),
+        "purchase_suggestions": purchase_suggestions.to_dict(orient="records"),
+        "errors": errors,
+    }
 
 
 @router.post("/raw_simulate")

@@ -28,12 +28,15 @@ def build_dataframes(data: SimInput) -> Dict[str, pd.DataFrame]:
 
     # Coerce item_id to integers (convert floats like 31.0 to 31)
     if 'item_id' in df_his.columns:
-        item_series = pd.to_numeric(df_his['item_id'], errors='ignore')
-        if pd.api.types.is_float_dtype(item_series):
-            with pd.option_context('mode.use_inf_as_na', True):
-                df_his['item_id'] = pd.to_numeric(df_his['item_id'], errors='coerce').astype('Int64')
-        else:
-            df_his['item_id'] = item_series
+        try:
+            item_series = pd.to_numeric(df_his['item_id'])
+            if pd.api.types.is_float_dtype(item_series):
+                with pd.option_context('mode.use_inf_as_na', True):
+                    df_his['item_id'] = pd.to_numeric(df_his['item_id'], errors='coerce').astype('Int64')
+            else:
+                df_his['item_id'] = item_series
+        except (ValueError, TypeError):
+            pass
     
     if 'actual_sale' in df_his.columns:
         df_his['actual_sale'] = pd.to_numeric(df_his['actual_sale'], errors='coerce')
