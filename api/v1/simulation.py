@@ -3,6 +3,8 @@ Inventory simulation endpoints.
 """
 import json
 import traceback
+from datetime import datetime
+from typing import List
 
 import pandas as pd
 
@@ -357,6 +359,70 @@ def run_sim_prep(request: SimulationRequest):
         error_details = traceback.format_exc()
         print(f"Full error traceback:\n{error_details}")
         raise HTTPException(status_code=500, detail=f"Sim prep error: {str(e)}")
+
+
+@router.post("/multi-sim")
+def run_multi_sim(requests: List[SimulationRequest]):
+    """
+    Run simulation for multiple part numbers and return combined results.
+
+    Accepts a list of SimulationRequest objects (the output of the sim-prep endpoint)
+    and runs inventory_simulator_with_input_prep for each one. Returns the combined
+    sim_result across all part numbers and purchase suggestions.
+
+    Args:
+        requests: List of SimulationRequest, one per part number
+
+    Returns:
+        Dictionary with sim_result (all rows combined) and purchase_suggestions
+
+    Raises:
+        HTTPException: If any simulation fails
+    """
+    try:
+        final_res = pd.DataFrame()
+
+        for request in requests:
+            dfs = build_dataframes(SimInput(
+                sim_input_his=request.sim_input_his,
+                sim_rio_items=request.sim_rio_items,
+                sim_rio_item_details=request.sim_rio_item_details,
+                sim_rio_on_order=request.sim_rio_on_order,
+            ))
+
+            inv_sim = inv.inventory_simulator_with_input_prep(
+                dfs["sim_input_his"],
+                dfs["sim_rio_items"],
+                dfs["sim_rio_on_order"],
+                dfs["sim_rio_item_details"],
+                request.number_of_days,
+                request.number_of_simulations,
+                request.service_level,
+            )
+
+            if not final_res.empty:
+                final_res = pd.concat([final_res, inv_sim.sim_result], ignore_index=True)
+            else:
+                final_res = inv_sim.sim_result
+
+        if final_res.empty:
+            return {"sim_result": [], "purchase_suggestions": []}
+
+        purchase_suggestions = pd.DataFrame()
+        if "item_id" in final_res.columns and "sim_date" in final_res.columns and "purchase_qty" in final_res.columns:
+            oldest = final_res.loc[final_res.groupby("item_id")["sim_date"].idxmin()]
+            purchase_suggestions = oldest[["item_id", "purchase_qty"]].copy()
+            purchase_suggestions["current_datetime"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        return {
+            "sim_result": final_res.to_dict(orient="records"),
+            "purchase_suggestions": purchase_suggestions.to_dict(orient="records"),
+        }
+
+    except Exception as e:
+        error_details = traceback.format_exc()
+        print(f"Full error traceback:\n{error_details}")
+        raise HTTPException(status_code=500, detail=f"Multi-sim error: {str(e)}")
 
 
 @router.post("/raw_simulate")
