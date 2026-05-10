@@ -267,6 +267,27 @@ class inventory_simulator_with_input_prep(forecasts, sim.inventory_simulator):
             sim_input_with_extra['extra_params'] = extra_params
 
             return sim_input_with_extra
+
+        # Fallback for unknown purchasing methods — treat as low_sale
+        method = sim_rio_items.loc[:, 'purchasing_method'].values[0]
+        print(f"Unknown purchasing_method '{method}', falling back to low_sale")
+
+        dict_item_info = {}
+        dict_item_info['current_inventory'] = "[[10000," + str(curr_stock) + "]]"
+        dict_item_info['lead_time'] = lead_time
+        dict_item_info['order_freq'] = order_freq
+        dict_item_info['lead_forecast'] = lead_forecast
+        dict_item_info['buy_forecast'] = buy_forecast
+        dict_item_info['bakcorder'] = backorder
+        dict_item_info['safety_stock'] = safety_stock
+        dict_item_info['bypass_forecast'] = bypass_forecast
+
+        extra_params = {"extra_params": [dict_item_info]}
+        extra_params = str(extra_params).replace("'", '"')
+        sim_input_with_extra = sim_input_his
+        sim_input_with_extra['extra_params'] = extra_params
+
+        return sim_input_with_extra
         
         
     #In this method we add order day to data frame
