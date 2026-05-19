@@ -4,7 +4,8 @@ import requests
 
 inv_df = json.load(open("sim_input_modified.json", "r", encoding="utf-8"))
 r = requests.post(
-    "http://localhost:8000/api/v1/simulation/raw_simulate",
+    "http://api.nostradamus-api.com/api/v1/simulation/raw_simulate",
+    #"http://localhost:8000/api/v1/simulation/raw_simulate",
     json={"inv_df": inv_df},
     timeout=120,
 )

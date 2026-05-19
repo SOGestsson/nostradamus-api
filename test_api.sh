@@ -3,7 +3,7 @@
 # Test script for Inventory Simulation API
 # Usage: ./test_api.sh
 
-BASE_URL="http://localhost:8000"
+BASE_URL="http://ap.nastradamus-api.com"
 DATA_FILE="/Users/siggi/Dropbox/2025/python/Nostradamus_api/all_sim_input_data.v2.json"
 
 echo "Testing Inventory Simulation API"
