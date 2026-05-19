@@ -37,8 +37,8 @@ Thumbs.db
 nostradamus_store/
 *.duckdb
 
-# Data files (optional - remove if you want to commit them)
-# *.json
+# Data files
+*.json
 # *.csv
 
 # Docker
