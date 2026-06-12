@@ -97,7 +97,7 @@ def build_dataframes(data: SimInput) -> Dict[str, pd.DataFrame]:
         df_on_order = pd.DataFrame(raw_on_order)
         # Fix dates and types in on_order
         if 'est_deliv_date' in df_on_order.columns and not df_on_order.empty:
-            df_on_order['est_deliv_date'] = pd.to_datetime(df_on_order['est_deliv_date'].astype(str), errors='coerce')
+            df_on_order['est_deliv_date'] = pd.to_datetime(df_on_order['est_deliv_date'].astype(str), errors='coerce').dt.normalize()
         if 'est_deliv_qty' in df_on_order.columns:
             df_on_order['est_deliv_qty'] = pd.to_numeric(df_on_order['est_deliv_qty'], errors='coerce').fillna(0)
         if 'pn' in df_on_order.columns:
