@@ -202,6 +202,9 @@ class inventory_simulator_with_input_prep(forecasts, sim.inventory_simulator):
         if sim_rio_on_order.empty:
             return input_with_on_order
 
+        sim_rio_on_order = sim_rio_on_order.copy()
+        sim_rio_on_order['est_deliv_date'] = pd.to_datetime(sim_rio_on_order['est_deliv_date'])
+
         # Sum quantities by date to handle multiple deliveries on the same day
         delivery_by_date = sim_rio_on_order.groupby('est_deliv_date')['est_deliv_qty'].sum()
         for date, qty in delivery_by_date.items():
