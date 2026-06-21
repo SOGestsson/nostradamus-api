@@ -31,6 +31,7 @@ class SimulationRequest(BaseModel):
     number_of_days: int = 900
     number_of_simulations: int = 1000
     service_level: float = 0.95
+    random_seed: Optional[int] = None
 
 
 class ForecastRequest(BaseModel):

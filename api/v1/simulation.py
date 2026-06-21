@@ -2,11 +2,13 @@
 Inventory simulation endpoints.
 """
 import json
+import random
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List
 
+import numpy as np
 import pandas as pd
 
 from fastapi import APIRouter, HTTPException
@@ -17,6 +19,12 @@ from api.models import CoreSimInput, SimInput, SimulationRequest
 from api.deps import build_dataframes
 
 router = APIRouter()
+
+
+def _apply_random_seed(seed: int | None) -> None:
+    if seed is not None:
+        np.random.seed(seed)
+        random.seed(seed)
 
 
 def coerce_sim_input_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -310,6 +318,7 @@ def run_sim_prep(request: SimulationRequest):
     """
     try:
         print("Starting sim_prep...")
+        _apply_random_seed(request.random_seed)
 
         dfs = build_dataframes(SimInput(
             sim_input_his=request.sim_input_his,
