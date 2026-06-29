@@ -203,12 +203,19 @@ class inventory_simulator_with_input_prep(forecasts, sim.inventory_simulator):
             return input_with_on_order
 
         sim_rio_on_order = sim_rio_on_order.copy()
-        sim_rio_on_order['est_deliv_date'] = pd.to_datetime(sim_rio_on_order['est_deliv_date'])
+        sim_rio_on_order['est_deliv_date'] = pd.to_datetime(
+            sim_rio_on_order['est_deliv_date'].astype(str),
+            format='ISO8601',
+            errors='coerce',
+        ).dt.normalize()
 
         # Sum quantities by date to handle multiple deliveries on the same day
         delivery_by_date = sim_rio_on_order.groupby('est_deliv_date')['est_deliv_qty'].sum()
+        sim_days = pd.to_datetime(input_with_on_order['day'], errors='coerce').dt.normalize()
         for date, qty in delivery_by_date.items():
-            input_with_on_order.loc[input_with_on_order['day'] == date, 'delivery'] = qty
+            if pd.isna(date):
+                continue
+            input_with_on_order.loc[sim_days == date, 'delivery'] = qty
 
         return input_with_on_order
 
