@@ -43,21 +43,17 @@ class forecasts:
         return hist
 
     def serv_lev_value(self, histogram, serv_lev):
-        sorted_histogram = np.sort(histogram)
-        line_num = int(serv_lev * len(sorted_histogram))
-        serv_lev_val = sorted_histogram[line_num]
+        return float(np.percentile(histogram, serv_lev * 100))
 
-        return serv_lev_val
-
-    def histogram_with_cum(self, monte_forecast, bins):
+    def histogram_with_cum(self, monte_forecast, bins=40):
         # create histogram
-        hist, bins = np.histogram(monte_forecast, bins=bins, density=False)
+        hist, bin_edges = np.histogram(monte_forecast, bins=bins, density=False)
 
-        # create cumulative histogram
+        # cumulative at right edge of each bin — aligns with service-level percentile line
         cum_hist = np.cumsum(hist) / hist.sum()
 
         # create Pandas DataFrame
-        df = pd.DataFrame({'bin_edges': bins[:-1], 'frequency': hist, 'cumulative_frequency': cum_hist})
+        df = pd.DataFrame({'bin_edges': bin_edges[1:], 'frequency': hist, 'cumulative_frequency': cum_hist})
 
         return df
 
@@ -151,11 +147,11 @@ class inventory_simulator_with_input_prep(forecasts, sim.inventory_simulator):
         #upphafsgildi úr montercarlo spá fyrir buy freq og lead time
         self.histogram_lead = self.monte_forecast(sim_input_his[['actual_sale', 'day']], sim_rio_items.loc[:, 'del_time'].values[0], number_of_trials)
         self.serv_level_value_lead = self.serv_lev_value(self.histogram_lead, serv_level)
-        self.histo_with_cum_lead  = self.histogram_with_cum(self.histogram_lead, 20)
+        self.histo_with_cum_lead  = self.histogram_with_cum(self.histogram_lead)
 
         self.histogram_buy = self.monte_forecast(sim_input_his[['actual_sale', 'day']], sim_rio_items.loc[:, 'buy_freq'].values[0], number_of_trials)
         self.serv_level_value_buy = self.serv_lev_value(self.histogram_buy, serv_level)
-        self.histo_with_cum_buy = self.histogram_with_cum(self.histogram_buy, 20)
+        self.histo_with_cum_buy = self.histogram_with_cum(self.histogram_buy)
 
 
         #Input í simulator
@@ -226,10 +222,9 @@ class inventory_simulator_with_input_prep(forecasts, sim.inventory_simulator):
         order_freq = sim_rio_items.loc[:, 'buy_freq'].values[0].item()
         minmax_min = sim_rio_items.loc[:, 'min'].values[0].item()
         minmax_max = sim_rio_items.loc[:, 'max'].values[0].item()
-        lead_forecast = self.calc_lead_and_buy_with_save(sim_input_his.loc[sim_input_his['actual_sale'] != -1000001.0],
-                                                         lead_time, number_of_trials, serv_level).item()
-        buy_forecast = self.calc_lead_and_buy_with_save(sim_input_his.loc[sim_input_his['actual_sale'] != -1000001.0],
-                                                        order_freq, number_of_trials, serv_level).item()
+        # Same MC percentiles as histogram display — do not re-roll Monte Carlo here.
+        lead_forecast = float(np.asarray(self.serv_level_value_lead).item())
+        buy_forecast = float(np.asarray(self.serv_level_value_buy).item())
         backorder = 1
         safety_stock = 0
         bypass_forecast = 1
