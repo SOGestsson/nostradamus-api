@@ -3,6 +3,7 @@ Inventory simulation endpoints.
 """
 import json
 import random
+import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -20,11 +21,25 @@ from api.deps import build_dataframes
 
 router = APIRouter()
 
+# Monte Carlo uses global numpy/random state — serialize multi-sim workers.
+_sim_mc_lock = threading.Lock()
+
 
 def _apply_random_seed(seed: int | None) -> None:
     if seed is not None:
         np.random.seed(seed)
         random.seed(seed)
+
+
+def _resolve_item_seed(request: SimulationRequest) -> int | None:
+    if request.random_seed is not None:
+        return int(request.random_seed)
+    if request.sim_input_his:
+        try:
+            return int(request.sim_input_his[0]["item_id"])
+        except (TypeError, ValueError, KeyError, IndexError):
+            return None
+    return None
 
 
 def coerce_sim_input_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -318,7 +333,7 @@ def run_sim_prep(request: SimulationRequest):
     """
     try:
         print("Starting sim_prep...")
-        _apply_random_seed(request.random_seed)
+        _apply_random_seed(_resolve_item_seed(request))
 
         dfs = build_dataframes(SimInput(
             sim_input_his=request.sim_input_his,
@@ -390,27 +405,30 @@ def run_multi_sim(requests: List[SimulationRequest]):
         HTTPException: If any simulation fails
     """
     def _run_single(request: SimulationRequest):
-        item_id = request.sim_rio_items[0].get("pn") if request.sim_rio_items else "unknown"
+        label = request.sim_rio_items[0].get("pn") if request.sim_rio_items else "unknown"
         try:
-            dfs = build_dataframes(SimInput(
-                sim_input_his=request.sim_input_his,
-                sim_rio_items=request.sim_rio_items,
-                sim_rio_item_details=request.sim_rio_item_details,
-                sim_rio_on_order=request.sim_rio_on_order,
-            ))
-            inv_sim = inv.inventory_simulator_with_input_prep(
-                dfs["sim_input_his"],
-                dfs["sim_rio_items"],
-                dfs["sim_rio_on_order"],
-                dfs["sim_rio_item_details"],
-                request.number_of_days,
-                request.number_of_simulations,
-                request.service_level,
-            )
-            return item_id, inv_sim.sim_result, None
+            # Global numpy/random is not thread-safe; pin seed per item like Deep Dive.
+            with _sim_mc_lock:
+                _apply_random_seed(_resolve_item_seed(request))
+                dfs = build_dataframes(SimInput(
+                    sim_input_his=request.sim_input_his,
+                    sim_rio_items=request.sim_rio_items,
+                    sim_rio_item_details=request.sim_rio_item_details,
+                    sim_rio_on_order=request.sim_rio_on_order,
+                ))
+                inv_sim = inv.inventory_simulator_with_input_prep(
+                    dfs["sim_input_his"],
+                    dfs["sim_rio_items"],
+                    dfs["sim_rio_on_order"],
+                    dfs["sim_rio_item_details"],
+                    request.number_of_days,
+                    request.number_of_simulations,
+                    request.service_level,
+                )
+            return label, inv_sim.sim_result, None
         except Exception as e:
-            print(f"Error on item_id {item_id}:\n{traceback.format_exc()}")
-            return item_id, None, str(e)
+            print(f"Error on item_id {label}:\n{traceback.format_exc()}")
+            return label, None, str(e)
 
     results = []
     errors = []
