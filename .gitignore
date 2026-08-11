@@ -43,3 +43,6 @@ nostradamus_store/
 
 # Docker
 *.tar
+
+# Local Streamlit benchmark settings (persisted API URL list + last-used choice)
+.benchmark_settings.json

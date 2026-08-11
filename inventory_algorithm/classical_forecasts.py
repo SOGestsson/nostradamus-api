@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import numpy as np
 import pandas as pd
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 try:
     # NOTE: Do not import nixtla at module import time.
@@ -378,6 +378,565 @@ def _min_obs_for_model_cv(
     return base
 
 
+def _conformal_forecast_n_windows(min_len: int, h: int) -> int:
+    """Adaptive conformal window count for forecast-time intervals.
+
+    More windows -> more calibration residuals per horizon step -> better
+    calibrated intervals. Capped at 5 to bound cost and keep enough training
+    data in the earliest window.
+    """
+    if min_len <= h + 2:
+        return 1
+    return max(1, min(5, (min_len - h - 2) // max(h, 1)))
+
+
+def _statsforecast_forecast_with_conformal(sf, df: pd.DataFrame, h: int) -> pd.DataFrame:
+    """Forecast with conformal intervals when history length allows."""
+    from statsforecast.utils import ConformalIntervals
+
+    min_len = int(df.groupby('unique_id').size().min()) if 'unique_id' in df.columns else len(df)
+    n_windows = _conformal_forecast_n_windows(min_len, h)
+    if min_len > n_windows * h:
+        intervals = ConformalIntervals(h=h, n_windows=n_windows)
+        return sf.forecast(h=h, df=df, level=[70, 90, 95], prediction_intervals=intervals)
+    return sf.forecast(h=h, df=df)
+
+
+def _upper_column_from_fcst(fcst: pd.DataFrame, model_name: str, level: int) -> Optional[np.ndarray]:
+    col = f"{model_name}-hi-{level}"
+    if col in fcst.columns:
+        return fcst[col].to_numpy(dtype=float)
+    cands = [c for c in fcst.columns if c.endswith(f"-hi-{level}")]
+    if cands:
+        return fcst[cands[0]].to_numpy(dtype=float)
+    return None
+
+
+def _conformal_corrected_quantile(arr: np.ndarray, level: float) -> float:
+    """Finite-sample conformal quantile: the ceil((n+1)*level)-th smallest score.
+
+    Unlike interpolated ``np.quantile``, this carries the standard split-conformal
+    coverage guarantee. With small n the required rank can exceed n; we clip to
+    the max score (slightly anti-conservative but the best available bound).
+    """
+    n = len(arr)
+    if n == 0:
+        return 0.0
+    k = int(np.ceil((n + 1) * float(level)))
+    srt = np.sort(arr)
+    if k >= n:
+        return float(srt[-1])
+    return float(srt[k - 1])
+
+
+def _excess_quantiles_from_values(
+    values: list[float],
+    baselines: Optional[list[float]] = None,
+) -> dict[str, float]:
+    """Absolute (and, when baselines given, relative) conformal excess quantiles.
+
+    ``baselines`` are the predicted/reference levels each excess was measured
+    against. Relative quantiles let the band scale with the forecast level so a
+    peak-month error does not inflate off-season months by the same absolute
+    amount.
+    """
+    if not values:
+        return {}
+    arr = np.asarray(values, dtype=float)
+    if baselines is not None and len(baselines) == len(values):
+        base = np.asarray(baselines, dtype=float)
+        mask = np.isfinite(arr) & np.isfinite(base)
+        arr = arr[mask]
+        base = base[mask]
+    else:
+        base = None
+        arr = arr[np.isfinite(arr)]
+    if len(arr) == 0:
+        return {}
+    out = {
+        'q70': _conformal_corrected_quantile(arr, 0.70),
+        'q90': _conformal_corrected_quantile(arr, 0.90),
+        'q95': _conformal_corrected_quantile(arr, 0.95),
+    }
+    if base is not None and len(base) == len(arr):
+        # min(abs, rel) of two level-alpha bounds only guarantees 2*alpha-1
+        # coverage, so each side is computed at the Bonferroni-adjusted level
+        # 1-(1-alpha)/2 to keep the combined bound at the nominal level.
+        # Drop near-zero baselines: excess/1.0 from quiet months produces
+        # absurd relative quantiles (e.g. 15x) that defeat off-season capping.
+        pos_base = base[base > 0]
+        min_base = 1.0
+        if len(pos_base) > 0:
+            min_base = max(1.0, float(np.quantile(pos_base, 0.25)))
+        ok = base >= min_base
+        if np.any(ok):
+            ratios = arr[ok] / np.maximum(base[ok], 1.0)
+            for key, level in (('q70', 0.70), ('q90', 0.90), ('q95', 0.95)):
+                adj = 1.0 - (1.0 - level) / 2.0
+                out[f'{key}_hi'] = _conformal_corrected_quantile(arr, adj)
+                out[f'{key}_rel'] = _conformal_corrected_quantile(ratios, adj)
+    return out
+
+
+def _residual_excess_for_level(q: dict[str, float], level_key: str, yhat_val: float) -> Optional[float]:
+    """Per-row excess above yhat from residual quantiles.
+
+    Uses min(absolute, relative*yhat), each at the Bonferroni-adjusted level:
+    the absolute quantile is dominated by peak-month errors, the relative one
+    by low-month errors, so the min keeps the band proportional to the
+    forecast level without losing peak coverage or nominal validity.
+    """
+    abs_v = q.get(level_key)
+    if abs_v is None:
+        return None
+    rel_v = q.get(f'{level_key}_rel')
+    if rel_v is None:
+        return float(abs_v)
+    abs_adj = q.get(f'{level_key}_hi', abs_v)
+    return float(min(abs_adj, rel_v * max(yhat_val, 1.0)))
+
+
+def _merge_excess_quantile_dicts(
+    cv_q: dict[str, float],
+    hist_q: dict[str, float],
+) -> dict[str, float]:
+    """Combine CV and historical residual quantile dicts.
+
+    Absolute quantiles take the elementwise max so a historical/CV spike
+    signal is not dropped. Relative quantiles take the tighter (min) ratio
+    when *both* sides are informative; an uninformative near-zero CV band
+    must not zero-out a useful historical relative cap (and a huge CV ratio
+    from peak-month errors on a flat mean must not defeat off-season capping).
+    """
+    if not cv_q:
+        return dict(hist_q)
+    if not hist_q:
+        return dict(cv_q)
+    cv95 = float(cv_q.get('q95', 0.0) or 0.0)
+    h95 = float(hist_q.get('q95', 0.0) or 0.0)
+    out = dict(cv_q)
+    for key in ('q70', 'q90', 'q95', 'q70_hi', 'q90_hi', 'q95_hi'):
+        hv = hist_q.get(key)
+        if hv is None:
+            continue
+        cvv = out.get(key)
+        out[key] = float(hv) if cvv is None else float(max(float(cvv), float(hv)))
+    cv_informative = cv95 >= 0.25 * max(h95, 1.0)
+    hist_informative = h95 >= 0.25 * max(cv95, 1.0)
+    for key in ('q70_rel', 'q90_rel', 'q95_rel'):
+        hv = hist_q.get(key)
+        cvv = out.get(key)
+        if hist_informative and not cv_informative and hv is not None:
+            out[key] = float(hv)
+        elif cv_informative and not hist_informative and cvv is not None:
+            out[key] = float(cvv)
+        elif hv is not None and cvv is not None:
+            out[key] = float(min(float(cvv), float(hv)))
+        elif hv is not None:
+            out[key] = float(hv)
+        elif cvv is not None:
+            out[key] = float(cvv)
+    return out
+
+
+def _is_spiky_intermittent(ypos: np.ndarray, *, min_zero_frac: float = 0.4) -> bool:
+    """True for event/spike demand: mostly-idle months between bursts.
+
+    Measured over the *active* span (first to last positive) so that leading or
+    trailing pad zeros from panel regularization don't make a continuously
+    selling item look intermittent. Continuous items must keep their plain
+    residual/conformal bands: same-month reasoning would clamp them to last
+    year's value for the month and understate ordinary month-to-month noise.
+    """
+    if ypos is None or len(ypos) == 0:
+        return False
+    nz = ypos > 0.0
+    if not bool(nz.any()):
+        return False
+    first = int(np.argmax(nz))
+    last = len(nz) - 1 - int(np.argmax(nz[::-1]))
+    span = ypos[first:last + 1]
+    if len(span) < 6:
+        # Too short to characterise; treat as spiky (wider band is the safer error).
+        return True
+    return float(np.mean(span <= 0.0)) >= float(min_zero_frac)
+
+
+# Exponential forgetting factor (per year) for event-recurrence evidence. 0.7
+# gives an evidence half-life of ~2 years, so a season that was missed recently
+# counts for more than one missed five years ago.
+_EVENT_DISCOUNT_LAMBDA = 0.7
+
+_UPPER_LEVELS: tuple[float, ...] = (0.70, 0.90, 0.95)
+
+
+def _event_probability(occurred_newest_first: np.ndarray, lam: float = _EVENT_DISCOUNT_LAMBDA) -> float:
+    """P(event recurs) from its per-year occurrence history, newest first.
+
+    Discounted Beta(1,1) posterior mean: recent years carry more weight, and the
+    prior keeps the estimate strictly inside (0, 1) — an item still being
+    forecast is never certain to stay silent, nor certain to fire again.
+    """
+    occ = np.asarray(occurred_newest_first, dtype=float)
+    if len(occ) == 0:
+        return 0.0
+    w = float(lam) ** np.arange(len(occ), dtype=float)
+    a = 1.0 + float(np.sum(w * occ))
+    b = 1.0 + float(np.sum(w * (1.0 - occ)))
+    return a / (a + b)
+
+
+def _weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
+    v = np.asarray(values, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    order = np.argsort(v)
+    v = v[order]
+    w = w[order]
+    total = float(w.sum())
+    if total <= 0.0 or len(v) == 0:
+        return float(v[-1]) if len(v) else 0.0
+    cum = (np.cumsum(w) - 0.5 * w) / total
+    return float(np.interp(float(q), cum, v))
+
+
+def _offpeak_positive_pool(
+    ypos: np.ndarray,
+    months: np.ndarray,
+    *,
+    frac_of_max: float = 0.2,
+) -> np.ndarray:
+    """Positive sales from the item's non-event months.
+
+    A month that has never sold still has some chance of selling, but its scale
+    is the item's *quiet* trade, not its event. Months whose own maximum is a
+    small fraction of the series maximum supply that scale.
+    """
+    if len(ypos) == 0 or len(months) != len(ypos):
+        return np.asarray([], dtype=float)
+    series_max = float(ypos.max())
+    if series_max <= 0.0:
+        return np.asarray([], dtype=float)
+    threshold = float(frac_of_max) * series_max
+    keep = np.zeros(len(ypos), dtype=bool)
+    for m in np.unique(months):
+        m_mask = months == m
+        if float(ypos[m_mask].max()) < threshold:
+            keep |= m_mask
+    pool = ypos[keep]
+    return pool[pool > 0.0]
+
+
+def _mixture_limits(
+    p_event: float,
+    mags: np.ndarray,
+    mag_w: np.ndarray,
+    ceiling: float,
+    yhat_val: float,
+) -> dict[int, float]:
+    """Upper limits per level for a Bernoulli(p) x magnitude mixture."""
+    resolvable = len(mags) / (len(mags) + 1.0)
+    q_at_resolvable = _weighted_quantile(mags, mag_w, resolvable)
+    limits: dict[int, float] = {}
+    for level in _UPPER_LEVELS:
+        key = int(round(level * 100))
+        if p_event <= (1.0 - level):
+            # The event is too unlikely to appear in this level's tail at all.
+            limits[key] = float(yhat_val)
+            continue
+        q_level = 1.0 - (1.0 - level) / p_event
+        if q_level <= resolvable:
+            limits[key] = _weighted_quantile(mags, mag_w, q_level)
+        else:
+            # Interpolate across the tail the samples can't resolve so the levels
+            # stay ordered instead of all pinning to the ceiling.
+            frac = (q_level - resolvable) / max(1e-9, 1.0 - resolvable)
+            limits[key] = q_at_resolvable + frac * (ceiling - q_at_resolvable)
+    return limits
+
+
+def _event_month_limits(
+    y_hist: Optional[np.ndarray],
+    yhat_val: float,
+    *,
+    ds_hist: Optional[pd.Series] = None,
+    forecast_month: Optional[int] = None,
+    horizon_pos: int = 1,
+    horizon_len: int = 12,
+) -> tuple[Optional[dict[int, float]], float]:
+    """Per-level upper limits for one month of spiky/event demand.
+
+    Models the month as a mixture: with probability ``p`` the event happens and
+    demand is drawn from the magnitudes that month has produced before, and with
+    probability ``1-p`` it is zero. The upper limit at level ``alpha`` is then
+
+        0 (i.e. yhat)                       if p <= 1 - alpha
+        quantile(magnitudes, 1-(1-alpha)/p) otherwise
+
+    Consequences worth knowing: while ``p`` is above ``1-alpha`` the limit sits
+    near the event's own size and barely moves as ``p`` decays, because the
+    tail of the mixture *is* the event. What decays smoothly is the point
+    forecast (``p`` times the mean magnitude). As an item goes dormant the
+    levels switch off in turn — upper_70 once p < 30%, upper_90 below 10%,
+    upper_95 below 5% — so the spread between them is the "how much safety does
+    this need" signal rather than any single level.
+
+    ``p`` is a discounted Beta posterior over the month's occurrence history and
+    magnitudes are recency-weighted, so both a declining event size and a
+    lengthening silence pull the limits down.
+
+    Returns ``(limits_by_level, ramp_floor_excess)``. ``limits_by_level`` is
+    None when this month has no recurrence history to reason from (continuous
+    item, or fewer than two years of the month producing sales); a sparse series
+    then gets ``ramp_floor_excess``, a floor growing with the horizon toward its
+    recent max, since we know a spike can come but not when.
+    """
+    if y_hist is None or len(y_hist) == 0:
+        return None, 0.0
+    y = np.asarray(y_hist, dtype=float)
+    if len(y) == 0:
+        return None, 0.0
+    ypos = np.maximum(np.where(np.isfinite(y), y, 0.0), 0.0)
+    if float(ypos.max()) <= 0.0:
+        return None, 0.0
+    if not _is_spiky_intermittent(ypos):
+        return None, 0.0
+    n_pos = int(np.sum(ypos > 0.0))
+
+    def _sparse_ramp_floor() -> float:
+        if n_pos == 0 or n_pos > 3:
+            return 0.0
+        gmax = float(ypos[-36:].max()) if len(ypos) > 36 else float(ypos.max())
+        if gmax <= 0.0:
+            return 0.0
+        ramp = min(1.0, max(1, int(horizon_pos)) / max(1, int(horizon_len)))
+        return max(0.0, gmax - float(yhat_val)) * ramp
+
+    if (
+        forecast_month is None
+        or ds_hist is None
+        or len(ds_hist) != len(ypos)
+    ):
+        return None, _sparse_ramp_floor()
+
+    ds = pd.to_datetime(pd.Series(ds_hist).reset_index(drop=True))
+    months = ds.dt.month.to_numpy()
+    # Same-month values across years, zeros included: a year where the event did
+    # not happen is evidence, and dropping it makes a stale peak look current.
+    same_mask = months == int(forecast_month)
+    if int(np.sum(same_mask)) < 2:
+        return None, _sparse_ramp_floor()
+    order = np.argsort(ds[same_mask].to_numpy())
+    same_vals = ypos[same_mask][order]
+
+    occurred = same_vals > 0.0
+    p_event = _event_probability(occurred[::-1])
+    mags = same_vals[occurred]
+
+    if len(mags) >= 2:
+        # This month recurs: use its own magnitudes, newest weighted heaviest.
+        mag_w = (_EVENT_DISCOUNT_LAMBDA ** np.arange(len(mags), dtype=float))[::-1]
+        # Headroom beyond the observed max equal to the month's own year-over-year
+        # growth (nothing for a flat or declining month).
+        growth = 0.0
+        if float(mags[-2]) > 0.0:
+            growth = min(0.2, max(0.0, (float(mags[-1]) - float(mags[-2])) / float(mags[-2])))
+        ceiling = float(mags.max()) * (1.0 + growth)
+        return _mixture_limits(p_event, mags, mag_w, ceiling, yhat_val), 0.0
+
+    if n_pos <= 3:
+        # Single-spike series: we know a spike can come but not when, so the band
+        # grows with the horizon instead of claiming to know the season.
+        return None, _sparse_ramp_floor()
+
+    # Month has never (or only once) sold while the item trades in other months.
+    # A zero-width interval here would assert certainty of no sales, so borrow the
+    # scale of the item's quiet trade and keep this month's own low probability.
+    pool = _offpeak_positive_pool(ypos, months)
+    if len(mags) == 1:
+        pool = np.concatenate([pool, mags])
+    if len(pool) == 0:
+        return None, 0.0
+    return (
+        _mixture_limits(p_event, pool, np.ones(len(pool)), float(pool.max()), yhat_val),
+        0.0,
+    )
+
+
+def _historical_excess_quantiles(
+    y: np.ndarray,
+    ds: Optional[pd.Series] = None,
+    *,
+    lookback: int = 36,
+) -> dict[str, float]:
+    """Quantiles of positive forecast excess from trailing history."""
+    y = np.asarray(y, dtype=float)
+    if len(y) == 0:
+        return {}
+    tail = y[-lookback:] if len(y) > lookback else y
+    excesses: list[float] = []
+    baselines: list[float] = []
+    if ds is not None and len(ds) == len(y):
+        ds_tail = pd.to_datetime(ds.iloc[-len(tail):])
+        months = ds_tail.dt.month.to_numpy()
+        for i, val in enumerate(tail):
+            if not np.isfinite(val):
+                continue
+            same_month = tail[months == months[i]]
+            baseline = float(np.mean(same_month)) if len(same_month) > 0 else float(np.mean(tail))
+            if baseline <= 0:
+                baseline = float(np.median(tail[tail > 0])) if np.any(tail > 0) else 1.0
+            excesses.append(max(0.0, float(val) - baseline))
+            baselines.append(baseline)
+    else:
+        baseline = float(np.median(tail[tail > 0])) if np.any(tail > 0) else float(np.mean(tail))
+        if baseline <= 0:
+            baseline = 1.0
+        for v in tail:
+            if np.isfinite(v):
+                excesses.append(max(0.0, float(v) - baseline))
+                baselines.append(baseline)
+    return _excess_quantiles_from_values(excesses, baselines)
+
+
+def _last_resort_upper_excess(yhat_val: float, y_hist: Optional[np.ndarray] = None) -> float:
+    """Uncalibrated last-resort excess above yhat when no conformal/CV/history quantiles."""
+    if y_hist is not None and len(y_hist) >= 6:
+        recent = np.asarray(y_hist[-12:], dtype=float)
+        recent = recent[np.isfinite(recent)]
+        if len(recent) > 0:
+            mean_y = float(np.mean(recent))
+            if mean_y > 0:
+                cv_y = float(np.std(recent) / mean_y)
+                return max(yhat_val * 0.5, 2.0 * cv_y * yhat_val, 1.0)
+    return max(yhat_val * 0.5, 1.0)
+
+
+def _attach_upper_quantiles(
+    yhat: np.ndarray,
+    fcst: pd.DataFrame,
+    model_name: str,
+    *,
+    uid_series: Optional[pd.Series] = None,
+    ds_series: Optional[pd.Series] = None,
+    cv_excess_by_uid: Optional[dict[str, dict[str, float]]] = None,
+    historical_excess_by_uid: Optional[dict[str, dict[str, float]]] = None,
+    y_hist_by_uid: Optional[dict[str, np.ndarray]] = None,
+    ds_hist_by_uid: Optional[dict[str, pd.Series]] = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Attach upper_70/90/95 combining conformal columns and residual/history bands.
+
+    StatsForecast conformal intervals here calibrate on very few residuals per
+    horizon step (1-5 windows), which empirically under-covers. The CV holdout /
+    historical excess band uses a larger sample, so when both are available we
+    take the elementwise max (each is a valid upper bound; max preserves the
+    stronger coverage).
+    """
+    yhat = np.asarray(yhat, dtype=float)
+    n = len(yhat)
+    u70 = _upper_column_from_fcst(fcst, model_name, 70)
+    u90 = _upper_column_from_fcst(fcst, model_name, 90)
+    u95 = _upper_column_from_fcst(fcst, model_name, 95)
+
+    # Residual/history band per row: fallback when conformal is missing,
+    # backstop (max) when it is present but thinly calibrated.
+    r95 = np.full(n, np.nan)
+    r90 = np.full(n, np.nan)
+    r70 = np.full(n, np.nan)
+    lim = {70: np.full(n, np.nan), 90: np.full(n, np.nan), 95: np.full(n, np.nan)}
+    horizon_pos_by_uid: dict[str, int] = {}
+    horizon_len_by_uid: dict[str, int] = {}
+    if uid_series is not None:
+        for u, cnt in uid_series.astype(str).value_counts().items():
+            horizon_len_by_uid[str(u)] = int(cnt)
+    for i in range(n):
+        uid = str(uid_series.iloc[i]) if uid_series is not None else None
+        cv_q: dict[str, float] = {}
+        hist_q: dict[str, float] = {}
+        if uid and cv_excess_by_uid:
+            cv_q = cv_excess_by_uid.get(uid) or {}
+        if uid and historical_excess_by_uid:
+            hist_q = historical_excess_by_uid.get(uid) or {}
+        q = _merge_excess_quantile_dicts(cv_q, hist_q)
+        yh = float(yhat[i])
+        y_hist = y_hist_by_uid.get(uid) if uid and y_hist_by_uid else None
+        ds_hist = ds_hist_by_uid.get(uid) if uid and ds_hist_by_uid else None
+        forecast_month: Optional[int] = None
+        if ds_series is not None and i < len(ds_series):
+            try:
+                forecast_month = int(pd.Timestamp(ds_series.iloc[i]).month)
+            except Exception:
+                forecast_month = None
+        h_pos = horizon_pos_by_uid.get(uid or '', 0) + 1
+        horizon_pos_by_uid[uid or ''] = h_pos
+        h_len = max(horizon_len_by_uid.get(uid or '', n), 12)
+        month_limits, spike_floor = _event_month_limits(
+            y_hist,
+            yh,
+            ds_hist=ds_hist,
+            forecast_month=forecast_month,
+            horizon_pos=h_pos,
+            horizon_len=h_len,
+        )
+        if month_limits:
+            for key, arr in lim.items():
+                arr[i] = float(month_limits[key])
+        if q:
+            e95 = _residual_excess_for_level(q, 'q95', yh)
+            e90 = _residual_excess_for_level(q, 'q90', yh)
+            e70 = _residual_excess_for_level(q, 'q70', yh)
+            if e95 is None:
+                e95 = _last_resort_upper_excess(yh, y_hist)
+            e95 = max(float(e95), spike_floor)
+            if e90 is None:
+                e90 = 0.8 * e95
+            else:
+                e90 = max(float(e90), 0.8 * spike_floor)
+            if e70 is None:
+                e70 = 0.4 * e95
+            else:
+                e70 = max(float(e70), 0.4 * spike_floor)
+            r95[i] = yh + e95
+            r90[i] = yh + e90
+            r70[i] = yh + e70
+        elif u95 is None or spike_floor > 0.0:
+            # Last resort / spike floor: uncalibrated when conformal & residual
+            # bands are missing; still apply same-month hist-max floor when present.
+            excess = _last_resort_upper_excess(yh, y_hist) if u95 is None else 0.0
+            excess = max(float(excess), spike_floor)
+            r95[i] = yh + excess
+            r90[i] = yh + 0.8 * excess
+            r70[i] = yh + 0.4 * excess
+
+    # np.fmax ignores NaN, so rows without residual info keep the conformal value.
+    u95 = r95 if u95 is None else np.fmax(u95, r95)
+    u90 = r90 if u90 is None else np.fmax(u90, r90)
+    u70 = r70 if u70 is None else np.fmax(u70, r70)
+
+    u95 = np.nan_to_num(np.asarray(u95, dtype=float), nan=0.0)
+    upper_95 = np.maximum(np.maximum(u95, yhat), 0.0)
+    # Event months: the mixture limit derived from that month's own recurrence
+    # history replaces the residual/conformal band, which is calibrated across
+    # all months and cannot see whether this one fires. Where the point forecast
+    # already exceeds the limit the month's history says nothing useful about the
+    # error, so the model's own band is kept rather than collapsing to zero width.
+    has_lim = np.isfinite(lim[95]) & (lim[95] > yhat)
+    if np.any(has_lim):
+        upper_95 = np.where(has_lim, lim[95], upper_95)
+    gap = np.maximum(0.0, upper_95 - yhat)
+    # Rows still NaN at 90/70 (conformal missing those levels, no residual info)
+    # fall back to a proportional share of the 95 gap.
+    u90 = np.where(np.isnan(u90), yhat + 0.8 * gap, u90)
+    u70 = np.where(np.isnan(u70), yhat + 0.4 * gap, u70)
+    if np.any(has_lim):
+        u90 = np.where(has_lim, np.maximum(lim[90], yhat), u90)
+        u70 = np.where(has_lim, np.maximum(lim[70], yhat), u70)
+    upper_90 = np.maximum(np.maximum(u90, yhat), 0.0)
+    upper_70 = np.maximum(np.maximum(u70, yhat), 0.0)
+    upper_90 = np.minimum(upper_90, upper_95)
+    upper_70 = np.minimum(upper_70, upper_90)
+    return upper_70, upper_90, upper_95
+
+
 def _build_candidate_model_factories(season_length: int) -> list[tuple[str, Callable[[], object]]]:
     """Candidate StatsForecast model factories (explicitly excludes TimeGPT/LightGPT).
 
@@ -575,6 +1134,98 @@ def _regularize_panel_extend_end(freq: str, data_max: pd.Timestamp) -> pd.Timest
         dm = pd.to_datetime(data_max)
         return max(dm, anchor)
     return pd.to_datetime(data_max)
+
+
+def _trim_panel_pre_gap(df: pd.DataFrame, freq: str, *, gap_threshold_months: int = 12) -> pd.DataFrame:
+    """Trim history before any large contiguous-zero block (data gap).
+
+    Real production data often has multi-month "holes" — periods where sales
+    weren't tracked, the SKU was paused, or imports were skipped — that
+    ``_regularize_panel_time_index`` fills with zero. To downstream models
+    that's indistinguishable from a real off-season, but it poisons CV
+    scoring for seasonal models:
+
+      * SeasonalNaive's lag-12 lookup hits zero-filled rows on one side of
+        the gap and real values on the other, producing garbage WAPE.
+      * Theta / AutoETS see a non-stationary level and pick degenerate
+        configurations.
+      * HistoricAverage's mean is dragged down by the zero block.
+
+    The pragmatic fix: when a contiguous run of ``>= gap_threshold_months``
+    zero months exists, treat everything before it as pre-gap history and
+    drop it. The post-gap block is what reflects current demand. Items
+    without large gaps are returned unchanged.
+
+    Concrete example (production item Kjoris_1/106501):
+      raw rows span Jan 2022 – May 2026 with all of 2023 missing → 12-month
+      zero block after regularization. Trimming leaves Jan 2024 – May 2026
+      (29 months), which the dead-zone gate then routes to the seasonal-
+      aware mini-CV instead of a flat HistoricAverage that ignores the
+      Jul 2024 = 3795 / Jul 2025 = 3920 peaks.
+
+    Threshold rationale: 12 months catches genuine year-long gaps while
+    leaving real off-season runs untouched. Even narrow event-seasonal
+    items (Christmas-only) have at most ~10 contiguous zero months in any
+    given year because the peak is in December; a 12-month zero run is
+    diagnostic of missing data rather than seasonality.
+
+    Notes:
+      * Operates per ``unique_id``; gaps in one series don't affect others.
+      * Only the *most recent* gap is used as the trim cutoff. If a series
+        has multiple gaps, all pre-most-recent-gap data is dropped.
+      * Series with all-zero history are unchanged (no real data to keep).
+    """
+    if df.empty or int(gap_threshold_months) <= 0:
+        return df
+    if canonical_forecaster_freq(freq) != 'MS':
+        return df  # gap detection is monthly-specific
+    out_parts: list[pd.DataFrame] = []
+    for uid, g in df.groupby('unique_id', sort=False):
+        g = g.sort_values('ds').reset_index(drop=True)
+        y = pd.to_numeric(g['y'], errors='coerce').fillna(0.0).to_numpy(dtype=float)
+        n = len(y)
+        if n == 0 or not np.any(y > 0.0):
+            out_parts.append(g)
+            continue
+        # Find contiguous zero-runs and their (start_idx, end_idx_exclusive).
+        # We walk the array once, tracking runs that are flanked by real data
+        # on both sides (a leading zero block isn't a "gap" — it's launch
+        # phase, which the leading-zero-trim handler downstream addresses).
+        first_pos = int(np.argmax(y > 0.0))
+        last_pos = n - 1 - int(np.argmax(y[::-1] > 0.0))
+        if last_pos <= first_pos:
+            out_parts.append(g)
+            continue
+
+        # Default: no trim. Leading zeros (before ``first_pos``) are
+        # explicitly NOT a gap — that's launch-phase, handled by the
+        # leading-zero trim downstream (``y_eff = y_full[first_pos:]``).
+        # Only zero runs flanked by real data on both sides count.
+        cutoff_idx = 0
+        in_run = False
+        run_start = 0
+        for i in range(first_pos, last_pos + 1):
+            if y[i] <= 0.0:
+                if not in_run:
+                    in_run = True
+                    run_start = i
+            elif in_run:
+                in_run = False
+                run_len = i - run_start
+                if run_len >= int(gap_threshold_months):
+                    # Trim cutoff: end of the gap (this i, the first real
+                    # observation after the gap). Use the LATEST gap end
+                    # encountered so we keep only the most recent block.
+                    cutoff_idx = i
+
+        if cutoff_idx > 0:
+            g = g.iloc[cutoff_idx:].reset_index(drop=True)
+        out_parts.append(g)
+
+    if not out_parts:
+        return df
+    out = pd.concat(out_parts, ignore_index=True)
+    return out.sort_values(['unique_id', 'ds']).reset_index(drop=True)
 
 
 def _regularize_panel_time_index(df: pd.DataFrame, freq: str) -> pd.DataFrame:
@@ -856,6 +1507,237 @@ def _auto_model_detect_sparse_noise(
                 return False
 
     return True
+
+
+def _auto_model_event_seasonal_dead_zone_select(
+    g_uid: pd.DataFrame,
+    *,
+    h: int,
+    season_length: int,
+    n_obs: int,
+    freq: str,
+) -> tuple[Optional[str], dict[str, Any]]:
+    """Run a small per-uid CV to pick a model for event-seasonal items in the
+    "CV dead zone" (24-37 months on monthly h>=12 data).
+
+    The bucket-level seasonal CV uses ``cv_h = min(h, season_length)`` which
+    sets the per-model min-obs gate for ``SeasonalNaive`` to ~38 months.
+    Items below that threshold get SN/SWA/AutoARIMA filtered out and the pool
+    collapses to AutoETS + HistoricAverage. AutoETS on 1-2 cycles typically
+    picks a non-seasonal config and forecasts a flat low line.
+
+    This helper runs a relaxed CV with a shorter horizon so SN qualifies, and
+    scores it against a small set of seasonal-aware alternatives:
+
+      - SeasonalNaive: lag-12 baseline.
+      - AutoETS: searches (E, T, S) by AICc; on 2 cycles usually drops the
+        seasonal component but may pick (A, A, N) for clearly trending items.
+      - Theta / OptimizedTheta: classical seasonal decomposition; estimates
+        seasonal indices by averaging same-month values, more robust on
+        short series than AutoETS's MLE.
+      - HistoricAverage: honest level fallback.
+
+    Returns ``(best_model_name, debug_info)``. ``best_model_name`` is the
+    StatsForecast class name suitable for ``best_by_uid[uid] = ...``. If CV
+    cannot be run (insufficient data even at the relaxed cv_h, or all models
+    raise), returns ``(None, ...)`` and the caller should fall back to a
+    deterministic SN pick.
+    """
+    try:
+        from statsforecast import StatsForecast  # local import: speed
+    except Exception as e:  # pragma: no cover - statsforecast is a hard dep
+        return None, {'reason': 'cv_failed', 'error': str(e)}
+
+    # Adaptive CV settings: smaller cv_h to fit SN at min-obs <= n_obs.
+    # For h >= 6 use cv_h = 6; otherwise mirror h. Two windows when feasible
+    # (n_obs >= 26 with cv_h=6), single window otherwise so n_obs in [24, 25]
+    # still gets evaluated.
+    dz_cv_h = max(1, int(min(h, 6)))
+    sn_min_obs_two = dz_cv_h * 2 + 2 + int(season_length)
+    dz_n_windows = 2 if int(n_obs) >= int(sn_min_obs_two) else 1
+
+    # Hard floor: even single-window CV needs cv_h + 2 + season for SN to
+    # have any training data. If n_obs is below that, bail out.
+    sn_min_obs_one = dz_cv_h + 2 + int(season_length)
+    if int(n_obs) < int(sn_min_obs_one):
+        return None, {
+            'reason': 'cv_failed',
+            'detail': 'n_obs_below_sn_min_obs_one_window',
+            'n_obs': int(n_obs),
+            'sn_min_obs_one': int(sn_min_obs_one),
+        }
+
+    models_dict = _lazy_import_nixtla_models()
+    candidates: list[tuple[str, Callable[[], object]]] = [
+        ('SeasonalNaive', lambda: models_dict['seasonal_naive'](season_length=season_length)),
+        ('AutoETS', lambda: models_dict['auto_ets'](season_length=season_length)),
+        ('Theta', lambda: models_dict['theta'](season_length=season_length)),
+        ('OptimizedTheta', lambda: models_dict['optimized_theta'](season_length=season_length)),
+        ('HistoricAverage', lambda: models_dict['historic_average']()),
+    ]
+
+    df_uid = g_uid.loc[:, ['unique_id', 'ds', 'y']].copy()
+    df_uid['unique_id'] = df_uid['unique_id'].astype(str)
+
+    scores: dict[str, float] = {}
+    biases: dict[str, float] = {}
+    for name, factory in candidates:
+        try:
+            sf_one = StatsForecast(models=[factory()], freq=freq, n_jobs=1)
+            cv = sf_one.cross_validation(
+                df=df_uid,
+                h=int(dz_cv_h),
+                step_size=int(dz_cv_h),
+                n_windows=int(dz_n_windows),
+            )
+        except Exception:
+            continue
+        if name not in cv.columns:
+            continue
+        y_true = pd.to_numeric(cv['y'], errors='coerce').to_numpy(dtype=float)
+        y_hat = pd.to_numeric(cv[name], errors='coerce').to_numpy(dtype=float)
+        wape, bias = _safe_wape_and_bias(y_true, y_hat)
+        if not np.isfinite(wape):
+            continue
+        scores[name] = float(wape)
+        biases[name] = float(bias)
+
+    if not scores:
+        return None, {
+            'reason': 'cv_failed',
+            'detail': 'all_models_raised_or_unscored',
+            'dz_cv_h': int(dz_cv_h),
+            'dz_n_windows': int(dz_n_windows),
+        }
+
+    # Lag-family vs non-lag carve-out.
+    #
+    # Theta / OptimizedTheta / AutoETS estimate seasonality from the data.
+    # On <3 cycles their seasonal decomposition is unreliable: they often
+    # win CV on a 6-month holdout (mostly off-season months) but their
+    # 12-step forecast collapses to a near-flat extrapolation that
+    # completely misses the next peak. Concrete failure observed on real
+    # production items 103402/103403 (28 months, leading zeros): Theta's
+    # CV WAPE 0.501 beat SN 0.556 by 11%, but Theta's Jul forecast was
+    # 19.6 vs SN+peak_ratio's 353 — an order-of-magnitude undershoot.
+    #
+    # Require a stronger advantage on short series so SN is the default
+    # pivot when seasonality is detected but data is sparse. SN combined
+    # with the peak_ratio post-correction handles year-over-year
+    # growth/decline without depending on trend extrapolation.
+    cycles = float(n_obs) / float(season_length) if season_length > 0 else 0.0
+    sn_advantage_required = 0.05 if cycles >= 3.0 else 0.20
+    sn_wape = scores.get('SeasonalNaive')
+    other_best_score = min(
+        (v for k, v in scores.items() if k != 'SeasonalNaive'),
+        default=None,
+    )
+    sn_unavailable = sn_wape is None or not np.isfinite(sn_wape)
+    if sn_unavailable:
+        # SN couldn't be scored (too few observations even at relaxed cv_h);
+        # fall back to the best of whatever did score.
+        best = min(scores.keys(), key=lambda k: scores[k])
+    elif (
+        other_best_score is not None
+        and other_best_score > 0
+        and (sn_wape - other_best_score) / max(other_best_score, 1e-9) > sn_advantage_required
+    ):
+        # Non-lag candidate beats SN by more than the required advantage —
+        # promote the non-lag winner. On <3 cycles the threshold is 20% so
+        # we don't fall for short-data Theta/AutoETS that win CV but
+        # extrapolate to a flat forecast.
+        best = min(
+            (k for k in scores.keys() if k != 'SeasonalNaive'),
+            key=lambda k: scores[k],
+        )
+    else:
+        # SN is the safe pivot: either it has the lowest WAPE or no non-lag
+        # candidate beats it by enough margin to be trusted on this much
+        # data. The peak_ratio post-correction will adjust for YoY trend.
+        best = 'SeasonalNaive'
+
+    return best, {
+        'reason': 'event_seasonal_dead_zone_cv',
+        'picked': best,
+        'scores': {k: float(v) for k, v in scores.items()},
+        'biases': {k: float(v) for k, v in biases.items()},
+        'dz_cv_h': int(dz_cv_h),
+        'dz_n_windows': int(dz_n_windows),
+        'n_obs': int(n_obs),
+        'cycles': float(cycles),
+        'sn_advantage_required': float(sn_advantage_required),
+    }
+
+
+def _auto_model_compute_peak_ratio(
+    g_uid: pd.DataFrame,
+    *,
+    season_length: int,
+    min_clip: float = 0.7,
+    max_clip: float = 1.4,
+) -> Optional[float]:
+    """Year-over-year peak-month volume ratio, used to scale a SeasonalNaive
+    forecast for event-seasonal items in the dead zone.
+
+    Identifies the peak month (highest total volume across all years) and
+    returns ``current_year_peak / prior_year_peak`` clipped to a conservative
+    band so noise on a single peak can't blow up the forecast.
+
+    Returns ``None`` when:
+      - history is too short for two full seasonal cycles
+      - either the current or prior year peak observation is missing
+      - the prior year peak is non-positive (avoid divide-by-near-zero)
+
+    The clip range ``[0.7, 1.4]`` is intentionally conservative: with only
+    two cycles the ratio has high sampling variance, so we limit the
+    correction to ±30-40%. For items with three or more cycles the ratio
+    is averaged across the available pairs (more robust); the mini-CV in
+    ``_auto_model_event_seasonal_dead_zone_select`` is the primary
+    differentiator and this correction is a small additional nudge.
+    """
+    try:
+        ds_pd = pd.to_datetime(g_uid['ds'], errors='coerce').reset_index(drop=True)
+    except Exception:
+        return None
+    y = pd.to_numeric(g_uid['y'], errors='coerce').reset_index(drop=True)
+    if len(y) < 2 * int(season_length):
+        return None
+
+    # Find the peak month by total volume across all years.
+    nz = y > 0.0
+    if not bool(nz.any()):
+        return None
+    df_local = pd.DataFrame({'ds': ds_pd, 'y': y, 'm': ds_pd.dt.month, 'yr': ds_pd.dt.year})
+    vol_by_month = df_local.loc[nz, :].groupby('m')['y'].sum()
+    if vol_by_month.empty:
+        return None
+    peak_month = int(vol_by_month.idxmax())
+
+    peak_obs = (
+        df_local.loc[df_local['m'] == peak_month, ['yr', 'y']]
+        .groupby('yr', as_index=True)['y']
+        .sum()
+        .sort_index()
+    )
+    if len(peak_obs) < 2:
+        return None
+
+    # Pairwise ratios across consecutive years; average for robustness.
+    years = peak_obs.index.to_list()
+    ratios: list[float] = []
+    for i in range(1, len(years)):
+        prev = float(peak_obs.iloc[i - 1])
+        curr = float(peak_obs.iloc[i])
+        if prev <= 1e-9:
+            continue
+        ratios.append(float(curr / prev))
+    if not ratios:
+        return None
+
+    ratio = float(np.mean(ratios))
+    if not np.isfinite(ratio) or ratio <= 0:
+        return None
+    return float(np.clip(ratio, float(min_clip), float(max_clip)))
 
 
 def _auto_model_exclude_seasonal_naive(
@@ -1241,14 +2123,7 @@ class ClassicalForecasts:
         # Fit and forecast. StatsForecast 2.x requires prediction_intervals when level is passed.
         sf.fit(df)
         try:
-            from statsforecast.utils import ConformalIntervals
-            n_windows = 2
-            min_len = df.groupby('unique_id').size().min() if 'unique_id' in df.columns else len(df)
-            if min_len > n_windows * h:
-                intervals = ConformalIntervals(h=h, n_windows=n_windows)
-                fcst = sf.forecast(h=h, df=df, level=[70, 90, 95], prediction_intervals=intervals)
-            else:
-                fcst = sf.forecast(h=h, df=df)
+            fcst = _statsforecast_forecast_with_conformal(sf, df, h)
         except Exception:
             fcst = sf.forecast(h=h, df=df)
         
@@ -1266,29 +2141,19 @@ class ClassicalForecasts:
         forecast_col = forecast_cols[0]
         yhat = fcst[forecast_col].to_numpy(dtype=float)
 
-        def _upper_for(level: int) -> Optional[np.ndarray]:
-            col = f"{forecast_col}-hi-{level}"
-            if col in fcst.columns:
-                return fcst[col].to_numpy(dtype=float)
-            cands = [c for c in fcst.columns if c.endswith(f"-hi-{level}")]
-            if cands:
-                return fcst[cands[0]].to_numpy(dtype=float)
-            return None
-
-        # Prefer StatsForecast intervals when available; otherwise derive from a conservative fallback.
-        u95 = _upper_for(95)
-        if u95 is None:
-            u95 = np.maximum(yhat * 1.5, yhat + 1.0)
-        upper_95 = np.maximum(np.maximum(u95, yhat), 0.0)
-
-        u90 = _upper_for(90)
-        u70 = _upper_for(70)
-        gap = np.maximum(0.0, upper_95 - yhat)
-        upper_90 = np.maximum(np.maximum(u90 if u90 is not None else (yhat + 0.8 * gap), yhat), 0.0)
-        upper_70 = np.maximum(np.maximum(u70 if u70 is not None else (yhat + 0.4 * gap), yhat), 0.0)
-        # Enforce nesting: yhat <= upper_70 <= upper_90 <= upper_95
-        upper_90 = np.minimum(upper_90, upper_95)
-        upper_70 = np.minimum(upper_70, upper_90)
+        hist_q = _historical_excess_quantiles(df['y'].to_numpy(), df['ds'])
+        y_hist = {'item': df['y'].to_numpy(dtype=float)}
+        ds_hist = {'item': pd.Series(pd.to_datetime(df['ds']))}
+        upper_70, upper_90, upper_95 = _attach_upper_quantiles(
+            yhat,
+            fcst,
+            forecast_col,
+            uid_series=pd.Series(['item'] * len(yhat)),
+            ds_series=pd.Series(future_ds),
+            historical_excess_by_uid={'item': hist_q} if hist_q else None,
+            y_hist_by_uid=y_hist,
+            ds_hist_by_uid=ds_hist,
+        )
         
         out = pd.DataFrame({
             'ds': future_ds,
@@ -1378,6 +2243,17 @@ class ClassicalForecasts:
         if df.empty:
             raise ValueError('Empty history after regularization')
 
+        # Trim history before any large data gap (>=12 contiguous zero months
+        # after regularization). On real catalogs, ~46% of items can have
+        # year-long calendar gaps in their imports — these poison
+        # SeasonalNaive's lag-12 alignment and unfairly favor flat models
+        # like HistoricAverage. Keeping only the post-most-recent-gap block
+        # restores honest CV scoring for seasonal candidates without
+        # affecting items that don't have gaps.
+        df = _trim_panel_pre_gap(df, freq=str(self.freq))
+        if df.empty:
+            raise ValueError('Empty history after pre-gap trim')
+
         metric_name, metric_fn = _metric_func_from_name(metric)
 
         is_monthly = canonical_forecaster_freq(str(self.freq)) == 'MS'
@@ -1423,6 +2299,11 @@ class ClassicalForecasts:
         bucket_by_uid: dict[str, str] = {}
         exclude_seasonal_naive_uid: dict[str, bool] = {}
         dead_sku_uid: set[str] = set()
+        # Peak-ratio correction for event-seasonal items in the dead zone where
+        # SeasonalNaive won the mini-CV. Maps uid -> multiplicative scalar
+        # (clipped) applied to SN's forecast at output time so that genuinely
+        # growing items don't get pinned to last year's value.
+        peak_ratio_correction_uid: dict[str, float] = {}
 
         def _looks_event_seasonal(g: pd.DataFrame, season_length: int) -> bool:
             """Heuristic: demand volume mostly concentrated in 1-2 calendar months each year.
@@ -1583,6 +2464,148 @@ class ClassicalForecasts:
             # legacy ``exclude_seasonal_naive_uid`` flag (the rerank function
             # strips the whole _LAG_FAMILY_MODELS set when this is True).
             exclude_seasonal_naive_uid[uid] = ex_sn
+
+            # Event-seasonal items in the CV "dead zone".
+            #
+            # On monthly data the seasonal CV bucket runs with bucket_cv_h =
+            # min(h, season_for_models) (line ~1851). For h>=12 that's a
+            # 12-step CV horizon, which pushes ``_min_obs_for_model_cv`` for
+            # SeasonalNaive (``base + season``) to ~38 months. Items with
+            # 24-37 months of *panel* history therefore have SN/SWA/AutoARIMA
+            # filtered out before CV; the seasonal pool collapses to AutoETS
+            # + HistoricAverage, AutoETS picks a non-seasonal config on 1-2
+            # cycles of training data, and the forecast is a flat low line
+            # that misses the next peak.
+            #
+            # We also short-circuit items that would otherwise land in the
+            # ``'smooth'`` bucket (n_eff < 24 due to leading zeros). That
+            # bucket's pool doesn't include SeasonalNaive at all, so an
+            # event-seasonal SKU with first sale ~6 months in (e.g. summer-
+            # only Kjörís) would silently get AutoETS-flat. This gate uses
+            # ``n_obs`` (full regularized panel) rather than ``n_eff`` so
+            # leading zeros don't disqualify it — SN forecasts the requested
+            # horizon h<=12 by lagging into real data, not the leading zeros.
+            #
+            # Conditions:
+            #   - is_monthly (gate is monthly-specific by construction)
+            #   - yearly seasonality detected by EITHER detector:
+            #       * event_seasonal_uid: strict — single-month dominant
+            #         peak (top1 share >= 0.45) with recurrence in >=2 years.
+            #         Catches narrow-event items (Christmas, ramp-events).
+            #       * _strong_yearly_seasonality(y_full): broad — lag-12
+            #         correlation >= 0.38 on the full panel. Catches broad
+            #         seasonal humps (e.g. ice-cream summer season Apr-Sep
+            #         peaking in Jul) where no single month exceeds 45% of
+            #         volume share but the year-over-year shape repeats.
+            #         Verified on production items 103401-103403, 104318:
+            #         top1=0.25-0.34 (fail strict) but lag-12 corr passes.
+            #     Using OR rather than AND: both detectors are conservative
+            #     in their own way (concentration threshold vs correlation
+            #     threshold) and miss legitimate seasonal items each.
+            #   - not exclude_seasonal_naive_uid (dead tail / YoY collapse /
+            #     lag-vs-recent regime mismatch all bypassed for event-
+            #     seasonal upstream, but checked defensively)
+            #   - 2*season <= n_obs < sn_gate: long enough for either
+            #     detector to even run, short enough that the seasonal CV
+            #     path filters SN out.
+            yearly_seasonal_for_dz = bool(
+                event_seasonal_uid.get(uid, False)
+            ) or bool(
+                _strong_yearly_seasonality(y_full, int(season_for_models))
+            )
+            if (
+                is_monthly
+                and yearly_seasonal_for_dz
+                and not exclude_seasonal_naive_uid.get(uid, False)
+            ):
+                # Mirror the bucket_cv_h that the seasonal CV path uses
+                # (line ~1851: min(h, season_for_models)) so this gate fires
+                # iff the CV path would otherwise filter SN out.
+                _bucket_cv_h_seasonal = max(1, int(min(h, season_for_models)))
+                _sn_filter_gate = (
+                    _bucket_cv_h_seasonal * max(1, int(n_windows))
+                    + 2
+                    + int(season_for_models)
+                )
+                # The gate must fire for two distinct failure modes:
+                #   (1) SN would be filtered out by min-obs (covered by
+                #       _sn_filter_gate above; depends on n_windows).
+                #   (2) Standard CV is unreliable on the well-known monthly
+                #       dead zone [2*season, 3*season+h] — particularly when
+                #       n_windows=1 (which the API uses by default for
+                #       season_length=forecast_periods=12). With a single
+                #       12-month holdout, leading-zero alignment can poison
+                #       SN's lag-12 baseline and Naive wins by predicting a
+                #       flat last value. Verified on production items
+                #       103401-103403, 104318: n_obs=28, n_windows=1 →
+                #       _sn_filter_gate=26 misses them; without the dead-zone
+                #       upper bound, the gate skips and SN never gets a fair
+                #       comparison. The mini-CV uses smaller cv_h + multiple
+                #       windows internally so it is robust to this regime.
+                _dead_zone_upper = 3 * int(season_for_models) + int(h)
+                _sn_gate = max(_sn_filter_gate, _dead_zone_upper)
+                if 2 * int(season_for_models) <= int(n_obs) < int(_sn_gate):
+                    # Run a relaxed mini-CV (smaller cv_h so SN is eligible)
+                    # over a small set of seasonal-aware candidates. Pick the
+                    # winner by WAPE with a small lag-family advantage
+                    # requirement; SeasonalNaive wins for items where last
+                    # year is the best estimate of next year, Theta /
+                    # OptimizedTheta / AutoETS for items with a clear trend.
+                    dz_pick, dz_info = _auto_model_event_seasonal_dead_zone_select(
+                        g_uid,
+                        h=int(h),
+                        season_length=int(season_for_models),
+                        n_obs=int(n_obs),
+                        freq=str(self.freq),
+                    )
+                    if dz_pick is None:
+                        # Fallback: deterministic SN. The CV path further
+                        # downstream would have left this item with AutoETS-
+                        # flat or HistoricAverage; SN is at least
+                        # seasonally-aware.
+                        best_by_uid[uid] = 'SeasonalNaive'
+                        dz_info = dict(dz_info or {})
+                        dz_info.update(
+                            {
+                                'reason': dz_info.get('reason', 'cv_failed'),
+                                'picked': 'SeasonalNaive',
+                                'fallback': True,
+                            }
+                        )
+                    else:
+                        best_by_uid[uid] = dz_pick
+
+                    # Peak-ratio correction is a post-forecast nudge for the
+                    # SN winners only — Theta/AutoETS already model trend
+                    # internally, so applying a multiplicative ratio on top
+                    # would double-count. The correction is conservative
+                    # (clipped to [0.7, 1.4]) so it can't blow up the
+                    # forecast on noisy single-cycle ratios.
+                    if best_by_uid[uid] == 'SeasonalNaive':
+                        ratio = _auto_model_compute_peak_ratio(
+                            g_uid, season_length=int(season_for_models)
+                        )
+                        if ratio is not None and abs(float(ratio) - 1.0) > 1e-3:
+                            peak_ratio_correction_uid[uid] = float(ratio)
+
+                    if debug:
+                        debug_entry: dict[str, Any] = {
+                            'reason': 'event_seasonal_cv_dead_zone',
+                            'picked': best_by_uid[uid],
+                            'n_obs': int(n_obs),
+                            'sn_gate': int(_sn_gate),
+                            'season_for_models': int(season_for_models),
+                            'bucket_cv_h_seasonal': int(_bucket_cv_h_seasonal),
+                            'n_windows': int(n_windows),
+                        }
+                        debug_entry.update(dz_info or {})
+                        if uid in peak_ratio_correction_uid:
+                            debug_entry['peak_ratio'] = float(
+                                peak_ratio_correction_uid[uid]
+                            )
+                        debug_reason[uid] = debug_entry
+                    continue
+
             prof = _series_profile(y_eff)
             bucket = _bucket_series(prof, season_length=season_for_models, min_arima_len=min_arima_len)
             n_eff = int(prof.get('n', float(len(y_eff))))  # effective history length
@@ -1838,6 +2861,8 @@ class ClassicalForecasts:
         # {uid: {model_name: [wape_window_0, wape_window_1, ...]}}.
         wape_per_window_map: dict[str, dict[str, list[float]]] = {uid: {} for uid in counts.index}
         metric_scores: dict[str, dict[str, float]] = {uid: {} for uid in counts.index}
+        # Per uid/model: (positive excess, predicted level) pairs from CV holdouts.
+        cv_excess_by_uid_model: dict[str, dict[str, list[tuple[float, float]]]] = {str(uid): {} for uid in counts.index}
 
         # Score each bucket with per-model CV (robust to individual model failures).
         for bucket, uids in buckets.items():
@@ -1902,6 +2927,18 @@ class ClassicalForecasts:
                         step_size=bucket_cv_h,
                         n_windows=bucket_n_windows,
                     )
+
+                    if model_name in cv.columns:
+                        for uid, g in cv.groupby('unique_id', sort=False):
+                            y_cv = g['y'].to_numpy(dtype=float)
+                            yhat_cv = g[model_name].to_numpy(dtype=float)
+                            pairs = [
+                                (max(0.0, float(yi - yhi)), float(yhi))
+                                for yi, yhi in zip(y_cv, yhat_cv)
+                                if np.isfinite(yi) and np.isfinite(yhi)
+                            ]
+                            if pairs:
+                                cv_excess_by_uid_model[str(uid)][model_name] = pairs
 
                     if metric_name == 'robust':
                         from utilsforecast.losses import rmse, mae
@@ -2080,6 +3117,26 @@ class ClassicalForecasts:
         for uid, model_name in best_by_uid.items():
             by_model.setdefault(model_name, []).append(uid)
 
+        cv_excess_by_uid: dict[str, dict[str, float]] = {}
+        for uid, model_name in best_by_uid.items():
+            pairs = cv_excess_by_uid_model.get(str(uid), {}).get(str(model_name), [])
+            q = _excess_quantiles_from_values(
+                [p[0] for p in pairs], [p[1] for p in pairs]
+            )
+            if q:
+                cv_excess_by_uid[str(uid)] = q
+
+        historical_excess_by_uid: dict[str, dict[str, float]] = {}
+        y_hist_by_uid: dict[str, np.ndarray] = {}
+        ds_hist_by_uid: dict[str, pd.Series] = {}
+        for uid, g in df.groupby('unique_id', sort=False):
+            uid_s = str(uid)
+            y_hist_by_uid[uid_s] = g['y'].to_numpy(dtype=float)
+            ds_hist_by_uid[uid_s] = pd.Series(pd.to_datetime(g['ds']))
+            hq = _historical_excess_quantiles(g['y'].to_numpy(dtype=float), g['ds'])
+            if hq:
+                historical_excess_by_uid[uid_s] = hq
+
         parts: list[pd.DataFrame] = []
         # Use the full set of factories so we can forecast whatever was selected
         # in any bucket.
@@ -2091,14 +3148,7 @@ class ClassicalForecasts:
             sf_one = StatsForecast(models=[factory()], freq=self.freq, n_jobs=1)
             subset = df[df['unique_id'].isin(uids)]
             try:
-                from statsforecast.utils import ConformalIntervals
-                min_len = subset.groupby('unique_id').size().min()
-                n_windows = 2
-                if min_len > n_windows * h:
-                    intervals = ConformalIntervals(h=h, n_windows=n_windows)
-                    fcst = sf_one.forecast(df=subset, h=h, level=[70, 90, 95], prediction_intervals=intervals)
-                else:
-                    fcst = sf_one.forecast(df=subset, h=h)
+                fcst = _statsforecast_forecast_with_conformal(sf_one, subset, h)
             except Exception:
                 fcst = sf_one.forecast(df=subset, h=h)
             if model_name not in fcst.columns:
@@ -2107,28 +3157,17 @@ class ClassicalForecasts:
             yhat = fcst[model_name].to_numpy(dtype=float)
             part['yhat'] = yhat
             part['model_used'] = model_name
-            def _upper_for(level: int) -> Optional[np.ndarray]:
-                col = f"{model_name}-hi-{level}"
-                if col in fcst.columns:
-                    return fcst[col].to_numpy(dtype=float)
-                cands = [c for c in fcst.columns if c.endswith(f"-hi-{level}")]
-                if cands:
-                    return fcst[cands[0]].to_numpy(dtype=float)
-                return None
-
-            u95 = _upper_for(95)
-            if u95 is None:
-                u95 = np.maximum(yhat * 1.5, yhat + 1.0)
-            upper_95 = np.maximum(np.maximum(u95, yhat), 0.0)
-
-            u90 = _upper_for(90)
-            u70 = _upper_for(70)
-            gap = np.maximum(0.0, upper_95 - yhat)
-            upper_90 = np.maximum(np.maximum(u90 if u90 is not None else (yhat + 0.8 * gap), yhat), 0.0)
-            upper_70 = np.maximum(np.maximum(u70 if u70 is not None else (yhat + 0.4 * gap), yhat), 0.0)
-            upper_90 = np.minimum(upper_90, upper_95)
-            upper_70 = np.minimum(upper_70, upper_90)
-
+            upper_70, upper_90, upper_95 = _attach_upper_quantiles(
+                yhat,
+                fcst,
+                model_name,
+                uid_series=part['unique_id'],
+                ds_series=part['ds'],
+                cv_excess_by_uid=cv_excess_by_uid,
+                historical_excess_by_uid=historical_excess_by_uid,
+                y_hist_by_uid=y_hist_by_uid,
+                ds_hist_by_uid=ds_hist_by_uid,
+            )
             part['upper_70'] = upper_70
             part['upper_90'] = upper_90
             part['upper_95'] = upper_95
@@ -2147,6 +3186,37 @@ class ClassicalForecasts:
             for col in ['yhat', 'upper_70', 'upper_90', 'upper_95']:
                 if col in out.columns:
                     out.loc[dead_mask, col] = 0.0
+
+        # Peak-ratio correction: scale SeasonalNaive's lag-12 forecast by the
+        # year-over-year peak ratio for event-seasonal items in the dead zone
+        # where SN won the mini-CV. SN by construction repeats last year's
+        # value; for items with a clear YoY trend on the peak month (e.g.
+        # 35% growth), this nudges the forecast in the trend's direction
+        # without abandoning the seasonal lag pattern. Skip if the uid was
+        # already marked dead.
+        if peak_ratio_correction_uid:
+            for uid, ratio in peak_ratio_correction_uid.items():
+                if uid in dead_sku_uid:
+                    continue
+                mask_uid = out['unique_id'] == uid
+                if not bool(mask_uid.any()):
+                    continue
+                # Only apply when SeasonalNaive is actually the model used
+                # (the mini-CV's pick can be overridden by downstream rerankers
+                # in pathological cases — defensive check).
+                model_used = out.loc[mask_uid, 'model_used'].astype(str).iloc[0]
+                if model_used != 'SeasonalNaive':
+                    continue
+                for col in ['yhat', 'upper_70', 'upper_90', 'upper_95']:
+                    if col in out.columns:
+                        out.loc[mask_uid, col] = (
+                            out.loc[mask_uid, col].astype(float) * float(ratio)
+                        )
+                # Tag the model label so the correction is visible in the
+                # picked-model output.
+                out.loc[mask_uid, 'model_used'] = (
+                    out.loc[mask_uid, 'model_used'].astype(str) + ':peak_ratio'
+                )
 
         # Replace non-finite quantiles with safe fallbacks and enforce nesting.
         for col in ['upper_70', 'upper_90', 'upper_95']:
@@ -2236,6 +3306,9 @@ class ClassicalForecasts:
         df = _regularize_panel_time_index(df, freq=str(self.freq))
         if df.empty:
             raise ValueError('Empty history after regularization')
+        df = _trim_panel_pre_gap(df, freq=str(self.freq))
+        if df.empty:
+            raise ValueError('Empty history after pre-gap trim')
 
         # Build a mapping from model class name -> factory.
         factories = {name: factory for name, factory in _build_candidate_model_factories(int(self.season_length))}
@@ -2244,6 +3317,17 @@ class ClassicalForecasts:
         for uid in df['unique_id'].unique().tolist():
             model_name = model_by_uid.get(str(uid), 'Naive')
             by_model.setdefault(model_name, []).append(str(uid))
+
+        historical_excess_by_uid: dict[str, dict[str, float]] = {}
+        y_hist_by_uid: dict[str, np.ndarray] = {}
+        ds_hist_by_uid: dict[str, pd.Series] = {}
+        for uid, g in df.groupby('unique_id', sort=False):
+            uid_s = str(uid)
+            y_hist_by_uid[uid_s] = g['y'].to_numpy(dtype=float)
+            ds_hist_by_uid[uid_s] = pd.Series(pd.to_datetime(g['ds']))
+            hq = _historical_excess_quantiles(g['y'].to_numpy(dtype=float), g['ds'])
+            if hq:
+                historical_excess_by_uid[uid_s] = hq
 
         parts: list[pd.DataFrame] = []
         for model_name, uids in by_model.items():
@@ -2255,14 +3339,7 @@ class ClassicalForecasts:
             sf_one = StatsForecast(models=[factory()], freq=self.freq, n_jobs=1)
             subset = df[df['unique_id'].isin(uids)]
             try:
-                from statsforecast.utils import ConformalIntervals
-                min_len = subset.groupby('unique_id').size().min()
-                n_windows = 2
-                if min_len > n_windows * h:
-                    intervals = ConformalIntervals(h=h, n_windows=n_windows)
-                    fcst = sf_one.forecast(df=subset, h=h, level=[70, 90, 95], prediction_intervals=intervals)
-                else:
-                    fcst = sf_one.forecast(df=subset, h=h)
+                fcst = _statsforecast_forecast_with_conformal(sf_one, subset, h)
             except Exception:
                 fcst = sf_one.forecast(df=subset, h=h)
             if model_name not in fcst.columns:
@@ -2271,28 +3348,16 @@ class ClassicalForecasts:
             yhat = fcst[model_name].to_numpy(dtype=float)
             part['yhat'] = yhat
             part['model_used'] = model_name
-            def _upper_for(level: int) -> Optional[np.ndarray]:
-                col = f"{model_name}-hi-{level}"
-                if col in fcst.columns:
-                    return fcst[col].to_numpy(dtype=float)
-                cands = [c for c in fcst.columns if c.endswith(f"-hi-{level}")]
-                if cands:
-                    return fcst[cands[0]].to_numpy(dtype=float)
-                return None
-
-            u95 = _upper_for(95)
-            if u95 is None:
-                u95 = np.maximum(yhat * 1.5, yhat + 1.0)
-            upper_95 = np.maximum(np.maximum(u95, yhat), 0.0)
-
-            u90 = _upper_for(90)
-            u70 = _upper_for(70)
-            gap = np.maximum(0.0, upper_95 - yhat)
-            upper_90 = np.maximum(np.maximum(u90 if u90 is not None else (yhat + 0.8 * gap), yhat), 0.0)
-            upper_70 = np.maximum(np.maximum(u70 if u70 is not None else (yhat + 0.4 * gap), yhat), 0.0)
-            upper_90 = np.minimum(upper_90, upper_95)
-            upper_70 = np.minimum(upper_70, upper_90)
-
+            upper_70, upper_90, upper_95 = _attach_upper_quantiles(
+                yhat,
+                fcst,
+                model_name,
+                uid_series=part['unique_id'],
+                ds_series=part['ds'],
+                historical_excess_by_uid=historical_excess_by_uid,
+                y_hist_by_uid=y_hist_by_uid,
+                ds_hist_by_uid=ds_hist_by_uid,
+            )
             part['upper_70'] = upper_70
             part['upper_90'] = upper_90
             part['upper_95'] = upper_95

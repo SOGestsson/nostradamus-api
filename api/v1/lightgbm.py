@@ -964,15 +964,11 @@ def get_lightgbm_diagnostics(
     """
 
     try:
-        # DEBUG: Log request params
-        print(f"[DEBUG /diagnostics] customer_id={customer_id}, model_version={model_version}, status={status}")
-
         forecaster = LightGBMForecast(store_root=store_root or _default_store_root(), customer_id=customer_id)
 
         mv = model_version
         if mv is None:
             mv = forecaster.store.get_active_model_version(status=status)
-            print(f"[DEBUG /diagnostics] resolved model_version from status={status}: {mv}")
         if not mv:
             raise ValueError(f"No active model version found for status='{status}'")
 
@@ -983,8 +979,6 @@ def get_lightgbm_diagnostics(
             unique_ids = None
 
         explain = forecaster.store.get_explain_summary(model_version=mv, unique_ids=unique_ids, limit=int(limit))
-        # DEBUG: Log results
-        print(f"[DEBUG /diagnostics] explain returned {len(explain)} items")
         name_token_vocab = None
         name_token_columns = None
         name_token_buckets = None
