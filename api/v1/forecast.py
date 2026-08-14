@@ -25,6 +25,11 @@ import logging
 from api.models import ForecastRequest, ForecastDailyResponse, ForecastDailyItemResponse
 from api.daily_forecast_utils import monthly_to_daily
 from inventory_algorithm.classical_forecasts import ClassicalForecasts
+from inventory_algorithm.easter import (
+    EasterPlan,
+    apply_easter_to_item_results,
+    prepare_easter_history,
+)
 
 router = APIRouter()
 
@@ -164,6 +169,24 @@ def _normalize_and_aggregate_history(df_his: pd.DataFrame, freq: str) -> tuple[p
     return df_his, freq_req
 
 
+def _is_monthly_freq(freq: str) -> bool:
+    f = str(freq or "").strip().upper()
+    return f.startswith("M")
+
+
+def _prepare_easter_for_request(
+    df_his: pd.DataFrame, request: ForecastRequest, freq_req: str
+) -> tuple[pd.DataFrame, EasterPlan]:
+    """No-op unless monthly local mode with easter_item_ids set."""
+
+    ids = [str(i).strip() for i in (request.easter_item_ids or []) if str(i).strip()]
+    if not ids or request.mode != "local" or not _is_monthly_freq(freq_req):
+        return df_his, EasterPlan()
+    return prepare_easter_history(
+        df_his, ids, item_col="item_id", date_col="day", sales_col="actual_sale"
+    )
+
+
 @router.post("/generate")
 def generate_forecast(request: ForecastRequest):
     """
@@ -218,6 +241,13 @@ def generate_forecast(request: ForecastRequest):
 
     **auto_model_lookback_periods** (optional): Use only the last N observations per item
     - Example: 24 for last 24 months (monthly series)
+
+    **easter_item_ids** (optional): Item ids that are Easter / paskavara products
+    - Monthly local forecasts only. The March/April Easter spike is stripped from
+      history so the model does not copy last year's calendar month, then placed
+      onto this year's months using Easter−21 through Easter−1.
+    - Omitted or empty: current AutoModel behaviour, unchanged.
+    - Aliases: paskavara_item_ids, easterItemIds
     
     **season_length** (default: 12): Length of one seasonal cycle
     - 7 = weekly seasonality (for daily data)
@@ -293,6 +323,7 @@ def generate_forecast(request: ForecastRequest):
         df_his['day'] = pd.to_datetime(df_his['day'])
 
         df_his, freq_req = _normalize_and_aggregate_history(df_his, request.freq)
+        df_his, easter_plan = _prepare_easter_for_request(df_his, request, freq_req)
         
         # Initialize forecaster
         forecaster = ClassicalForecasts(
@@ -416,6 +447,8 @@ def generate_forecast(request: ForecastRequest):
                     })
         
         print(f"Forecast generation completed: {len(results)} items processed")
+
+        results = apply_easter_to_item_results(results, easter_plan)
         
         return {
             'forecasts': results,
@@ -616,6 +649,7 @@ async def generate_forecast_async(request: ForecastRequest):
         df_his['day'] = pd.to_datetime(df_his['day'])
 
         df_his, freq_req = _normalize_and_aggregate_history(df_his, request.freq)
+        df_his, easter_plan = _prepare_easter_for_request(df_his, request, freq_req)
 
         forecaster = ClassicalForecasts(
             mode=request.mode,
@@ -730,6 +764,8 @@ async def generate_forecast_async(request: ForecastRequest):
                     })
 
         print(f"Async forecast generation completed: {len(results)} items processed")
+
+        results = apply_easter_to_item_results(results, easter_plan)
 
         return {
             'forecasts': results,
