@@ -142,8 +142,34 @@ class get_raw_data():
 
         return new_sim_input_his
 
+def split_on_order_by_due_date(sim_rio_on_order, as_of_day=None):
+    """Treat on-order qty due on/before as_of_day as already inbound (stock), not future delivery."""
+    if sim_rio_on_order is None or getattr(sim_rio_on_order, "empty", False):
+        return 0.0, sim_rio_on_order
+
+    oo = sim_rio_on_order.copy()
+    if "est_deliv_date" not in oo.columns:
+        return 0.0, oo
+
+    oo["est_deliv_date"] = pd.to_datetime(
+        oo["est_deliv_date"].astype(str),
+        format="ISO8601",
+        errors="coerce",
+    ).dt.normalize()
+
+    if as_of_day is None:
+        ref = pd.Timestamp.today().normalize()
+    else:
+        ref = pd.Timestamp(as_of_day).normalize()
+
+    due_mask = oo["est_deliv_date"].notna() & (oo["est_deliv_date"] <= ref)
+    due_qty = float(oo.loc[due_mask, "est_deliv_qty"].sum()) if "est_deliv_qty" in oo.columns else 0.0
+    future = oo.loc[~due_mask].copy()
+    return due_qty, future
+
 class inventory_simulator_with_input_prep(forecasts, sim.inventory_simulator):
     def __init__(self, sim_input_his, sim_rio_items, sim_rio_on_order, rio_item_details, periods, number_of_trials, serv_level):
+        self._on_order_due_stock = 0.0
         #upphafsgildi úr montercarlo spá fyrir buy freq og lead time
         self.histogram_lead = self.monte_forecast(sim_input_his[['actual_sale', 'day']], sim_rio_items.loc[:, 'del_time'].values[0], number_of_trials)
         self.serv_level_value_lead = self.serv_lev_value(self.histogram_lead, serv_level)
@@ -198,15 +224,22 @@ class inventory_simulator_with_input_prep(forecasts, sim.inventory_simulator):
         if sim_rio_on_order.empty:
             return input_with_on_order
 
-        sim_rio_on_order = sim_rio_on_order.copy()
-        sim_rio_on_order['est_deliv_date'] = pd.to_datetime(
-            sim_rio_on_order['est_deliv_date'].astype(str),
+        hist_end = pd.to_datetime(input_with_on_order['day'], errors='coerce').max()
+        due_qty, future_on_order = split_on_order_by_due_date(sim_rio_on_order, as_of_day=hist_end)
+        self._on_order_due_stock = due_qty
+
+        if future_on_order.empty:
+            return input_with_on_order
+
+        future_on_order = future_on_order.copy()
+        future_on_order['est_deliv_date'] = pd.to_datetime(
+            future_on_order['est_deliv_date'].astype(str),
             format='ISO8601',
             errors='coerce',
         ).dt.normalize()
 
         # Sum quantities by date to handle multiple deliveries on the same day
-        delivery_by_date = sim_rio_on_order.groupby('est_deliv_date')['est_deliv_qty'].sum()
+        delivery_by_date = future_on_order.groupby('est_deliv_date')['est_deliv_qty'].sum()
         sim_days = pd.to_datetime(input_with_on_order['day'], errors='coerce').dt.normalize()
         for date, qty in delivery_by_date.items():
             if pd.isna(date):
@@ -218,6 +251,7 @@ class inventory_simulator_with_input_prep(forecasts, sim.inventory_simulator):
     def step_3_input_add_extra_params_to_sim_input(self, sim_rio_items, sim_input_his, number_of_trials, serv_level):
 
         curr_stock = sim_rio_items.loc[:, 'actual_stock'].values[0].item()
+        curr_stock += float(getattr(self, '_on_order_due_stock', 0) or 0)
         lead_time = min(365, sim_rio_items.loc[:, 'del_time'].values[0].item())
         order_freq = sim_rio_items.loc[:, 'buy_freq'].values[0].item()
         minmax_min = sim_rio_items.loc[:, 'min'].values[0].item()
