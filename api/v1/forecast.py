@@ -19,10 +19,11 @@ import hmac
 import hashlib
 import time
 
-from fastapi import APIRouter, HTTPException, Request, Depends, Header, Body
+from fastapi import APIRouter, HTTPException, Request, Depends, Body
 import logging
 
 from api.models import ForecastRequest, ForecastDailyResponse, ForecastDailyItemResponse
+from api.security import require_api_key
 from api.daily_forecast_utils import monthly_to_daily
 from inventory_algorithm.classical_forecasts import ClassicalForecasts
 from inventory_algorithm.easter import (
@@ -130,15 +131,6 @@ async def send_webhook_with_retries(job_id: str, webhook: str, payload: Dict[str
 
 def _job_key(job_id: str) -> str:
     return f"job:{job_id}"
-
-
-def api_key_header(x_api_key: Optional[str] = Header(None)) -> bool:
-    """Simple API key dependency. If `API_KEY` env var is set, require matching header."""
-    expected = os.getenv('API_KEY')
-    if expected:
-        if not x_api_key or x_api_key != expected:
-            raise HTTPException(status_code=401, detail="Invalid API Key")
-    return True
 
 
 def _normalize_and_aggregate_history(df_his: pd.DataFrame, freq: str) -> tuple[pd.DataFrame, str]:
@@ -783,7 +775,7 @@ async def generate_forecast_async(request: ForecastRequest):
 
 
 @router.post("/generate_job")
-async def generate_forecast_job(request: ForecastRequest, req: Request, webhook_url: Optional[str] = None, auth: bool = Depends(api_key_header)):
+async def generate_forecast_job(request: ForecastRequest, req: Request, webhook_url: Optional[str] = None, auth: bool = Depends(require_api_key)):
     """
     Submit an asynchronous forecast job. Returns immediately with a `job_id` and
     a status URL. The job runs in the background and the result can be polled
@@ -910,7 +902,7 @@ async def generate_forecast_job(request: ForecastRequest, req: Request, webhook_
 
 
 @router.get("/jobs/{job_id}")
-async def get_job_status(job_id: str, auth: bool = Depends(api_key_header)):
+async def get_job_status(job_id: str, auth: bool = Depends(require_api_key)):
     """Return status and result (if finished) for a submitted job."""
     global redis_client
     if redis_client:
@@ -934,7 +926,7 @@ async def get_job_status(job_id: str, auth: bool = Depends(api_key_header)):
 
 
 @router.get("/webhook/dlq")
-async def list_webhook_dlq(limit: int = 100, auth: bool = Depends(api_key_header)):
+async def list_webhook_dlq(limit: int = 100, auth: bool = Depends(require_api_key)):
     """List entries in the webhook dead-letter queue (requires API key if set)."""
     global redis_client
     if not redis_client:
@@ -954,7 +946,7 @@ async def list_webhook_dlq(limit: int = 100, auth: bool = Depends(api_key_header
 
 
 @router.post("/webhook/dlq/requeue")
-async def requeue_webhook_dlq(job_id: str, auth: bool = Depends(api_key_header)):
+async def requeue_webhook_dlq(job_id: str, auth: bool = Depends(require_api_key)):
     """Requeue a DLQ entry by `job_id`. This will remove the DLQ entry and
     attempt delivery again in the background."""
     global redis_client

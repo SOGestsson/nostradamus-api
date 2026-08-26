@@ -9,6 +9,11 @@ from scipy.stats import norm
 import copy
 import sys
 
+try:
+    from .safe_parse import parse_inventory_literal
+except ImportError:
+    from safe_parse import parse_inventory_literal
+
 
 class inventory_simulator:
 
@@ -286,8 +291,9 @@ class inventory_simulator:
 
             # pick out the information stored in the json-text
             # initial_inv = get_key_value_or_default(js, 'current_inventory', 0)  # single number for initial inventory
-            initial_inv = eval(str(self.get_key_value_or_default(js, 'current_inventory',
-                                                            "[]")))  # array as string with (expirationdate, inv) elements
+            initial_inv = parse_inventory_literal(
+                self.get_key_value_or_default(js, 'current_inventory', "[]")
+            )  # array as string with (expirationdate, inv) elements
             lead_time = self.get_key_value_or_default(js, 'lead_time', 0)
             z_value = self.get_key_value_or_default(js, 'service_level', 1.65, func=lambda x: norm.ppf(x))
             safety_stock = self.get_key_value_or_default(js, 'safety_stock',

@@ -9,6 +9,11 @@ from scipy.stats import norm
 import copy
 import sys
 
+try:
+    from .safe_parse import parse_inventory_literal
+except ImportError:
+    from safe_parse import parse_inventory_literal
+
 def update_inventory(curr_inv, day_nr, outgoing, incoming, initial_shelf_life, backorder):
     # Make sure that the inventory is sorted correctly
     curr_inv.sort(key=lambda x: x[0])
@@ -265,7 +270,7 @@ def run_inventory_simulator(invsimdataset):
 
         # pick out the information stored in the json-text
         #initial_inv = get_key_value_or_default(js, 'current_inventory', 0)  # single number for initial inventory
-        initial_inv = eval( str(get_key_value_or_default(js, 'current_inventory', "[]")) )  # array as string with (expirationdate, inv) elements
+        initial_inv = parse_inventory_literal(get_key_value_or_default(js, 'current_inventory', "[]"))  # array as string with (expirationdate, inv) elements
         lead_time = get_key_value_or_default(js, 'lead_time', 0)
         z_value = get_key_value_or_default(js, 'service_level', 1.65, func=lambda x: norm.ppf(x))
         safety_stock = get_key_value_or_default(js, 'safety_stock', z_value * math.sqrt(lead_time) * math.sqrt(the_variance))

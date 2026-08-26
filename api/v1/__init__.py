@@ -1,10 +1,12 @@
 """
 API v1 router - aggregates all v1 endpoints.
 """
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+
+from api.security import require_api_key
 from api.v1 import forecast, lightgpt, lightgbm, simulation, test_data
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_api_key)])
 
 
 # Include simulation routes

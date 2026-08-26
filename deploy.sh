@@ -8,6 +8,11 @@ CONTAINER="nostradamus-api"
 REDIS_CONTAINER="redis"
 NETWORK="nostradamus-net"
 
+# The API refuses every /api/v1 request when API_KEY is unset, so fail here
+# rather than deploying a container that returns 503 to every caller.
+: "${API_KEY:?API_KEY must be set. Same value as SIM_API_KEY on the pipeline gateway and the frontend.}"
+: "${SANDBOX_DB_PASSWORD:?SANDBOX_DB_PASSWORD must be set}"
+
 if ! ssh -o BatchMode=yes -o ConnectTimeout=3 "$PI_USER@$PI_HOST" true 2>/dev/null; then
   echo "==> Setting up SSH key on $PI_HOST (one-time)..."
   ssh-copy-id "$PI_USER@$PI_HOST"
@@ -34,10 +39,11 @@ ssh "$PI_USER@$PI_HOST" "
   docker run -d -p 8000:8000 --name $CONTAINER --restart unless-stopped \
     --network $NETWORK \
     -e REDIS_URL=redis://${REDIS_CONTAINER}:6379/0 \
+    -e API_KEY='$API_KEY' \
     -e SANDBOX_DB_HOST=192.168.1.50 \
     -e SANDBOX_DB_PORT=4406 \
-    -e SANDBOX_DB_USER=root \
-    -e SANDBOX_DB_PASSWORD=Superman \
+    -e SANDBOX_DB_USER='${SANDBOX_DB_USER:-root}' \
+    -e SANDBOX_DB_PASSWORD='$SANDBOX_DB_PASSWORD' \
     $IMAGE &&
 
   ok=0 &&

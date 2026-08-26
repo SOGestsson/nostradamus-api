@@ -17,6 +17,11 @@ try:
 except ImportError:
     import simulator_class as sim
 
+try:
+    from .safe_parse import parse_inventory_literal
+except ImportError:
+    from safe_parse import parse_inventory_literal
+
 
 
 
@@ -372,7 +377,9 @@ class inventory_simulator_with_input_prep(forecasts, sim.inventory_simulator):
         # convert the dictionary to a Pandas DataFrame
         df = pd.DataFrame.from_dict(my_dict['extra_params'][0], orient='index').T
         #Næ hér í upplýsingar um birgðastöðu þar sem við höfum lista sem geymir birgðstöðu og expiery dags
-        df['updated_current_inventory'] = eval(my_dict['extra_params'][0]['current_inventory'])[0][1]
+        df['updated_current_inventory'] = parse_inventory_literal(
+            my_dict['extra_params'][0]['current_inventory']
+        )[0][1]
 
         #Sameina datafream
         sim_rio_items = sim_rio_items.reset_index()
