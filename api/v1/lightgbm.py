@@ -14,6 +14,7 @@ import uuid
 import time
 import threading
 from typing import Any
+import math
 
 import pandas as pd
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -21,9 +22,13 @@ import httpx
 import json
 import hmac
 import hashlib
+import logging
 
 from api.models import LightGBMBatchForecastRequest, LightGBMTrainRequest
 from inventory_algorithm.lightgbm_forecasts import LightGBMForecast
+from inventory_algorithm.lgbm_origin import CONFIDENCE_DEFINITION
+
+logger = logging.getLogger("nostradamus.lightgbm")
 
 
 router = APIRouter()
@@ -41,7 +46,12 @@ REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
 try:
     import redis
 
-    _redis_sync = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    _redis_sync = redis.Redis.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        socket_connect_timeout=2.0,
+        socket_timeout=2.0,
+    )
 except Exception:
     _redis_sync = None
 
@@ -60,55 +70,54 @@ def _now_ts() -> int:
 def _set_job(job_id: str, payload: dict[str, Any]) -> None:
     payload = dict(payload)
     payload.setdefault('updated_at', _now_ts())
+    with _JOBS_LOCK:
+        _JOBS[job_id] = payload
     if _redis_sync is not None:
         try:
             _redis_sync.hset(_job_key(job_id), mapping={k: json.dumps(v) for k, v in payload.items()})
             _redis_sync.expire(_job_key(job_id), 60 * 60 * 24)
-            return
         except Exception:
-            # Fall back to in-memory storage if Redis is unavailable.
             pass
-    with _JOBS_LOCK:
-        _JOBS[job_id] = payload
 
 
 def _update_job(job_id: str, **fields: Any) -> None:
     fields = dict(fields)
     fields['updated_at'] = _now_ts()
-    if _redis_sync is not None:
-        try:
-            _redis_sync.hset(_job_key(job_id), mapping={k: json.dumps(v) for k, v in fields.items()})
-            _redis_sync.expire(_job_key(job_id), 60 * 60 * 24)
-            return
-        except Exception:
-            # Fall back to in-memory storage if Redis is unavailable.
-            pass
     with _JOBS_LOCK:
         cur = _JOBS.get(job_id, {})
         cur.update(fields)
         _JOBS[job_id] = cur
+    if _redis_sync is not None:
+        try:
+            _redis_sync.hset(_job_key(job_id), mapping={k: json.dumps(v) for k, v in fields.items()})
+            _redis_sync.expire(_job_key(job_id), 60 * 60 * 24)
+        except Exception:
+            pass
 
 
 def _get_job(job_id: str) -> dict[str, Any] | None:
     if _redis_sync is not None:
         try:
             raw = _redis_sync.hgetall(_job_key(job_id))
-            if not raw:
-                # Fall back to in-memory if not in Redis
-                with _JOBS_LOCK:
-                    return dict(_JOBS.get(job_id)) if job_id in _JOBS else None
-            out: dict[str, Any] = {}
-            for k, v in raw.items():
-                try:
-                    out[k] = json.loads(v)
-                except Exception:
-                    out[k] = v
-            return out
+            if raw:
+                out: dict[str, Any] = {}
+                for k, v in raw.items():
+                    try:
+                        out[k] = json.loads(v)
+                    except Exception:
+                        out[k] = v
+                return out
         except Exception:
-            # Fall back to in-memory storage if Redis is unavailable
             pass
     with _JOBS_LOCK:
         return dict(_JOBS.get(job_id)) if job_id in _JOBS else None
+
+
+def _start_job_thread(name: str, fn) -> threading.Thread:
+    """Run the job in a dedicated thread so FastAPI can still serve GET /jobs."""
+    t = threading.Thread(target=fn, name=name, daemon=True)
+    t.start()
+    return t
 
 
 def _send_webhook_with_retries(job_id: str, webhook: str, payload: dict[str, Any], max_attempts: int = 5) -> bool:
@@ -133,14 +142,33 @@ def _send_webhook_with_retries(job_id: str, webhook: str, payload: dict[str, Any
                 resp = client.post(webhook, content=payload_bytes, headers=headers)
             if 200 <= resp.status_code < 300:
                 _update_job(job_id, webhook_attempts=attempt)
+                logger.info(
+                    "webhook sent",
+                    extra={"job_id": job_id, "customer_id": payload.get("customer_id"), "attempt": attempt},
+                )
                 return True
             last_exc = f"status={resp.status_code}, body={resp.text}"
         except Exception as e:
             last_exc = str(e)
 
         _update_job(job_id, webhook_attempts=attempt, webhook_last_error=last_exc)
-        time.sleep(delays[min(attempt - 1, len(delays) - 1)])
+        if attempt < max_attempts:
+            time.sleep(delays[min(attempt - 1, len(delays) - 1)])
 
+    dlq_entry = {
+        "job_id": job_id,
+        "webhook": webhook,
+        "payload": payload,
+        "attempts": attempt,
+        "last_error": last_exc,
+    }
+    if _redis_sync is not None:
+        try:
+            _redis_sync.rpush("webhook:dlq", json.dumps(dlq_entry, default=str))
+        except Exception:
+            logger.error("DLQ push failed", extra={"job_id": job_id})
+    else:
+        logger.error("webhook failed after retries (no redis DLQ)", extra={"job_id": job_id, "error": last_exc})
     return False
 
 
@@ -156,99 +184,125 @@ def _future_month_starts(last_day: Any, periods: int) -> list[str]:
     return [d.strftime("%Y-%m-%d") for d in future]
 
 
-def _build_non_ml_fallback(
+def _requested_item_ids(df_hist: pd.DataFrame, df_items: pd.DataFrame | None) -> list[str]:
+    ids: list[str] = []
+    if df_hist is not None and not df_hist.empty and "item_id" in df_hist.columns:
+        ids.extend(df_hist["item_id"].astype(str).tolist())
+    if df_items is not None and not df_items.empty and "item_id" in df_items.columns:
+        ids.extend(df_items["item_id"].astype(str).tolist())
+    out: list[str] = []
+    seen: set[str] = set()
+    for item_id in ids:
+        if item_id not in seen:
+            seen.add(item_id)
+            out.append(item_id)
+    return out
+
+
+def _failed_item_payload(
+    *,
+    item_id: str,
+    forecast_periods: int,
+    reason: str,
+    confidence: Any,
+    dates: list[str] | None = None,
+) -> dict[str, Any]:
+    n = int(forecast_periods)
+    return {
+        "item_id": item_id,
+        "forecast": [0.0] * n,
+        "upper_70": [0.0] * n,
+        "upper_90": [0.0] * n,
+        "upper_95": [0.0] * n,
+        "forecast_dates": dates or [],
+        "model_used": "failed",
+        "reason_code": reason,
+        "confidence": confidence,
+        "skipped": True,
+        "failed": True,
+        "adjustments": [{"failed": True, "reason_code": str(reason)} for _ in range(n)],
+    }
+
+
+def _dispatch_fallback(
     *,
     df_hist: pd.DataFrame,
     item_id: str,
     forecast_periods: int,
     reason: str,
     confidence: Any,
+    method: str | None,
 ) -> dict[str, Any]:
-    """Seasonal+level fallback when ML prediction is unavailable."""
-    h = df_hist[df_hist["item_id"].astype(str) == str(item_id)].copy()
-    h["day"] = pd.to_datetime(h["day"], errors="coerce")
-    h["actual_sale"] = pd.to_numeric(h["actual_sale"], errors="coerce")
-    h = h.dropna(subset=["day", "actual_sale"]).sort_values("day", kind="mergesort")
-    last_day = h["day"].max() if not h.empty else pd.NaT
-    days = _future_month_starts(last_day, int(forecast_periods))
+    """Dispatch the eligibility fallback: last-value naive or seasonal naive.
 
+    History is monthly-aggregated with the same sum contract as training
+    (Jan 40+60 → 100, not 60). Upper bounds are heuristic, not calibrated.
+    """
+    from inventory_algorithm.lightgbm_forecasts import _normalize_monthly_history
+    from inventory_algorithm.lgbm_grid import complete_monthly_grid, seasonal_naive_value
+
+    method_key = str(method or "naive").strip().lower()
+    h = df_hist[df_hist["item_id"].astype(str) == str(item_id)].copy() if not df_hist.empty else pd.DataFrame()
     if h.empty:
-        return {
-            "item_id": item_id,
-            "forecast": [0.0] * int(forecast_periods),
-            "upper_70": [0.0] * int(forecast_periods),
-            "upper_90": [0.0] * int(forecast_periods),
-            "upper_95": [0.0] * int(forecast_periods),
-            "forecast_dates": days,
-            "model_used": "fallback_seasonal_level",
-            "reason_code": reason,
-            "confidence": confidence,
-            "skipped": True,
-            "adjustments": [{"fallback": "empty_history"} for _ in range(int(forecast_periods))],
-        }
-
-    y = h["actual_sale"].astype(float).to_numpy()
-    months = h["day"].dt.month.to_numpy()
-    nz = y[y > 0.0]
-    overall_nonzero_rate = float((y > 0.0).mean()) if len(y) else 0.0
-    recent_nz = nz[-12:] if len(nz) else nz
-    recent_nz_mean = float(recent_nz.mean()) if len(recent_nz) else 0.0
-    last_nz = float(nz[-1]) if len(nz) else 0.0
-
-    month_rates: dict[int, float] = {}
-    month_nonzero_means: dict[int, float] = {}
-    for m in range(1, 13):
-        ym = y[months == m]
-        if len(ym) == 0:
-            month_rates[m] = 0.0
-            month_nonzero_means[m] = 0.0
-            continue
-        nzm = ym[ym > 0.0]
-        month_rates[m] = float(len(nzm) / len(ym))
-        month_nonzero_means[m] = float(nzm.mean()) if len(nzm) else 0.0
-    seasonal_strength = float(max(month_rates.values())) if month_rates else 0.0
-    strict_seasonal = bool(seasonal_strength >= 0.50 and overall_nonzero_rate <= 0.30)
-
-    croston_proxy = float(overall_nonzero_rate * recent_nz_mean) if recent_nz_mean > 0.0 else 0.0
-    spread_base = max(1.0, 0.35 * max(recent_nz_mean, last_nz, croston_proxy))
+        return _failed_item_payload(
+            item_id=item_id,
+            forecast_periods=forecast_periods,
+            reason=reason or "NO_HISTORY",
+            confidence=confidence,
+            dates=[],
+        )
+    try:
+        monthly = _normalize_monthly_history(h)
+        monthly = complete_monthly_grid(monthly)
+    except Exception:
+        return _failed_item_payload(
+            item_id=item_id,
+            forecast_periods=forecast_periods,
+            reason=reason or "NO_HISTORY",
+            confidence=confidence,
+            dates=[],
+        )
+    if monthly is None or monthly.empty:
+        return _failed_item_payload(
+            item_id=item_id,
+            forecast_periods=forecast_periods,
+            reason=reason or "NO_HISTORY",
+            confidence=confidence,
+            dates=[],
+        )
+    monthly = monthly.sort_values("ds", kind="mergesort")
+    last_day = monthly["ds"].max()
+    days = _future_month_starts(last_day, int(forecast_periods))
+    y = pd.to_numeric(monthly["y"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    t = len(y) - 1
+    last_val = float(y[t]) if t >= 0 else 0.0
 
     fcst: list[float] = []
     u70: list[float] = []
     u90: list[float] = []
     u95: list[float] = []
     adj: list[dict[str, Any]] = []
-
-    for d in days:
-        m = int(pd.to_datetime(d).month)
-        m_rate = float(month_rates.get(m, 0.0))
-        m_mean = float(month_nonzero_means.get(m, 0.0))
-        yhat = float(0.55 * m_mean + 0.30 * recent_nz_mean + 0.15 * croston_proxy)
-        if m_mean <= 0.0 and recent_nz_mean > 0.0 and overall_nonzero_rate >= 0.5:
-            yhat = max(yhat, 0.60 * recent_nz_mean)
-        off_season_zeroed = bool(strict_seasonal and m_rate <= 0.10)
-        if off_season_zeroed:
-            yhat = 0.0
-        yhat = float(max(0.0, yhat))
-        spread = float(max(spread_base, 0.30 * max(m_mean, recent_nz_mean, 0.0)))
-        if yhat <= 0.0 and recent_nz_mean <= 0.0:
-            q70 = q90 = q95 = 0.0
+    spread = float(max(1.0, 0.35 * abs(last_val)))
+    used = "naive"
+    for hi, _d in enumerate(days, start=1):
+        if method_key in {"seasonal_naive", "snaive", "seasonal"}:
+            yhat = float(max(0.0, seasonal_naive_value(y, t, hi)))
+            used = "seasonal_naive"
         else:
-            q70 = float(max(yhat, yhat + 0.30 * spread))
-            q90 = float(max(q70, yhat + 0.60 * spread))
-            q95 = float(max(q90, yhat + 0.90 * spread))
+            yhat = float(max(0.0, last_val))
+            used = "naive"
+        q70 = float(max(0.0, yhat + 0.30 * spread))
+        q90 = float(max(q70, yhat + 0.60 * spread))
+        q95 = float(max(q90, yhat + 0.90 * spread))
         fcst.append(yhat)
         u70.append(q70)
         u90.append(q90)
         u95.append(q95)
         adj.append(
             {
-                "fallback": "seasonal_level",
+                "fallback": used,
                 "reason_code": str(reason),
-                "month_rate_same": float(m_rate),
-                "month_nonzero_mean": float(m_mean),
-                "recent_nonzero_mean": float(recent_nz_mean),
-                "overall_nonzero_rate": float(overall_nonzero_rate),
-                "strict_seasonal_offseason_zeroed": bool(off_season_zeroed),
+                "bound_type": "heuristic_not_calibrated",
             }
         )
 
@@ -259,7 +313,7 @@ def _build_non_ml_fallback(
         "upper_90": u90,
         "upper_95": u95,
         "forecast_dates": days,
-        "model_used": "fallback_seasonal_level",
+        "model_used": used,
         "reason_code": reason,
         "confidence": confidence,
         "skipped": True,
@@ -267,6 +321,143 @@ def _build_non_ml_fallback(
     }
 
 
+def _json_num_list(values) -> list:
+    out = []
+    for v in list(values):
+        if v is None:
+            out.append(None)
+            continue
+        try:
+            fv = float(v)
+        except Exception:
+            out.append(None)
+            continue
+        out.append(fv if math.isfinite(fv) else None)
+    return out
+
+
+def _format_batch_results(
+    *,
+    unique_ids: list[str],
+    fcst_df: pd.DataFrame,
+    eligibility: dict[str, Any],
+    df_hist: pd.DataFrame,
+    forecast_periods: int,
+    meta: dict[str, Any],
+) -> dict[str, Any]:
+    out: list[dict[str, Any]] = []
+    if fcst_df is None or fcst_df.empty:
+        fcst_df = pd.DataFrame(columns=["item_id", "day", "yhat", "upper_70", "upper_90", "upper_95"])
+
+    for item_id in unique_ids:
+        elig = eligibility.get(str(item_id)) or {}
+        ml_allowed = bool(elig.get("ml_allowed")) if elig.get("ml_allowed") is not None else False
+        winner = elig.get("winner_model") or ("lgbm_direct" if ml_allowed else "naive")
+        reason = elig.get("reason_code") or ("OK" if ml_allowed else "NO_ELIGIBILITY")
+        confidence = elig.get("confidence")
+        fallback_method = elig.get("fallback_model") or "naive"
+        logger.info(
+            "item routing",
+            extra={
+                "customer_id": meta.get("customer_id"),
+                "model_version": meta.get("model_version"),
+                "item_id": str(item_id),
+                "reason_code": str(reason),
+            },
+        )
+
+        item_fcst = fcst_df[fcst_df["item_id"].astype(str) == str(item_id)].sort_values("day") if "item_id" in fcst_df.columns else pd.DataFrame()
+        item_failed = bool(
+            not item_fcst.empty and "failed" in item_fcst.columns and bool(item_fcst["failed"].fillna(False).any())
+        )
+        use_ml = ml_allowed and str(winner).startswith("lgbm") and not item_failed
+        if use_ml and len(item_fcst) == int(forecast_periods):
+            days = [
+                pd.to_datetime(d).to_period("M").to_timestamp(how="start").strftime("%Y-%m-%d")
+                for d in item_fcst["day"].tolist()
+            ]
+            if len(days) != len(set(days)):
+                item_failed = True
+            yhat = _json_num_list(item_fcst["yhat"].tolist())
+            if any(v is None for v in yhat):
+                item_failed = True
+            if not item_failed:
+                upper_70 = _json_num_list(item_fcst["upper_70"].tolist()) if "upper_70" in item_fcst.columns else None
+                upper_90 = _json_num_list(item_fcst["upper_90"].tolist()) if "upper_90" in item_fcst.columns else None
+                upper_95 = _json_num_list(item_fcst["upper_95"].tolist()) if "upper_95" in item_fcst.columns else None
+                adjustments_list: list[Any] = []
+                if "adjustments" in item_fcst.columns:
+                    try:
+                        adjustments_list = [(a if isinstance(a, (dict, list)) else {}) for a in item_fcst["adjustments"].tolist()]
+                    except Exception:
+                        adjustments_list = []
+                payload: dict[str, Any] = {
+                    "item_id": item_id,
+                    "forecast": yhat,
+                    "upper_70": upper_70,
+                    "upper_90": upper_90,
+                    "upper_95": upper_95,
+                    "forecast_dates": days,
+                    "model_used": str(winner),
+                    "reason_code": reason,
+                    "confidence": confidence,
+                    "adjustments": adjustments_list,
+                }
+                if "yhat_raw" in item_fcst.columns:
+                    payload["yhat_raw"] = _json_num_list(item_fcst["yhat_raw"].tolist())
+                if "mean_head" in item_fcst.columns:
+                    payload["mean_head"] = item_fcst["mean_head"].tolist()
+                if "planning_ceiling" in item_fcst.columns:
+                    payload["planning_ceiling"] = _json_num_list(item_fcst["planning_ceiling"].tolist())
+                out.append(payload)
+                continue
+
+        if item_failed:
+            fail_rows = item_fcst
+            if "failed" in item_fcst.columns:
+                fail_rows = item_fcst[item_fcst["failed"].fillna(False).astype(bool)]
+            if fail_rows.empty:
+                fail_rows = item_fcst
+            fail_reason = "PREDICT_FAILED"
+            if "reason_code" in fail_rows.columns and not fail_rows.empty:
+                fail_reason = str(fail_rows["reason_code"].iloc[0])
+            out.append(
+                _failed_item_payload(
+                    item_id=str(item_id),
+                    forecast_periods=int(forecast_periods),
+                    reason=fail_reason,
+                    confidence=confidence,
+                    dates=[
+                        pd.to_datetime(d).to_period("M").to_timestamp(how="start").strftime("%Y-%m-%d")
+                        for d in item_fcst["day"].tolist()
+                    ] if "day" in item_fcst.columns else [],
+                )
+            )
+            continue
+
+        out.append(
+            _dispatch_fallback(
+                df_hist=df_hist,
+                item_id=str(item_id),
+                forecast_periods=int(forecast_periods),
+                reason="ML_NO_PREDICTION" if ml_allowed else str(reason),
+                confidence=confidence,
+                method=str(fallback_method if not ml_allowed else fallback_method),
+            )
+        )
+
+    meta = dict(meta or {})
+    meta.setdefault("confidence_definition", CONFIDENCE_DEFINITION)
+    meta["job_runner"] = "fastapi_background_tasks"
+    return {
+        "forecasts": out,
+        "total_items": len(unique_ids),
+        "forecast_type": "batch",
+        "periods": forecast_periods,
+        "freq": meta.get("freq"),
+        "model_version": meta.get("model_version"),
+        "meta": meta,
+    }
 @router.post("/train")
 def train_lightgbm(request: LightGBMTrainRequest):
     try:
@@ -296,6 +487,7 @@ def train_lightgbm(request: LightGBMTrainRequest):
             tune_hyperparameters=getattr(request, "tune_hyperparameters", False),
             optuna_n_trials=getattr(request, "optuna_n_trials", 30),
             optuna_timeout=getattr(request, "optuna_timeout", 300),
+            required_driver_columns=getattr(request, "required_driver_columns", None),
         )
 
         return {
@@ -414,6 +606,7 @@ def train_lightgbm_async(
                 tune_hyperparameters=getattr(request, "tune_hyperparameters", False),
                 optuna_n_trials=getattr(request, "optuna_n_trials", 30),
                 optuna_timeout=getattr(request, "optuna_timeout", 300),
+                required_driver_columns=getattr(request, "required_driver_columns", None),
                 progress_hook=progress_hook,
             )
 
@@ -477,7 +670,7 @@ def train_lightgbm_async(
                     },
                 )
 
-    background_tasks.add_task(_runner)
+    background_tasks.add_task(_start_job_thread, f"lgbm-train-{job_id}", _runner)
 
     # #region agent log
     _debug_log({
@@ -502,65 +695,14 @@ def train_lightgbm_async(
 
 @router.get("/jobs/{job_id}")
 def get_lightgbm_job(job_id: str):
-    # #region agent log
-    _debug_log({
-        "sessionId": "debug-session",
-        "runId": "lightgbm_job_get",
-        "hypothesisId": "J5",
-        "location": "api/v1/lightgbm.py:get_job:entry",
-        "message": "Job status request received",
-        "data": {
-            "job_id": job_id,
-            "redis_enabled": bool(_redis_sync),
-        },
-        "timestamp": int(time.time() * 1000),
-    })
-    # #endregion
     try:
         job = _get_job(job_id)
         if not job:
-            # #region agent log
-            _debug_log({
-                "sessionId": "debug-session",
-                "runId": "lightgbm_job_get",
-                "hypothesisId": "J6",
-                "location": "api/v1/lightgbm.py:get_job:not_found",
-                "message": "Job not found",
-                "data": {
-                    "job_id": job_id,
-                },
-                "timestamp": int(time.time() * 1000),
-            })
-            # #endregion
             raise HTTPException(status_code=404, detail='job not found')
-        # #region agent log
-        _debug_log({
-            "sessionId": "debug-session",
-            "runId": "lightgbm_job_get",
-            "hypothesisId": "J7",
-            "location": "api/v1/lightgbm.py:get_job:success",
-            "message": "Job status returned",
-            "data": {
-                "job_id": job_id,
-                "status": job.get("status"),
-                "phase": job.get("phase"),
-            },
-            "timestamp": int(time.time() * 1000),
-        })
-        # #endregion
         return job
     except HTTPException:
         raise
     except Exception as e:
-        _debug_log({
-            "sessionId": "debug-session",
-            "runId": "lightgbm_job_get",
-            "hypothesisId": "J8",
-            "location": "api/v1/lightgbm.py:get_job:error",
-            "message": f"Error fetching job: {str(e)}",
-            "data": {"job_id": job_id, "error": str(e), "traceback": traceback.format_exc()},
-            "timestamp": int(time.time() * 1000),
-        })
         raise HTTPException(status_code=500, detail=f"Error fetching job: {str(e)}")
 
 
@@ -633,7 +775,7 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
             pass
         # #endregion
 
-        unique_ids = [str(x) for x in df_hist["item_id"].astype(str).unique().tolist()]
+        unique_ids = _requested_item_ids(df_hist, df_items)
         eligibility = forecaster.store.get_eligibility(model_version=model_version, unique_ids=unique_ids)
 
         # ML batch prediction for all; we'll decide per item whether to use it.
@@ -647,100 +789,21 @@ def batch_forecast_lightgbm(request: LightGBMBatchForecastRequest):
             model_version=model_version,
             status=request.status,
         )
+        meta = dict(meta or {})
+        meta["customer_id"] = request.customer_id
 
-        # Build fallback inputs
         df_hist["day"] = pd.to_datetime(df_hist["day"], errors="coerce")
         df_hist = df_hist.dropna(subset=["item_id", "day", "actual_sale"])
         df_hist["item_id"] = df_hist["item_id"].astype(str)
 
-        # Convert ML results to per-item format
-        out: list[dict[str, Any]] = []
-        if fcst_df.empty:
-            fcst_df = pd.DataFrame(columns=["item_id", "day", "yhat", "upper_70", "upper_90", "upper_95"])
-
-        for item_id in unique_ids:
-            elig = eligibility.get(str(item_id)) or {}
-            ml_allowed = bool(elig.get("ml_allowed")) if elig.get("ml_allowed") is not None else False
-            winner = elig.get("winner_model") or ("lgbm_direct" if ml_allowed else "naive")
-            reason = elig.get("reason_code") or ("OK" if ml_allowed else "NO_ELIGIBILITY")
-            confidence = elig.get("confidence")
-
-            use_ml = ml_allowed and str(winner).startswith("lgbm")
-            if use_ml:
-                item_fcst = fcst_df[fcst_df["item_id"].astype(str) == str(item_id)].sort_values("day")
-                if len(item_fcst) == int(request.forecast_periods):
-                    yhat = item_fcst["yhat"].to_numpy(dtype=float).tolist()
-                    upper_70 = None
-                    if "upper_70" in item_fcst.columns:
-                        upper_70 = item_fcst["upper_70"].to_numpy(dtype=float).tolist()
-                    upper_90 = None
-                    if "upper_90" in item_fcst.columns:
-                        upper_90 = item_fcst["upper_90"].to_numpy(dtype=float).tolist()
-                    upper_95 = None
-                    if "upper_95" in item_fcst.columns:
-                        upper_95 = item_fcst["upper_95"].to_numpy(dtype=float).tolist()
-                    # Month-start semantics: YYYY-MM-01 represents that month.
-                    days = [
-                        pd.to_datetime(d).to_period("M").to_timestamp(how="start").strftime("%Y-%m-%d")
-                        for d in item_fcst["day"].tolist()
-                    ]
-                    adjustments_list = []
-                    if "adjustments" in item_fcst.columns:
-                        try:
-                            adjustments_list = [
-                                (a if isinstance(a, dict) else {}) for a in item_fcst["adjustments"].tolist()
-                            ]
-                        except Exception:
-                            adjustments_list = []
-                    out.append(
-                        {
-                            "item_id": item_id,
-                            "forecast": yhat,
-                            "upper_70": upper_70,
-                            "upper_90": upper_90,
-                            "upper_95": upper_95,
-                            "forecast_dates": days,
-                            "model_used": str(winner),
-                            "reason_code": reason,
-                            "confidence": confidence,
-                            "adjustments": adjustments_list,
-                        }
-                    )
-                    continue
-
-                # If ML is allowed but we don't have predictions (e.g. not enough history
-                # for that item), fall back to naive but keep an explicit reason.
-                reason = "ML_NO_PREDICTION"
-                out.append(
-                    _build_non_ml_fallback(
-                        df_hist=df_hist,
-                        item_id=str(item_id),
-                        forecast_periods=int(request.forecast_periods),
-                        reason=reason,
-                        confidence=confidence,
-                    )
-                )
-                continue
-            if not ml_allowed:
-                out.append(
-                    _build_non_ml_fallback(
-                        df_hist=df_hist,
-                        item_id=str(item_id),
-                        forecast_periods=int(request.forecast_periods),
-                        reason=str(reason),
-                        confidence=confidence,
-                    )
-                )
-
-        return {
-            "forecasts": out,
-            "total_items": len(unique_ids),
-            "forecast_type": "batch",
-            "periods": request.forecast_periods,
-            "freq": meta.get("freq"),
-            "model_version": meta.get("model_version"),
-            "meta": meta,
-        }
+        return _format_batch_results(
+            unique_ids=unique_ids,
+            fcst_df=fcst_df,
+            eligibility=eligibility,
+            df_hist=df_hist,
+            forecast_periods=int(request.forecast_periods),
+            meta=meta,
+        )
 
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -794,7 +857,7 @@ def batch_forecast_lightgbm_async(
 
             _update_job(job_id, phase='forecasting', model_version=model_version)
 
-            unique_ids = [str(x) for x in df_hist["item_id"].astype(str).unique().tolist()]
+            unique_ids = _requested_item_ids(df_hist, df_items)
             eligibility = forecaster.store.get_eligibility(model_version=model_version, unique_ids=unique_ids)
 
             # ML batch prediction for all; we'll decide per item whether to use it.
@@ -808,88 +871,24 @@ def batch_forecast_lightgbm_async(
                 model_version=model_version,
                 status=request.status,
             )
+            meta = dict(meta or {})
+            meta["customer_id"] = request.customer_id
+            meta["job_id"] = job_id
 
             _update_job(job_id, phase='formatting')
 
-            # Build fallback inputs
             df_hist["day"] = pd.to_datetime(df_hist["day"], errors="coerce")
             df_hist = df_hist.dropna(subset=["item_id", "day", "actual_sale"])
             df_hist["item_id"] = df_hist["item_id"].astype(str)
 
-            # Convert ML results to per-item format
-            out: list[dict[str, Any]] = []
-            if fcst_df.empty:
-                fcst_df = pd.DataFrame(columns=["item_id", "day", "yhat", "upper_70", "upper_90", "upper_95"])
-
-            for item_id in unique_ids:
-                elig = eligibility.get(str(item_id)) or {}
-                ml_allowed = bool(elig.get("ml_allowed")) if elig.get("ml_allowed") is not None else False
-                winner = elig.get("winner_model") or ("lgbm_direct" if ml_allowed else "naive")
-                reason = elig.get("reason_code") or ("OK" if ml_allowed else "NO_ELIGIBILITY")
-                confidence = elig.get("confidence")
-
-                use_ml = ml_allowed and str(winner).startswith("lgbm")
-                if use_ml:
-                    item_fcst = fcst_df[fcst_df["item_id"].astype(str) == str(item_id)].sort_values("day")
-                    if len(item_fcst) == int(request.forecast_periods):
-                        yhat = item_fcst["yhat"].to_numpy(dtype=float).tolist()
-                        upper_70 = None
-                        if "upper_70" in item_fcst.columns:
-                            upper_70 = item_fcst["upper_70"].to_numpy(dtype=float).tolist()
-                        upper_90 = None
-                        if "upper_90" in item_fcst.columns:
-                            upper_90 = item_fcst["upper_90"].to_numpy(dtype=float).tolist()
-                        upper_95 = None
-                        if "upper_95" in item_fcst.columns:
-                            upper_95 = item_fcst["upper_95"].to_numpy(dtype=float).tolist()
-                        days = [
-                            pd.to_datetime(d).to_period("M").to_timestamp(how="start").strftime("%Y-%m-%d")
-                            for d in item_fcst["day"].tolist()
-                        ]
-                        adjustments_list = []
-                        if "adjustments" in item_fcst.columns:
-                            try:
-                                adjustments_list = [
-                                    (a if isinstance(a, dict) else {}) for a in item_fcst["adjustments"].tolist()
-                                ]
-                            except Exception:
-                                adjustments_list = []
-                        out.append(
-                            {
-                                "item_id": item_id,
-                                "forecast": yhat,
-                                "upper_70": upper_70,
-                                "upper_90": upper_90,
-                                "upper_95": upper_95,
-                                "forecast_dates": days,
-                                "model_used": str(winner),
-                                "reason_code": reason,
-                                "confidence": confidence,
-                                "adjustments": adjustments_list,
-                            }
-                        )
-                        continue
-
-                    reason = "ML_NO_PREDICTION"
-                out.append(
-                    _build_non_ml_fallback(
-                        df_hist=df_hist,
-                        item_id=str(item_id),
-                        forecast_periods=int(request.forecast_periods),
-                        reason=str(reason),
-                        confidence=confidence,
-                    )
-                )
-
-            result = {
-                "forecasts": out,
-                "total_items": len(unique_ids),
-                "forecast_type": "batch",
-                "periods": request.forecast_periods,
-                "freq": meta.get("freq"),
-                "model_version": meta.get("model_version"),
-                "meta": meta,
-            }
+            result = _format_batch_results(
+                unique_ids=unique_ids,
+                fcst_df=fcst_df,
+                eligibility=eligibility,
+                df_hist=df_hist,
+                forecast_periods=int(request.forecast_periods),
+                meta=meta,
+            )
 
             _update_job(
                 job_id,
@@ -932,7 +931,7 @@ def batch_forecast_lightgbm_async(
                     },
                 )
 
-    background_tasks.add_task(_batch_runner)
+    background_tasks.add_task(_start_job_thread, f"lgbm-batch-{job_id}", _batch_runner)
 
     return {
         'job_id': job_id,

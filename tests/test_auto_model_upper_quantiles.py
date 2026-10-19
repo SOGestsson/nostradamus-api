@@ -66,8 +66,8 @@ def test_conformal_corrected_quantile_finite_sample():
 
 
 def test_attach_upper_quantiles_residuals_backstop_thin_conformal():
-    """When conformal columns exist but are tighter than the CV residual band,
-    the residual band wins (elementwise max)."""
+    """Residual/history band wins over thin conformal, including when conformal
+    is wider: 1–5 conformal windows often pin 95% to a single residual."""
     yhat = np.array([10.0, 10.0])
     fcst = pd.DataFrame({
         'Naive': yhat,
@@ -83,8 +83,8 @@ def test_attach_upper_quantiles_residuals_backstop_thin_conformal():
         uid_series=pd.Series(['item', 'item']),
         cv_excess_by_uid=cv_q,
     )
-    assert u95[0] == 16.0  # residual band (10+6) beats thin conformal (11.5)
-    assert u95[1] == 20.0  # conformal kept where it is wider
+    assert u95[0] == 16.0  # residual band (10+6)
+    assert u95[1] == 16.0  # residual wins over exploded conformal (20)
     assert u90[0] == 14.0
     assert u70[0] == 12.0
 
@@ -397,3 +397,26 @@ def test_historical_excess_quantiles_nonempty():
     q = _historical_excess_quantiles(y, pd.Series(ds))
     assert 'q95' in q
     assert q['q95'] >= 0.0
+
+
+def test_long_history_95_is_not_the_single_worst_month():
+    """36-month conformal 95% used to be the sample max, so 90% and 95%
+    collapsed onto one outlier. Empirical quantiles keep them distinct."""
+    values = [float(i) for i in range(35)] + [1000.0]
+    baselines = [100.0] * 36
+    q = _excess_quantiles_from_values(values, baselines)
+    assert q['q95'] < 1000.0
+    assert q.get('q95_hi', q['q95']) < 1000.0
+    assert q['q90'] <= q['q95'] + 1e-9
+    assert q['q95'] > q['q70']
+
+
+def test_historical_excess_ignores_trailing_pad_zeros():
+    ds = pd.date_range('2023-01-01', periods=36, freq='MS')
+    y = np.full(36, 200.0)
+    y[::12] = 260.0  # mild January seasonality
+    q_clean = _historical_excess_quantiles(y, pd.Series(ds))
+    y_pad = np.concatenate([y, np.zeros(3)])
+    ds_pad = pd.Series(pd.date_range('2023-01-01', periods=39, freq='MS'))
+    q_pad = _historical_excess_quantiles(y_pad, ds_pad)
+    assert q_pad['q95'] <= q_clean['q95'] + 1e-6

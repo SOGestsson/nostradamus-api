@@ -429,6 +429,40 @@ def _conformal_corrected_quantile(arr: np.ndarray, level: float) -> float:
     return float(srt[k - 1])
 
 
+def _excess_level_quantile(arr: np.ndarray, level: float) -> float:
+    """Quantile of residual excesses for an upper band.
+
+    Split-conformal ``ceil((n+1)*level)`` with a 36-month lookback makes 95%
+    (and Bonferroni 97.5%) the sample max, so AutoModel 90% and 95% collapse
+    onto the single worst month. With enough history use the empirical
+    quantile; keep conformal only for short residual pools.
+    """
+    n = len(arr)
+    if n == 0:
+        return 0.0
+    k = int(np.ceil((n + 1) * float(level)))
+    if n >= 20:
+        return float(np.quantile(arr, float(level), method="linear"))
+    if k >= n:
+        return float(np.sort(arr)[-1])
+    return _conformal_corrected_quantile(arr, level)
+
+
+def _bonferroni_hi(arr: np.ndarray, level: float, point: float) -> float:
+    """Wider Bonferroni bound, but only when n can actually identify it.
+
+    ``1-(1-alpha)/2`` at 95% is 97.5%. For n<=36 that rank is past the sample,
+    so 90% and 95% would both become the max. In that case keep the point
+    quantile rather than inventing a wider band.
+    """
+    n = len(arr)
+    adj = 1.0 - (1.0 - float(level)) / 2.0
+    k = int(np.ceil((n + 1) * adj))
+    if n == 0 or k >= n:
+        return float(point)
+    return _excess_level_quantile(arr, adj)
+
+
 def _excess_quantiles_from_values(
     values: list[float],
     baselines: Optional[list[float]] = None,
@@ -454,9 +488,9 @@ def _excess_quantiles_from_values(
     if len(arr) == 0:
         return {}
     out = {
-        'q70': _conformal_corrected_quantile(arr, 0.70),
-        'q90': _conformal_corrected_quantile(arr, 0.90),
-        'q95': _conformal_corrected_quantile(arr, 0.95),
+        'q70': _excess_level_quantile(arr, 0.70),
+        'q90': _excess_level_quantile(arr, 0.90),
+        'q95': _excess_level_quantile(arr, 0.95),
     }
     if base is not None and len(base) == len(arr):
         # min(abs, rel) of two level-alpha bounds only guarantees 2*alpha-1
@@ -472,9 +506,8 @@ def _excess_quantiles_from_values(
         if np.any(ok):
             ratios = arr[ok] / np.maximum(base[ok], 1.0)
             for key, level in (('q70', 0.70), ('q90', 0.90), ('q95', 0.95)):
-                adj = 1.0 - (1.0 - level) / 2.0
-                out[f'{key}_hi'] = _conformal_corrected_quantile(arr, adj)
-                out[f'{key}_rel'] = _conformal_corrected_quantile(ratios, adj)
+                out[f'{key}_hi'] = _bonferroni_hi(arr, level, out[key])
+                out[f'{key}_rel'] = _bonferroni_hi(ratios, level, _excess_level_quantile(ratios, level))
     return out
 
 
@@ -762,6 +795,41 @@ def _event_month_limits(
     )
 
 
+def _drop_trailing_idle_history(
+    y: np.ndarray,
+    ds: Optional[pd.Series] = None,
+) -> tuple[np.ndarray, Optional[pd.Series]]:
+    """Drop padded future zeros and an obviously incomplete last month.
+
+    Incomplete current months (e.g. mid-September at 138 vs a 4000-unit
+    September history) and year-pad zeros drag the same-month baseline down,
+    so older real months look like huge excesses and the 95% band explodes.
+    Interior zeros are kept: those are real off-season observations.
+    """
+    y = np.asarray(y, dtype=float)
+    ds_out: Optional[pd.Series] = None if ds is None else pd.Series(pd.to_datetime(ds)).reset_index(drop=True)
+    if len(y) == 0:
+        return y, ds_out
+    ypos = np.where(np.isfinite(y), y, 0.0)
+    positive = ypos > 0.0
+    if not bool(positive.any()):
+        return y, ds_out
+    last = int(np.max(np.flatnonzero(positive)))
+    y = y[: last + 1]
+    if ds_out is not None:
+        ds_out = ds_out.iloc[: last + 1].reset_index(drop=True)
+    if ds_out is None or len(y) < 13:
+        return y, ds_out
+    last_month = int(ds_out.iloc[-1].month)
+    prior_mask = ds_out.iloc[:-1].dt.month.to_numpy() == last_month
+    prior = y[:-1][prior_mask]
+    prior = prior[np.isfinite(prior) & (prior > 0.0)]
+    if len(prior) >= 1 and float(y[-1]) < 0.2 * float(np.median(prior)):
+        y = y[:-1]
+        ds_out = ds_out.iloc[:-1].reset_index(drop=True)
+    return y, ds_out
+
+
 def _historical_excess_quantiles(
     y: np.ndarray,
     ds: Optional[pd.Series] = None,
@@ -770,6 +838,9 @@ def _historical_excess_quantiles(
 ) -> dict[str, float]:
     """Quantiles of positive forecast excess from trailing history."""
     y = np.asarray(y, dtype=float)
+    if len(y) == 0:
+        return {}
+    y, ds = _drop_trailing_idle_history(y, ds)
     if len(y) == 0:
         return {}
     tail = y[-lookback:] if len(y) > lookback else y
@@ -825,11 +896,11 @@ def _attach_upper_quantiles(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Attach upper_70/90/95 combining conformal columns and residual/history bands.
 
-    StatsForecast conformal intervals here calibrate on very few residuals per
-    horizon step (1-5 windows), which empirically under-covers. The CV holdout /
-    historical excess band uses a larger sample, so when both are available we
-    take the elementwise max (each is a valid upper bound; max preserves the
-    stronger coverage).
+    StatsForecast conformal intervals here calibrate on 1–5 residuals per
+    horizon step, so the 95% interval is often a single residual and can
+    explode. The CV holdout / historical excess band uses a larger sample and
+    is preferred when present; conformal fills in only where that band is
+    missing.
     """
     yhat = np.asarray(yhat, dtype=float)
     n = len(yhat)
@@ -907,10 +978,19 @@ def _attach_upper_quantiles(
             r90[i] = yh + 0.8 * excess
             r70[i] = yh + 0.4 * excess
 
-    # np.fmax ignores NaN, so rows without residual info keep the conformal value.
-    u95 = r95 if u95 is None else np.fmax(u95, r95)
-    u90 = r90 if u90 is None else np.fmax(u90, r90)
-    u70 = r70 if u70 is None else np.fmax(u70, r70)
+    # Residual/history band has the larger sample. StatsForecast conformal
+    # here uses 1–5 windows, so the 95% interval is often the max of a handful
+    # of residuals and can explode (a 4000-unit October on a series whose
+    # historical 95% excess is ~1000). Prefer residual when it exists;
+    # conformal fills in only where residual is missing.
+    def _prefer_residual(conf, resid):
+        if conf is None:
+            return resid
+        return np.where(np.isfinite(resid), resid, conf)
+
+    u95 = _prefer_residual(u95, r95)
+    u90 = _prefer_residual(u90, r90)
+    u70 = _prefer_residual(u70, r70)
 
     u95 = np.nan_to_num(np.asarray(u95, dtype=float), nan=0.0)
     upper_95 = np.maximum(np.maximum(u95, yhat), 0.0)

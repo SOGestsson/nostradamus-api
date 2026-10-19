@@ -185,6 +185,8 @@ class LightGBMTrainRequest(BaseModel):
         optuna_n_trials: int = 30
         optuna_timeout: int = 300
 
+        required_driver_columns: Optional[List[str]] = None
+
 
 class LightGBMBatchForecastRequest(BaseModel):
         """Request model for batch forecasting with a trained LightGBM model."""
