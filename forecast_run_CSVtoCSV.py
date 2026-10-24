@@ -82,6 +82,7 @@ def call_forecast_api(
     base_url: str,
     payload: dict,
     timeout: int = 60,
+    sim_api_key: str | None = None,
 ):
     """
     Calls POST /api/v1/forecast/generate
@@ -92,7 +93,10 @@ def call_forecast_api(
     print(
         f"Calling {url} with {record_count} history rows (timeout {timeout}s)"
     )
-    resp = requests.post(url, json=payload, timeout=timeout)
+    headers = {}
+    if sim_api_key:
+        headers["X-Api-Key"] = sim_api_key
+    resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
     try:
         resp.raise_for_status()
     except requests.HTTPError as e:
@@ -230,6 +234,11 @@ def main():
         "optional otherwise)",
     )
     parser.add_argument(
+        "--sim-api-key",
+        default=None,
+        help="X-Api-Key for api.nostradamus-api.com (internal or partner key)",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=120,
@@ -257,7 +266,9 @@ def main():
     )
 
     # 3) Call API
-    response_json = call_forecast_api(args.base_url, payload, timeout=args.timeout)
+    response_json = call_forecast_api(
+        args.base_url, payload, timeout=args.timeout, sim_api_key=args.sim_api_key
+    )
     print("DEBUG FULL RESPONSE:")
     print(json.dumps(response_json, indent=2))
 

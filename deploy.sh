@@ -11,6 +11,7 @@ NETWORK="nostradamus-net"
 # The API refuses every /api/v1 request when API_KEY is unset, so fail here
 # rather than deploying a container that returns 503 to every caller.
 : "${API_KEY:?API_KEY must be set. Same value as SIM_API_KEY on the pipeline gateway and the frontend.}"
+# Optional: API_KEYS='partner_a:secret,partner_b:secret' — enables per-partner X-Api-Key and locks local forecast routes.
 : "${SANDBOX_DB_PASSWORD:?SANDBOX_DB_PASSWORD must be set}"
 
 if ! ssh -o BatchMode=yes -o ConnectTimeout=3 "$PI_USER@$PI_HOST" true 2>/dev/null; then
@@ -40,6 +41,7 @@ ssh "$PI_USER@$PI_HOST" "
     --network $NETWORK \
     -e REDIS_URL=redis://${REDIS_CONTAINER}:6379/0 \
     -e API_KEY='$API_KEY' \
+    -e API_KEYS='${API_KEYS:-}' \
     -e SANDBOX_DB_HOST=192.168.1.50 \
     -e SANDBOX_DB_PORT=4406 \
     -e SANDBOX_DB_USER='${SANDBOX_DB_USER:-root}' \

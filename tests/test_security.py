@@ -9,7 +9,7 @@ from api import security
 
 
 def _req(path: str):
-    return SimpleNamespace(url=SimpleNamespace(path=path))
+    return SimpleNamespace(url=SimpleNamespace(path=path), state=SimpleNamespace())
 
 
 @pytest.fixture(autouse=True)
@@ -70,3 +70,27 @@ def test_non_local_path_rejects_wrong_key(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         security.require_api_key(_req("/api/v1/simulation/run"), x_api_key="nope")
     assert exc.value.status_code == 401
+
+
+def test_local_forecast_requires_key_when_partner_keys_configured(monkeypatch):
+    monkeypatch.setenv("API_KEY", "internal-secret")
+    monkeypatch.setenv("API_KEYS", "partner_a:partner-a-key")
+    with pytest.raises(HTTPException) as exc:
+        security.require_api_key(_req("/api/v1/forecast/generate"), x_api_key=None)
+    assert exc.value.status_code == 401
+
+
+def test_local_forecast_accepts_internal_key_with_partners(monkeypatch):
+    monkeypatch.setenv("API_KEY", "internal-secret")
+    monkeypatch.setenv("API_KEYS", "partner_a:partner-a-key")
+    req = _req("/api/v1/forecast/generate")
+    assert security.require_api_key(req, x_api_key="internal-secret") is True
+    assert req.state.api_client_id == "internal"
+
+
+def test_local_forecast_accepts_partner_key(monkeypatch):
+    monkeypatch.setenv("API_KEY", "internal-secret")
+    monkeypatch.setenv("API_KEYS", "partner_a:partner-a-key")
+    req = _req("/api/v1/forecast/generate")
+    assert security.require_api_key(req, x_api_key="partner-a-key") is True
+    assert req.state.api_client_id == "partner_a"
