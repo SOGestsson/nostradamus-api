@@ -6,8 +6,10 @@ from inventory_algorithm.easter import (
     EasterPlan,
     apply_easter_to_forecasts,
     apply_easter_to_item_results,
+    clear_unsold_months,
     easter_sunday,
     monthly_easter_weights,
+    positive_months_by_item,
     prepare_easter_history,
 )
 
@@ -18,24 +20,27 @@ def test_known_easter_sundays():
     assert easter_sunday(2026) == date(2026, 4, 5)
 
 
-def test_early_easter_is_all_march():
+def test_early_easter_splits_february_and_march():
     w = monthly_easter_weights(2024)
-    assert w[3] == 1.0
+    assert abs(w[2] - 26 / 56) < 1e-12
+    assert abs(w[3] - 30 / 56) < 1e-12
     assert w.get(4, 0.0) == 0.0
     assert abs(sum(w.values()) - 1.0) < 1e-12
 
 
-def test_late_easter_is_mostly_april():
+def test_late_easter_keeps_february_small():
     w = monthly_easter_weights(2025)
-    assert abs(w[3] - 2 / 21) < 1e-12
-    assert abs(w[4] - 19 / 21) < 1e-12
+    assert abs(w[2] - 6 / 56) < 1e-12
+    assert abs(w[3] - 31 / 56) < 1e-12
+    assert abs(w[4] - 19 / 56) < 1e-12
     assert abs(sum(w.values()) - 1.0) < 1e-12
 
 
-def test_mid_easter_splits_toward_march():
+def test_mid_easter_reaches_february():
     w = monthly_easter_weights(2026)
-    assert abs(w[3] - 17 / 21) < 1e-12
-    assert abs(w[4] - 4 / 21) < 1e-12
+    assert abs(w[2] - 21 / 56) < 1e-12
+    assert abs(w[3] - 31 / 56) < 1e-12
+    assert abs(w[4] - 4 / 56) < 1e-12
 
 
 def _hist(rows: list[tuple[str, str, float]]) -> pd.DataFrame:
@@ -48,11 +53,11 @@ def _hist(rows: list[tuple[str, str, float]]) -> pd.DataFrame:
     )
 
 
-def test_strip_zeros_out_a_pure_easter_month_when_weights_match():
+def test_strip_zeros_february_and_march_when_weights_match():
     hist = _hist(
         [
-            ("egg", "2024-03-01", 100.0),
-            ("egg", "2024-04-01", 0.0),
+            ("egg", "2024-02-01", 26.0),
+            ("egg", "2024-03-01", 30.0),
             ("egg", "2024-05-01", 3.0),
         ]
     )
@@ -60,10 +65,10 @@ def test_strip_zeros_out_a_pure_easter_month_when_weights_match():
     out, plan = prepare_easter_history(hist, {"egg"})
 
     by_month = out.set_index("day")["actual_sale"].to_dict()
+    assert by_month[pd.Timestamp("2024-02-01")] == 0.0
     assert by_month[pd.Timestamp("2024-03-01")] == 0.0
-    assert by_month[pd.Timestamp("2024-04-01")] == 0.0
     assert by_month[pd.Timestamp("2024-05-01")] == 3.0
-    assert plan.event_forecast["egg"] == 100.0
+    assert plan.event_forecast["egg"] == 56.0
 
 
 def test_non_paskavara_history_is_returned_unchanged():
@@ -90,18 +95,19 @@ def test_place_puts_the_event_on_this_years_months():
 
     fcst = pd.DataFrame(
         {
-            "item_id": ["egg", "egg", "egg"],
-            "forecast_date": pd.to_datetime(["2026-03-01", "2026-04-01", "2026-05-01"]),
-            "forecast": [1.0, 2.0, 3.0],
-            "forecast_upper_95": [4.0, 5.0, 6.0],
+            "item_id": ["egg", "egg", "egg", "egg"],
+            "forecast_date": pd.to_datetime(["2026-02-01", "2026-03-01", "2026-04-01", "2026-05-01"]),
+            "forecast": [0.0, 1.0, 2.0, 3.0],
+            "forecast_upper_95": [3.0, 4.0, 5.0, 6.0],
         }
     )
     out = apply_easter_to_forecasts(fcst, plan)
     w = monthly_easter_weights(2026)
-    assert abs(out["forecast"].iloc[0] - (1.0 + 105.0 * w[3])) < 1e-9
-    assert abs(out["forecast"].iloc[1] - (2.0 + 105.0 * w[4])) < 1e-9
-    assert out["forecast"].iloc[2] == 3.0
-    assert abs((out["forecast_upper_95"].iloc[0] - out["forecast"].iloc[0]) - 3.0) < 1e-9
+    assert abs(out["forecast"].iloc[0] - (105.0 * w[2])) < 1e-9
+    assert abs(out["forecast"].iloc[1] - (1.0 + 105.0 * w[3])) < 1e-9
+    assert abs(out["forecast"].iloc[2] - (2.0 + 105.0 * w[4])) < 1e-9
+    assert out["forecast"].iloc[3] == 3.0
+    assert abs((out["forecast_upper_95"].iloc[1] - out["forecast"].iloc[1]) - 3.0) < 1e-9
 
 
 def test_place_spans_two_easters_in_the_horizon():
@@ -158,9 +164,9 @@ def test_apply_easter_to_item_results_matches_long_form():
     results = [
         {
             "item_id": "egg",
-            "forecast": [1.0, 2.0, 3.0],
-            "forecast_dates": ["2026-03-01", "2026-04-01", "2026-05-01"],
-            "upper_95": [4.0, 5.0, 6.0],
+            "forecast": [0.0, 1.0, 2.0, 3.0],
+            "forecast_dates": ["2026-02-01", "2026-03-01", "2026-04-01", "2026-05-01"],
+            "upper_95": [3.0, 4.0, 5.0, 6.0],
         },
         {
             "item_id": "plain",
@@ -169,11 +175,51 @@ def test_apply_easter_to_item_results_matches_long_form():
         },
     ]
     out = apply_easter_to_item_results(results, plan)
-    assert abs(out[0]["forecast"][0] - (1.0 + 100.0 * w[3])) < 1e-9
-    assert abs(out[0]["forecast"][1] - (2.0 + 100.0 * w[4])) < 1e-9
-    assert out[0]["forecast"][2] == 3.0
-    assert abs((out[0]["upper_95"][0] - out[0]["forecast"][0]) - 3.0) < 1e-9
+    assert abs(out[0]["forecast"][0] - (100.0 * w[2])) < 1e-9
+    assert abs(out[0]["forecast"][1] - (1.0 + 100.0 * w[3])) < 1e-9
+    assert abs(out[0]["forecast"][2] - (2.0 + 100.0 * w[4])) < 1e-9
+    assert out[0]["forecast"][3] == 3.0
+    assert abs((out[0]["upper_95"][1] - out[0]["forecast"][1]) - 3.0) < 1e-9
     assert out[1]["forecast"] == [7.0, 8.0]
+
+
+def test_clear_unsold_months_keeps_real_seasons_and_other_items():
+    hist = _hist(
+        [
+            ("egg", "2024-02-01", 40.0),
+            ("egg", "2024-03-01", 80.0),
+            ("egg", "2025-12-01", 15.0),
+            ("egg", "2025-05-01", -2.0),
+            ("plain", "2024-07-01", 9.0),
+        ]
+    )
+    sold = positive_months_by_item(hist, ["egg"])
+    assert sold["egg"] == {2, 3, 12}
+    assert "plain" not in sold
+
+    results = [
+        {
+            "item_id": "egg",
+            "forecast": [6.0, 6.0, 6.0, 6.0],
+            "forecast_dates": ["2027-02-01", "2027-05-01", "2027-07-01", "2027-12-01"],
+            "upper_95": [8.0, 8.0, 8.0, 8.0],
+        },
+        {
+            "item_id": "plain",
+            "forecast": [4.0, 5.0],
+            "forecast_dates": ["2027-07-01", "2027-08-01"],
+        },
+    ]
+    cleared = clear_unsold_months(results, sold)
+    assert cleared[0]["forecast"] == [6.0, 0.0, 0.0, 6.0]
+    assert cleared[0]["upper_95"] == [8.0, 0.0, 0.0, 8.0]
+    assert cleared[1]["forecast"] == [4.0, 5.0]
+
+    placed = apply_easter_to_item_results(cleared, EasterPlan(event_forecast={"egg": 100.0}))
+    assert placed[0]["forecast"][1] == 0.0
+    assert placed[0]["forecast"][2] == 0.0
+    assert placed[0]["forecast"][0] > 6.0
+    assert placed[1]["forecast"] == [4.0, 5.0]
 
 
 def test_forecast_request_accepts_paskavara_alias():

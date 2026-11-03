@@ -2164,7 +2164,7 @@ class ClassicalForecasts:
         return out
 
     # ---------- Local fallback path ----------
-    def _local_forecast_path(self, hist: pd.DataFrame, h: int) -> pd.DataFrame:
+    def _local_forecast_path(self, hist: pd.DataFrame, h: int, model_instance=None) -> pd.DataFrame:
         """
         Local fallback using StatsForecast models (AutoARIMA, ETS, Croston, etc.).
         Returns DataFrame with 'ds', 'yhat', and upper quantiles.
@@ -2172,12 +2172,7 @@ class ClassicalForecasts:
         from statsforecast import StatsForecast
         
         models_dict = _lazy_import_nixtla_models()
-        
-        if self.local_model not in models_dict:
-            raise ValueError(f"Unknown local_model '{self.local_model}'. Available: {list(models_dict.keys())}")
-        
-        ModelClass = models_dict[self.local_model]
-        
+
         # Prepare data for StatsForecast format
         df = hist.rename(columns={'day':'ds','actual_sale':'y'}).copy()
         df = df[['ds', 'y']].sort_values('ds').reset_index(drop=True)
@@ -2187,11 +2182,15 @@ class ClassicalForecasts:
 
         # Initialize model with appropriate parameters
         seasonal_models = ['auto_arima', 'auto_ets', 'seasonal_naive', 'theta', 'optimized_theta', 'auto_ces']
-        
-        if self.local_model in seasonal_models:
-            model_instance = ModelClass(season_length=self.season_length)
-        else:
-            model_instance = ModelClass()
+
+        if model_instance is None:
+            if self.local_model not in models_dict:
+                raise ValueError(f"Unknown local_model '{self.local_model}'. Available: {list(models_dict.keys())}")
+            ModelClass = models_dict[self.local_model]
+            if self.local_model in seasonal_models:
+                model_instance = ModelClass(season_length=self.season_length)
+            else:
+                model_instance = ModelClass()
         
         # Initialize StatsForecast
         sf = StatsForecast(

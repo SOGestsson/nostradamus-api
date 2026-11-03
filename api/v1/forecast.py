@@ -25,10 +25,17 @@ import logging
 from api.models import ForecastRequest, ForecastDailyResponse, ForecastDailyItemResponse
 from api.security import require_api_key
 from api.daily_forecast_utils import monthly_to_daily
-from inventory_algorithm.classical_forecasts import ClassicalForecasts
+from inventory_algorithm.classical_forecasts import (
+    ClassicalForecasts,
+    _auto_model_compute_peak_ratio,
+    _ma_window_from_alias,
+)
 from inventory_algorithm.easter import (
     EasterPlan,
+    _clean_id,
     apply_easter_to_item_results,
+    clear_unsold_months,
+    positive_months_by_item,
     prepare_easter_history,
 )
 
@@ -166,17 +173,116 @@ def _is_monthly_freq(freq: str) -> bool:
     return f.startswith("M")
 
 
+def _easter_item_ids(request: ForecastRequest, freq_req: str) -> list[str]:
+    """Easter ids only for the monthly local path. Anything else leaves items alone."""
+
+    if request.mode != "local" or not _is_monthly_freq(freq_req):
+        return []
+    return [str(i).strip() for i in (request.easter_item_ids or []) if str(i).strip()]
+
+
 def _prepare_easter_for_request(
     df_his: pd.DataFrame, request: ForecastRequest, freq_req: str
 ) -> tuple[pd.DataFrame, EasterPlan]:
     """No-op unless monthly local mode with easter_item_ids set."""
 
-    ids = [str(i).strip() for i in (request.easter_item_ids or []) if str(i).strip()]
-    if not ids or request.mode != "local" or not _is_monthly_freq(freq_req):
+    ids = _easter_item_ids(request, freq_req)
+    if not ids:
         return df_his, EasterPlan()
     return prepare_easter_history(
         df_his, ids, item_col="item_id", date_col="day", sales_col="actual_sale"
     )
+
+
+_SELECTED_MODEL_KEYS = {
+    "AutoARIMA": "auto_arima",
+    "AutoETS": "auto_ets",
+    "CrostonOptimized": "croston_optimized",
+    "Naive": "naive",
+    "SeasonalNaive": "seasonal_naive",
+    "ADIDA": "adida",
+    "OptimizedTheta": "optimized_theta",
+    "Theta": "theta",
+    "AutoCES": "auto_ces",
+    "HistoricAverage": "historic_average",
+    "WindowAverage": "window_average",
+    "SeasonalWindowAverage": "seasonal_window_average",
+}
+
+
+def _forecast_chosen_model(forecaster: ClassicalForecasts, hist: pd.DataFrame, model_label: str, h: int, ratio_hist: pd.DataFrame):
+    """Forecast one series with the model chosen on its real sales.
+
+    ``hist`` is the Easter-stripped series. ``ratio_hist`` is the real series,
+    used only when the choice included the peak-ratio correction.
+    """
+
+    label = str(model_label or "")
+    base = label.split(":")[0]
+    use_peak = "peak_ratio" in label
+    ma_window = _ma_window_from_alias(base)
+    saved = forecaster.local_model
+    try:
+        if ma_window is not None:
+            from statsforecast.models import WindowAverage
+            fcst = forecaster._local_forecast_path(
+                hist, h, model_instance=WindowAverage(window_size=ma_window, alias=base)
+            )
+        else:
+            key = _SELECTED_MODEL_KEYS.get(base)
+            if key is None:
+                raise ValueError(f"No refit for model {base}")
+            forecaster.local_model = key
+            fcst = forecaster._local_forecast_path(hist, h)
+    finally:
+        forecaster.local_model = saved
+    yhat = fcst["yhat"].to_numpy(dtype=float)
+    uppers = {key: fcst[key].to_numpy(dtype=float) for key in ("upper_70", "upper_90", "upper_95")}
+    if use_peak:
+        ratio_frame = ratio_hist.rename(columns={"day": "ds", "actual_sale": "y"})[["ds", "y"]]
+        ratio = _auto_model_compute_peak_ratio(ratio_frame, season_length=int(forecaster.season_length or 12))
+        if ratio:
+            yhat = yhat * float(ratio)
+            uppers = {key: values * float(ratio) for key, values in uppers.items()}
+    yhat = yhat.clip(min=0.0)
+    uppers = {key: values.clip(min=0.0) for key, values in uppers.items()}
+    return yhat, uppers, [pd.to_datetime(d) for d in fcst["ds"]], label
+
+
+def _refit_easter_items(forecaster: ClassicalForecasts, df_fit: pd.DataFrame, df_full: pd.DataFrame, results: list, easter_ids: set[str], h: int) -> list:
+    """Fit each Easter item on the stripped history with the model chosen from real sales."""
+
+    for result in results:
+        if not isinstance(result, dict) or result.get("error"):
+            continue
+        item_id = _clean_id(result.get("item_id"))
+        if item_id not in easter_ids:
+            continue
+        mask = df_fit["item_id"].map(_clean_id) == item_id
+        hist = df_fit.loc[mask]
+        if hist.empty:
+            continue
+        try:
+            yhat, uppers, dates, label = _forecast_chosen_model(
+                forecaster,
+                hist,
+                str(result.get("model_used") or ""),
+                h,
+                df_full.loc[df_full["item_id"].map(_clean_id) == item_id],
+            )
+        except Exception as exc:
+            print(f"  ✗ Item {item_id}: Easter refit failed ({exc}); base forecast cleared before Easter placement")
+            dates = result.get("forecast_dates") or []
+            result["forecast"] = [0.0] * len(dates)
+            continue
+        result["forecast"] = yhat.tolist()
+        result["forecast_dates"] = [d.strftime("%Y-%m-%d") for d in dates]
+        result["model_used"] = label
+        result["periods_forecasted"] = int(len(yhat))
+        for key, values in uppers.items():
+            result[key] = values.tolist()
+        print(f"  ✓ Item {item_id}: Easter refit -> {label}")
+    return results
 
 
 @router.post("/generate")
@@ -235,9 +341,10 @@ def generate_forecast(request: ForecastRequest):
     - Example: 24 for last 24 months (monthly series)
 
     **easter_item_ids** (optional): Item ids that are Easter / paskavara products
-    - Monthly local forecasts only. The March/April Easter spike is stripped from
-      history so the model does not copy last year's calendar month, then placed
-      onto this year's months using Easter−21 through Easter−1.
+    - Monthly local forecasts only. The model is chosen from the real sales, then
+      fitted with February–April lifted out, so a Christmas season or a trend stays
+      visible. A month the item has never sold is set to zero. The Easter quantity
+      is then placed with Easter−56 through Easter−1. Unmarked items are unchanged.
     - Omitted or empty: current AutoModel behaviour, unchanged.
     - Aliases: paskavara_item_ids, easterItemIds
     
@@ -315,7 +422,10 @@ def generate_forecast(request: ForecastRequest):
         df_his['day'] = pd.to_datetime(df_his['day'])
 
         df_his, freq_req = _normalize_and_aggregate_history(df_his, request.freq)
+        df_full = df_his.copy()
+        easter_ids = set(_easter_item_ids(request, freq_req))
         df_his, easter_plan = _prepare_easter_for_request(df_his, request, freq_req)
+        sold_months = positive_months_by_item(df_full, easter_ids) if easter_ids else {}
         
         # Initialize forecaster
         forecaster = ClassicalForecasts(
@@ -355,7 +465,7 @@ def generate_forecast(request: ForecastRequest):
                 n_windows = int(max(1, request.auto_model_n_windows))
 
             panel_fcst = forecaster.auto_model_forecast_panel(
-                df_his,
+                df_full if easter_ids else df_his,
                 h=request.forecast_periods,
                 metric=metric,
                 cv_h=request.auto_model_cv_h,
@@ -394,6 +504,10 @@ def generate_forecast(request: ForecastRequest):
                         'forecast': [],
                         'forecast_dates': []
                     })
+            if easter_ids:
+                results = _refit_easter_items(
+                    forecaster, df_his, df_full, results, easter_ids, request.forecast_periods
+                )
         else:
             for item_id in unique_items:
                 try:
@@ -440,6 +554,7 @@ def generate_forecast(request: ForecastRequest):
         
         print(f"Forecast generation completed: {len(results)} items processed")
 
+        results = clear_unsold_months(results, sold_months)
         results = apply_easter_to_item_results(results, easter_plan)
         
         return {
@@ -641,7 +756,10 @@ async def generate_forecast_async(request: ForecastRequest):
         df_his['day'] = pd.to_datetime(df_his['day'])
 
         df_his, freq_req = _normalize_and_aggregate_history(df_his, request.freq)
+        df_full = df_his.copy()
+        easter_ids = set(_easter_item_ids(request, freq_req))
         df_his, easter_plan = _prepare_easter_for_request(df_his, request, freq_req)
+        sold_months = positive_months_by_item(df_full, easter_ids) if easter_ids else {}
 
         forecaster = ClassicalForecasts(
             mode=request.mode,
@@ -672,7 +790,7 @@ async def generate_forecast_async(request: ForecastRequest):
 
             panel_fcst = await asyncio.to_thread(
                 forecaster.auto_model_forecast_panel,
-                df_his,
+                df_full if easter_ids else df_his,
                 request.forecast_periods,
                 metric,
                 request.auto_model_cv_h,
@@ -757,6 +875,11 @@ async def generate_forecast_async(request: ForecastRequest):
 
         print(f"Async forecast generation completed: {len(results)} items processed")
 
+        if easter_ids and request.mode == 'local' and request.local_model in ('auto_model', 'automodel'):
+            results = await asyncio.to_thread(
+                _refit_easter_items, forecaster, df_his, df_full, results, easter_ids, request.forecast_periods
+            )
+        results = clear_unsold_months(results, sold_months)
         results = apply_easter_to_item_results(results, easter_plan)
 
         return {
