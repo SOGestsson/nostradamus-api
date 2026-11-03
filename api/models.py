@@ -53,8 +53,8 @@ class ForecastRequest(BaseModel):
     auto_model_lookback_periods: Optional[int] = None  # Use only last N observations per item
 
     # Easter items (paskavara). Empty / omitted = current AutoModel, unchanged.
-    # Monthly local forecasts only: strip Mar/Apr event from history, place it
-    # on this year's months after the fit (window Easter−21 through Easter−1).
+    # Monthly local forecasts only: strip the Feb/Mar/Apr event from history, place it
+    # on this year's months after the fit (window Easter−56 through Easter−1).
     easter_item_ids: Optional[List[str]] = Field(
         default=None,
         validation_alias=AliasChoices(

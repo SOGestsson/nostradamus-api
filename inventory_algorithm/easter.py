@@ -4,7 +4,9 @@ Easter Sunday moves between 22 March and 25 April, so a monthly SeasonalNaive
 copies last year's calendar month and misses the spike when the feast changes
 month. AutoModel is univariate and most of its candidates ignore regressors, so
 the helper strips Easter out of history, lets the model forecast the rest, then
-places the event onto this year's March/April using a known shopping window.
+places the event onto this year's February, March, and April. Retailers start
+building stock about eight weeks before Easter, so a producer's shipments move
+with that lead.
 
 Only item ids passed in by the caller are touched. Missing / empty list is a
 no-op so other clients keep current AutoModel behaviour.
@@ -18,11 +20,12 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-# Consumer sales sit before Easter Sunday: the week before Holy Week plus Holy
-# Week itself. Ends the day before Easter so Sunday itself carries no weight.
-WINDOW_BEFORE_EASTER = 21
+# Producer shipments lead the shopper week. Retailers start building stock about
+# eight weeks before Easter, which reaches February when Easter is early. The
+# window ends the day before Easter so Sunday itself carries no weight.
+WINDOW_BEFORE_EASTER = 56
 WINDOW_THROUGH_BEFORE_EASTER = 1
-EVENT_MONTHS = (3, 4)
+EVENT_MONTHS = (2, 3, 4)
 HALFLIFE_YEARS = 2.0
 UPPER_COLS = ("forecast_upper_70", "forecast_upper_90", "forecast_upper_95")
 RESULT_UPPER_KEYS = ("upper_70", "upper_90", "upper_95")
@@ -49,10 +52,10 @@ def easter_sunday(year: int) -> date:
 
 
 def monthly_easter_weights(year: int) -> dict[int, float]:
-    """Share of the shopping window that falls in each calendar month.
+    """Share of the shipping window that falls in each calendar month.
 
-    Window is Easter−21 through Easter−1. With 21 days this is March and/or
-    April; the two weights sum to 1.
+    Window is Easter−56 through Easter−1. The days fall in February, March,
+    and April, and the weights sum to 1.
     """
 
     sunday = easter_sunday(year)
@@ -201,7 +204,7 @@ def apply_easter_to_forecasts(
     date_col: str = "forecast_date",
     forecast_col: str = "forecast",
 ) -> pd.DataFrame:
-    """Add the Easter event onto March/April forecast points. Band width kept."""
+    """Add the Easter event onto February, March, and April forecast points. Band width kept."""
 
     if fcst_df is None or fcst_df.empty or plan.is_empty:
         return fcst_df
@@ -277,5 +280,86 @@ def apply_easter_to_item_results(results: list[dict], plan: EasterPlan) -> list[
             upper = item.get(key)
             if isinstance(upper, list) and len(upper) >= n:
                 item[key] = [float(upper[i]) + lifts[i] for i in range(n)]
+        out.append(item)
+    return out
+
+
+def positive_months_by_item(
+    hist_df: pd.DataFrame,
+    item_ids: Iterable[object],
+    *,
+    item_col: str = "item_id",
+    date_col: str = "day",
+    sales_col: str = "actual_sale",
+) -> dict[str, set[int]]:
+    """Calendar months where each Easter item has actually sold.
+
+    A return or a zero does not count. Items with no positive sales map to an
+    empty set. Callers use this only for the Easter item ids they were given.
+    """
+
+    ids = {_clean_id(i) for i in item_ids if _clean_id(i)}
+    sold = {item: set() for item in ids}
+    if hist_df is None or hist_df.empty or not ids:
+        return sold
+    if item_col not in hist_df.columns or date_col not in hist_df.columns or sales_col not in hist_df.columns:
+        return sold
+    items = hist_df[item_col].map(_clean_id)
+    dates = pd.to_datetime(hist_df[date_col], errors="coerce")
+    sales = pd.to_numeric(hist_df[sales_col], errors="coerce")
+    for item, ts, sale in zip(items, dates, sales):
+        if item not in ids or ts is pd.NaT or pd.isna(ts) or pd.isna(sale):
+            continue
+        if float(sale) > 0.0:
+            sold[item].add(int(ts.month))
+    return sold
+
+
+def clear_unsold_months(results: list[dict], sold_by_item: dict[str, set[int]]) -> list[dict]:
+    """Set an Easter item's forecast to zero in months it has never sold.
+
+    Months absent from ``sold_by_item`` are left alone, so this does not touch
+    items that were not marked. Easter placement runs after this and can still
+    fill February, March, and April.
+    """
+
+    if not results or not sold_by_item:
+        return results
+    out: list[dict] = []
+    for raw in results:
+        if not isinstance(raw, dict):
+            out.append(raw)
+            continue
+        item_id = _clean_id(raw.get("item_id"))
+        if item_id not in sold_by_item:
+            out.append(raw)
+            continue
+        sold = sold_by_item[item_id]
+        item = dict(raw)
+        dates = item.get("forecast_dates") or []
+        vals = item.get("forecast") or []
+        if not isinstance(dates, list) or not isinstance(vals, list):
+            out.append(item)
+            continue
+        n = min(len(dates), len(vals))
+        forecast = [float(v) for v in vals]
+        cleared: list[int] = []
+        for i in range(n):
+            ts = pd.to_datetime(dates[i], errors="coerce")
+            if ts is pd.NaT or pd.isna(ts):
+                continue
+            if int(ts.month) not in sold:
+                forecast[i] = 0.0
+                cleared.append(i)
+        item["forecast"] = forecast
+        for key in RESULT_UPPER_KEYS:
+            upper = item.get(key)
+            if not isinstance(upper, list):
+                continue
+            copied = [float(v) for v in upper]
+            for i in cleared:
+                if i < len(copied):
+                    copied[i] = 0.0
+            item[key] = copied
         out.append(item)
     return out
